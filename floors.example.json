@@ -1,0 +1,55 @@
+{
+  "floors": [
+    {
+      "id": "floor_1",
+      "name": "Lantai 1 - Area Publik",
+      "building": "Gedung Utama",
+      "image_url": "/uploads/floor_1_blueprint.svg",
+      "width_meters": 60.0,
+      "height_meters": 40.0
+    },
+    {
+      "id": "floor_2",
+      "name": "Lantai 2 - Area Rawat Inap",
+      "building": "Gedung Utama",
+      "image_url": "/uploads/floor_2_blueprint.svg",
+      "width_meters": 60.0,
+      "height_meters": 40.0
+    }
+  ],
+  "placements": [
+    {
+      "device_id": "ap-lobby",
+      "floor_id": "floor_1",
+      "x": 82.8,
+      "y": 50.1,
+      "tx_power_2g": 20,
+      "channel_2g": 6,
+      "tx_power_5g": 23,
+      "channel_5g": 153,
+      "radius_meters": 20.0
+    },
+    {
+      "device_id": "ap-ruang-tunggu",
+      "floor_id": "floor_1",
+      "x": 24.1,
+      "y": 49.4,
+      "tx_power_2g": 20,
+      "channel_2g": 1,
+      "tx_power_5g": 23,
+      "channel_5g": 149,
+      "radius_meters": 18.0
+    },
+    {
+      "device_id": "ap-lantai-2",
+      "floor_id": "floor_2",
+      "x": 50.0,
+      "y": 30.0,
+      "tx_power_2g": 20,
+      "channel_2g": 11,
+      "tx_power_5g": 23,
+      "channel_5g": 157,
+      "radius_meters": 20.0
+    }
+  ]
+}

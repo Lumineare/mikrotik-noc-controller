@@ -1,0 +1,47 @@
+# ---- secrets & local state (JANGAN pernah di-commit) ----
+.env
+*.env
+telegram_config.json
+ai_config.json
+devices.json
+client_aliases.json
+floors.json
+noc_history.db
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# ---- patch scripts sementara ----
+_patch_*.py
+_w2id.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Node / frontend ----
+node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-error.log*
+
+# ---- editor & OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- runtime artefacts ----
+uploads/*.tmp

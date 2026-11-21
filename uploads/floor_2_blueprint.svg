@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800">
+  <defs>
+    <pattern id="grid2" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#e2e8f0" stroke-width="0.75" />
+    </pattern>
+    <pattern id="denseGrid2" width="100" height="100" patternUnits="userSpaceOnUse">
+      <path d="M 100 0 L 0 0 0 100" fill="none" stroke="#cbd5e1" stroke-width="1.25" />
+    </pattern>
+    <style>
+      .wall { fill: #f8fafc; stroke: #334155; stroke-width: 3.5; stroke-linecap: round; stroke-linejoin: round; }
+      .inner-wall { fill: #ffffff; stroke: #64748b; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .room-title { font-family: Inter, system-ui, sans-serif; font-size: 14px; font-weight: 700; fill: #1e293b; text-anchor: middle; }
+      .room-sub { font-family: Inter, system-ui, sans-serif; font-size: 11px; font-weight: 500; fill: #64748b; text-anchor: middle; }
+      .door { stroke: #0284c7; stroke-width: 2.5; stroke-dasharray: 4,4; fill: none; }
+      .pillar { fill: #334155; stroke: #0f172a; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <!-- Background Canvas -->
+  <rect width="1200" height="800" fill="#f8fafc" />
+  <rect width="1200" height="800" fill="url(#grid2)" />
+  <rect width="1200" height="800" fill="url(#denseGrid2)" opacity="0.6" />
+
+  <!-- Outer Boundary Walls RS Anwar Medika - Lantai 2 -->
+  <rect x="50" y="60" width="1100" height="680" rx="8" class="wall" />
+
+  <!-- Main Corridor / Hallway -->
+  <rect x="50" y="360" width="1100" height="80" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6,6" />
+  <text x="600" y="405" font-family="Inter, sans-serif" font-size="13" font-weight="600" fill="#64748b" letter-spacing="4" text-anchor="middle">KORIDOR RAWAT INAP &amp; STERIL LANTAI 2</text>
+
+  <!-- Vertical cross corridor -->
+  <rect x="550" y="60" width="100" height="680" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6,6" />
+
+  <!-- TOP ROOMS (y: 60 to 360) -->
+  <!-- 1. Intensive Care Unit (ICU / HCU) -->
+  <rect x="50" y="60" width="280" height="300" class="inner-wall" />
+  <rect x="65" y="75" width="250" height="270" rx="4" fill="#fdf2f8" stroke="#fbcfe8" stroke-width="1" />
+  <text x="190" y="200" class="room-title">INTENSIVE CARE UNIT (ICU)</text>
+  <text x="190" y="220" class="room-sub">Ruang Isolasi &amp; HCU</text>
+  <text x="190" y="238" class="room-sub">Monitoring Sentral Pasien Kritis</text>
+
+  <!-- 2. Ruang Operasi (OK / Bedah Sentral) -->
+  <rect x="330" y="60" width="220" height="300" class="inner-wall" />
+  <rect x="345" y="75" width="190" height="270" rx="4" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1" />
+  <text x="440" y="200" class="room-title">BEDAH SENTRAL (OK)</text>
+  <text x="440" y="220" class="room-sub">Kamar Operasi 1 &amp; 2</text>
+  <text x="440" y="238" class="room-sub">Ruang Pemulihan (PACU)</text>
+
+  <!-- 3. Lift & Tangga Lantai 2 -->
+  <rect x="550" y="60" width="100" height="150" class="inner-wall" />
+  <text x="600" y="140" font-family="Inter, sans-serif" font-size="12" font-weight="700" fill="#0f172a" text-anchor="middle">LIFT &amp; TANGGA</text>
+
+  <!-- 4. Rawat Inap Paviliun VIP (Sayap Timur Atas) -->
+  <rect x="650" y="60" width="250" height="300" class="inner-wall" />
+  <rect x="665" y="75" width="220" height="270" rx="4" fill="#fafafa" stroke="#e2e8f0" stroke-width="1" />
+  <text x="775" y="200" class="room-title">RAWAT INAP VIP (PAV. A)</text>
+  <text x="775" y="220" class="room-sub">Kamar 201 - 206 (VIP Superior)</text>
+  <text x="775" y="238" class="room-sub">Nurse Station Paviliun A</text>
+
+  <!-- 5. Rawat Inap Kelas 1 (Sayap Timur Kanan) -->
+  <rect x="900" y="60" width="250" height="300" class="inner-wall" />
+  <rect x="915" y="75" width="220" height="270" rx="4" fill="#fafafa" stroke="#e2e8f0" stroke-width="1" />
+  <text x="1025" y="200" class="room-title">RAWAT INAP KELAS 1</text>
+  <text x="1025" y="220" class="room-sub">Kamar 207 - 212</text>
+  <text x="1025" y="238" class="room-sub">Ruang Perawat Jaga</text>
+
+  <!-- BOTTOM ROOMS (y: 440 to 740) -->
+  <!-- 6. Rawat Inap Kebidanan & Bersalin (VK) -->
+  <rect x="50" y="440" width="280" height="300" class="inner-wall" />
+  <rect x="65" y="455" width="250" height="270" rx="4" fill="#fff1f2" stroke="#fecdd3" stroke-width="1" />
+  <text x="190" y="580" class="room-title">RUANG BERSALIN (VK)</text>
+  <text x="190" y="600" class="room-sub">Kamar Bersalin &amp; Nifas</text>
+  <text x="190" y="618" class="room-sub">Ruang Rawat Bayi / Perinatologi</text>
+
+  <!-- 7. Nurse Station Utama & Dokter Jaga -->
+  <rect x="330" y="440" width="220" height="300" class="inner-wall" />
+  <rect x="345" y="455" width="190" height="270" rx="4" fill="#f0f9ff" stroke="#bae6fd" stroke-width="1" />
+  <text x="440" y="580" class="room-title">NURSE STATION PUSAT</text>
+  <text x="440" y="600" class="room-sub">Monitoring Infus &amp; Pasien</text>
+  <text x="440" y="618" class="room-sub">Ruang Dokter Spesialis Jaga</text>
+
+  <!-- 8. Lift & Tangga Bawah -->
+  <rect x="550" y="590" width="100" height="150" class="inner-wall" />
+  <text x="600" y="670" font-family="Inter, sans-serif" font-size="12" font-weight="700" fill="#0f172a" text-anchor="middle">LIFT TIMUR</text>
+
+  <!-- 9. Rawat Inap Kelas 2 (Sayap Selatan Tengah) -->
+  <rect x="650" y="440" width="250" height="300" class="inner-wall" />
+  <rect x="665" y="455" width="220" height="270" rx="4" fill="#fafafa" stroke="#e2e8f0" stroke-width="1" />
+  <text x="775" y="580" class="room-title">RAWAT INAP KELAS 2</text>
+  <text x="775" y="600" class="room-sub">Kamar 213 - 220</text>
+  <text x="775" y="618" class="room-sub">Nurse Station Sayap B</text>
+
+  <!-- 10. Rawat Inap Kelas 3 & Isolasi -->
+  <rect x="900" y="440" width="250" height="300" class="inner-wall" />
+  <rect x="915" y="455" width="220" height="270" rx="4" fill="#fafafa" stroke="#e2e8f0" stroke-width="1" />
+  <text x="1025" y="580" class="room-title">RAWAT INAP KELAS 3</text>
+  <text x="1025" y="600" class="room-sub">Bangsal Pria &amp; Wanita</text>
+  <text x="1025" y="618" class="room-sub">Kapasitas: 24 Bed</text>
+
+  <!-- Pillars -->
+  <rect x="325" y="355" width="12" height="12" class="pillar" />
+  <rect x="325" y="435" width="12" height="12" class="pillar" />
+  <rect x="645" y="355" width="12" height="12" class="pillar" />
+  <rect x="645" y="435" width="12" height="12" class="pillar" />
+  <rect x="895" y="355" width="12" height="12" class="pillar" />
+  <rect x="895" y="435" width="12" height="12" class="pillar" />
+
+  <!-- Hospital Identity Header in Floorplan -->
+  <g transform="translate(60, 20)">
+    <text font-family="Inter, sans-serif" font-size="16" font-weight="800" fill="#1e3a8a">DENAH LANTAI 2 — RS ANWAR MEDIKA</text>
+    <text x="350" y="0" font-family="Inter, sans-serif" font-size="12" font-weight="500" fill="#64748b">SKALA: 1 : 100 (60m × 40m) | AREA: ICU, BEDAH SENTRAL (OK), BERSALIN &amp; RAWAT INAP</text>
+  </g>
+</svg>

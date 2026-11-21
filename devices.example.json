@@ -1,0 +1,32 @@
+[
+  {
+    "id": "ap-lobby",
+    "name": "AP-LOBBY (cAP ac)",
+    "host": "192.168.88.11",
+    "port": 8728,
+    "user": "API",
+    "pass": "your-router-api-password",
+    "group": "Lantai 1",
+    "is_default": true
+  },
+  {
+    "id": "ap-ruang-tunggu",
+    "name": "AP-RUANG-TUNGGU (cAP ac)",
+    "host": "192.168.88.12",
+    "port": 8728,
+    "user": "API",
+    "pass": "your-router-api-password",
+    "group": "Lantai 1",
+    "is_default": false
+  },
+  {
+    "id": "ap-lantai-2",
+    "name": "AP-LANTAI-2 (RBcAPGi-5acD2nD)",
+    "host": "192.168.88.13",
+    "port": 8728,
+    "user": "API",
+    "pass": "your-router-api-password",
+    "group": "Lantai 2",
+    "is_default": false
+  }
+]

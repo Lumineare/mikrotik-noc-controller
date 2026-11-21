@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800">
+  <defs>
+    <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#e2e8f0" stroke-width="0.75" />
+    </pattern>
+    <pattern id="denseGrid" width="100" height="100" patternUnits="userSpaceOnUse">
+      <path d="M 100 0 L 0 0 0 100" fill="none" stroke="#cbd5e1" stroke-width="1.25" />
+    </pattern>
+    <style>
+      .wall { fill: #f8fafc; stroke: #334155; stroke-width: 3.5; stroke-linecap: round; stroke-linejoin: round; }
+      .inner-wall { fill: #ffffff; stroke: #64748b; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .room-title { font-family: Inter, system-ui, sans-serif; font-size: 14px; font-weight: 700; fill: #1e293b; text-anchor: middle; }
+      .room-sub { font-family: Inter, system-ui, sans-serif; font-size: 11px; font-weight: 500; fill: #64748b; text-anchor: middle; }
+      .door { stroke: #0284c7; stroke-width: 2.5; stroke-dasharray: 4,4; fill: none; }
+      .pillar { fill: #334155; stroke: #0f172a; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <!-- Background Canvas -->
+  <rect width="1200" height="800" fill="#f8fafc" />
+  <rect width="1200" height="800" fill="url(#grid)" />
+  <rect width="1200" height="800" fill="url(#denseGrid)" opacity="0.6" />
+
+  <!-- Outer Boundary Walls RS Anwar Medika - Lantai 1 -->
+  <rect x="50" y="60" width="1100" height="680" rx="8" class="wall" />
+
+  <!-- Main Corridor / Hallway -->
+  <!-- Horizontal central hallway -->
+  <rect x="50" y="360" width="1100" height="80" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6,6" />
+  <text x="600" y="405" font-family="Inter, sans-serif" font-size="13" font-weight="600" fill="#64748b" letter-spacing="4" text-anchor="middle">KORIDOR UTAMA LANTAI 1 (RAWAT JALAN &amp; IGD)</text>
+
+  <!-- Vertical cross corridor -->
+  <rect x="550" y="60" width="100" height="680" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6,6" />
+
+  <!-- ROOMS TOP ROW (y: 60 to 360) -->
+  <!-- 1. IGD (Instalasi Gawat Darurat) - Top Left -->
+  <rect x="50" y="60" width="280" height="300" class="inner-wall" />
+  <rect x="65" y="75" width="250" height="270" rx="4" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1" />
+  <!-- Red Cross Icon -->
+  <path d="M 190 120 h 20 v -20 h 20 v 20 h 20 v 20 h -20 v 20 h -20 v -20 h -20 z" fill="#ef4444" opacity="0.8" />
+  <text x="200" y="210" class="room-title">IGD &amp; TRIAGE</text>
+  <text x="200" y="230" class="room-sub">Kapasitas: 12 Bed Resusitasi</text>
+  <text x="200" y="248" class="room-sub">Zona Merah, Kuning, Hijau</text>
+  <path d="M 290 360 A 40 40 0 0 1 330 320" class="door" />
+
+  <!-- 2. Pendaftaran & Rekam Medis (Admisi) -->
+  <rect x="330" y="60" width="220" height="300" class="inner-wall" />
+  <rect x="345" y="75" width="190" height="270" rx="4" fill="#fafafa" stroke="#e2e8f0" stroke-width="1" />
+  <text x="440" y="200" class="room-title">PENDAFTARAN &amp; ADMISI</text>
+  <text x="440" y="220" class="room-sub">Loket 1 - 6 Pasien</text>
+  <text x="440" y="238" class="room-sub">Ruang Berkas Rekam Medis</text>
+
+  <!-- 3. Lobby & Kasir Pembayaran (Center Top) -->
+  <rect x="550" y="60" width="100" height="150" class="inner-wall" />
+  <text x="600" y="140" font-family="Inter, sans-serif" font-size="12" font-weight="700" fill="#0f172a" text-anchor="middle">LIFT &amp; TANGGA</text>
+
+  <!-- 4. Instalasi Farmasi & Depo Obat -->
+  <rect x="650" y="60" width="250" height="300" class="inner-wall" />
+  <rect x="665" y="75" width="220" height="270" rx="4" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1" />
+  <text x="775" y="200" class="room-title">FARMASI &amp; APOTEK</text>
+  <text x="775" y="220" class="room-sub">Depo Obat Rawat Jalan</text>
+  <text x="775" y="238" class="room-sub">Ruang Racik &amp; Konseling</text>
+
+  <!-- 5. Poliklinik Spesialis (Top Right) -->
+  <rect x="900" y="60" width="250" height="300" class="inner-wall" />
+  <rect x="915" y="75" width="220" height="270" rx="4" fill="#fafafa" stroke="#e2e8f0" stroke-width="1" />
+  <text x="1025" y="190" class="room-title">POLIKLINIK SPESIALIS</text>
+  <text x="1025" y="210" class="room-sub">Poli Penyakit Dalam</text>
+  <text x="1025" y="228" class="room-sub">Poli Anak &amp; Bedah</text>
+  <text x="1025" y="246" class="room-sub">Poli Jantung &amp; Paru</text>
+
+  <!-- ROOMS BOTTOM ROW (y: 440 to 740) -->
+  <!-- 6. Laboratorium Patologi Klinik & Bank Darah -->
+  <rect x="50" y="440" width="280" height="300" class="inner-wall" />
+  <rect x="65" y="455" width="250" height="270" rx="4" fill="#fafafa" stroke="#e2e8f0" stroke-width="1" />
+  <text x="190" y="580" class="room-title">LABORATORIUM KLINIK</text>
+  <text x="190" y="600" class="room-sub">Hematologi &amp; Kimia Darah</text>
+  <text x="190" y="618" class="room-sub">Bank Darah RS (BDRS)</text>
+
+  <!-- 7. Radiologi (X-Ray & CT-Scan) -->
+  <rect x="330" y="440" width="220" height="300" class="inner-wall" />
+  <rect x="345" y="455" width="190" height="270" rx="4" fill="#fffbeb" stroke="#fef3c7" stroke-width="1" />
+  <text x="440" y="580" class="room-title">RADIOLOGI &amp; CT SCAN</text>
+  <text x="440" y="600" class="room-sub">X-Ray Konvensional</text>
+  <text x="440" y="618" class="room-sub">Ruang Operator &amp; USG</text>
+
+  <!-- 8. Lift & Tangga Bawah -->
+  <rect x="550" y="590" width="100" height="150" class="inner-wall" />
+  <text x="600" y="670" font-family="Inter, sans-serif" font-size="12" font-weight="700" fill="#0f172a" text-anchor="middle">LIFT BARAT</text>
+
+  <!-- 9. Ruang Server IT & NOC RSAM -->
+  <rect x="650" y="440" width="250" height="300" class="inner-wall" />
+  <rect x="665" y="455" width="220" height="270" rx="4" fill="#f0f9ff" stroke="#bae6fd" stroke-width="1" />
+  <!-- Server Rack representation -->
+  <rect x="685" y="480" width="30" height="50" fill="#0284c7" rx="2" />
+  <rect x="725" y="480" width="30" height="50" fill="#0284c7" rx="2" />
+  <text x="775" y="580" class="room-title">SERVER ROOM &amp; NOC</text>
+  <text x="775" y="600" class="room-sub">Core Switch &amp; Gateway</text>
+  <text x="775" y="618" class="room-sub">RSAM Network Operations</text>
+
+  <!-- 10. Ruang Manajemen, HRD & Administrasi -->
+  <rect x="900" y="440" width="250" height="300" class="inner-wall" />
+  <rect x="915" y="455" width="220" height="270" rx="4" fill="#fafafa" stroke="#e2e8f0" stroke-width="1" />
+  <text x="1025" y="570" class="room-title">KANTOR HRD &amp; KEUANGAN</text>
+  <text x="1025" y="590" class="room-sub">Ruang Rapat Direksi</text>
+  <text x="1025" y="608" class="room-sub">Divisi Personalia RSAM</text>
+  <text x="1025" y="626" class="room-sub">Ruang Staf Administrasi</text>
+
+  <!-- Architectural Pillars -->
+  <rect x="325" y="355" width="12" height="12" class="pillar" />
+  <rect x="325" y="435" width="12" height="12" class="pillar" />
+  <rect x="645" y="355" width="12" height="12" class="pillar" />
+  <rect x="645" y="435" width="12" height="12" class="pillar" />
+  <rect x="895" y="355" width="12" height="12" class="pillar" />
+  <rect x="895" y="435" width="12" height="12" class="pillar" />
+
+  <!-- Hospital Identity Header in Floorplan -->
+  <g transform="translate(60, 20)">
+    <text font-family="Inter, sans-serif" font-size="16" font-weight="800" fill="#1e3a8a">DENAH LANTAI 1 — RS ANWAR MEDIKA</text>
+    <text x="350" y="0" font-family="Inter, sans-serif" font-size="12" font-weight="500" fill="#64748b">SKALA: 1 : 100 (60m × 40m) | AREA: IGD, ADMISI, FARMASI, POLI, LAB &amp; NOC</text>
+  </g>
+</svg>

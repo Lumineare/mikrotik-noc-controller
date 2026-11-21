@@ -1,0 +1,2388 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MikroTik Controller · APM-HRD</title>
+<style>
+  :root {
+    --bg-base: #070a0f;
+    --bg-surface: #0c121c;
+    --bg-surface-elevated: #111a28;
+    --bg-surface-hover: #162235;
+    --border-subtle: rgba(255, 255, 255, 0.06);
+    --border-default: #1b2638;
+    --border-strong: #27374e;
+    
+    --text-primary: #f0f4f8;
+    --text-secondary: #9cb0c7;
+    --text-muted: #5e738d;
+    
+    --cyan-500: #06b6d4;
+    --cyan-400: #22d3ee;
+    --cyan-glow: rgba(6, 182, 212, 0.16);
+    
+    --blue-500: #3b82f6;
+    --indigo-400: #818cf8;
+    --purple-400: #a78bfa;
+    
+    --emerald-400: #34d399;
+    --emerald-glow: rgba(52, 211, 153, 0.18);
+    
+    --amber-400: #fbbf24;
+    --amber-glow: rgba(251, 191, 36, 0.16);
+    
+    --rose-400: #f87171;
+    --rose-glow: rgba(248, 113, 113, 0.18);
+
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    --radius-full: 9999px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  body {
+    background:
+      radial-gradient(1200px 500px at 15% -8%, rgba(6, 182, 212, 0.08), transparent 60%),
+      radial-gradient(1000px 450px at 85% -5%, rgba(99, 102, 241, 0.08), transparent 60%),
+      var(--bg-base);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 13.5px;
+    line-height: 1.5;
+    min-height: 100vh;
+    padding: 18px 24px 60px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .dim { color: var(--text-muted); }
+  .secondary { color: var(--text-secondary); }
+  .right { text-align: right; }
+  .center { text-align: center; }
+
+  /* Top Navigation Bar */
+  .navbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding-bottom: 16px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .brand-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .brand-logo {
+    width: 38px;
+    height: 38px;
+    border-radius: var(--radius-md);
+    background: linear-gradient(135deg, #06b6d4, #3b82f6);
+    display: grid;
+    place-items: center;
+    color: #04121f;
+    font-weight: 800;
+    font-size: 15px;
+    letter-spacing: -0.5px;
+    box-shadow: 0 4px 16px rgba(6, 182, 212, 0.28);
+    flex-shrink: 0;
+  }
+
+  .brand-info h1 {
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: -0.2px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .brand-info .meta-chips {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    margin-top: 2px;
+  }
+
+  .meta-chips span:not(:last-child)::after {
+    content: "•";
+    margin-left: 8px;
+    color: var(--border-strong);
+  }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  /* Search Input */
+  .search-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .search-wrapper input {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 7px 32px 7px 11px;
+    border-radius: var(--radius-md);
+    font-size: 12.5px;
+    outline: none;
+    width: 210px;
+    transition: all 0.2s ease;
+  }
+
+  .search-wrapper input:focus {
+    border-color: var(--cyan-500);
+    width: 260px;
+    box-shadow: 0 0 0 3px var(--cyan-glow);
+  }
+
+  .search-wrapper .kbd {
+    position: absolute;
+    right: 8px;
+    padding: 1.5px 5px;
+    font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-default);
+    border-radius: 4px;
+    pointer-events: none;
+  }
+
+  /* Status and Action Buttons */
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 12px;
+    border-radius: var(--radius-full);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+  }
+
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--emerald-400);
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.7);
+    animation: pulse 2s infinite;
+  }
+
+  .pulse-dot.err {
+    background: var(--rose-400);
+    box-shadow: none;
+    animation: none;
+  }
+
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.6); }
+    70% { box-shadow: 0 0 0 7px rgba(52, 211, 153, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+  }
+
+  .btn {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 7px 12px;
+    border-radius: var(--radius-md);
+    font-size: 12px;
+    font-family: var(--font-mono);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.15s ease;
+  }
+
+  .btn:hover {
+    border-color: var(--cyan-500);
+    color: var(--cyan-400);
+    background: var(--bg-surface-elevated);
+  }
+
+  .btn.active {
+    background: var(--cyan-glow);
+    border-color: rgba(6, 182, 212, 0.4);
+    color: var(--cyan-400);
+  }
+
+  select.btn-select {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    color: var(--text-secondary);
+    padding: 6px 10px;
+    border-radius: var(--radius-md);
+    font-size: 12px;
+    font-family: var(--font-mono);
+    outline: none;
+    cursor: pointer;
+  }
+
+  select.btn-select:focus {
+    border-color: var(--cyan-500);
+  }
+
+  /* Alert Banner */
+  .banner {
+    display: none;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    border-radius: var(--radius-md);
+    background: rgba(248, 113, 113, 0.1);
+    border: 1px solid rgba(248, 113, 113, 0.28);
+    color: #fca5a5;
+    font-size: 12.5px;
+    font-family: var(--font-mono);
+  }
+
+  .banner.show { display: block; }
+
+  /* KPI Grid */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .kpi-card {
+    background: linear-gradient(180deg, var(--bg-surface), var(--bg-surface-elevated));
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    padding: 15px 18px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .kpi-card::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: transparent;
+    transition: background 0.3s;
+  }
+
+  .kpi-card:hover::before {
+    background: linear-gradient(90deg, var(--cyan-500), var(--blue-500));
+  }
+
+  .kpi-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    font-weight: 600;
+  }
+
+  .kpi-val {
+    font-size: 26px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    letter-spacing: -0.6px;
+    margin: 6px 0 2px;
+    color: var(--text-primary);
+  }
+
+  .kpi-val small {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    font-weight: 500;
+    margin-left: 3px;
+  }
+
+  .kpi-footer {
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 6px;
+  }
+
+  .gauge-track {
+    height: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: var(--radius-full);
+    margin-top: 10px;
+    overflow: hidden;
+  }
+
+  .gauge-fill {
+    height: 100%;
+    border-radius: var(--radius-full);
+    transition: width 0.4s ease;
+  }
+
+  .fill-cyan { background: linear-gradient(90deg, #06b6d4, #22d3ee); }
+  .fill-emerald { background: linear-gradient(90deg, #10b981, #34d399); }
+  .fill-amber { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+  .fill-rose { background: linear-gradient(90deg, #ef4444, #f87171); }
+
+  /* Badges */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2.5px 7px;
+    border-radius: 5px;
+    font-size: 10.5px;
+    font-family: var(--font-mono);
+    border: 1px solid transparent;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .badge-emerald { color: #34d399; background: var(--emerald-glow); border-color: rgba(52, 211, 153, 0.25); }
+  .badge-cyan { color: #22d3ee; background: var(--cyan-glow); border-color: rgba(6, 182, 212, 0.25); }
+  .badge-amber { color: #fbbf24; background: var(--amber-glow); border-color: rgba(251, 191, 36, 0.25); }
+  .badge-rose { color: #f87171; background: var(--rose-glow); border-color: rgba(248, 113, 113, 0.25); }
+  .badge-muted { color: var(--text-muted); background: rgba(255, 255, 255, 0.04); border-color: var(--border-default); }
+
+  /* Bandwidth Chart Card */
+  .chart-card {
+    background: linear-gradient(180deg, var(--bg-surface), var(--bg-surface-elevated));
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    padding: 16px 20px;
+    margin-bottom: 18px;
+  }
+
+  .chart-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+
+  .chart-title {
+    font-size: 11.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .chart-controls {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  canvas#chart {
+    display: block;
+    width: 100%;
+    height: 82px;
+    background: rgba(4, 7, 12, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: var(--radius-md);
+  }
+
+  .chart-legend {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 10px;
+    font-size: 11.5px;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+  }
+
+  .legend-streams {
+    display: flex;
+    gap: 16px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .dot-legend {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+  }
+
+  /* Tabs Navigation */
+  .tabs-nav {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    border-bottom: 1px solid var(--border-default);
+    margin-bottom: 16px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
+  .tab-btn {
+    padding: 8px 14px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+    color: var(--text-secondary);
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+    position: relative;
+  }
+
+  .tab-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  .tab-btn.active {
+    color: var(--cyan-400);
+    background: var(--bg-surface);
+    border-color: var(--border-default) var(--border-default) transparent;
+  }
+
+  .tab-btn.active::after {
+    content: "";
+    position: absolute;
+    bottom: -1px; left: 0; right: 0;
+    height: 2px;
+    background: var(--cyan-400);
+  }
+
+  .tab-count {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: var(--radius-full);
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+  }
+
+  .tab-btn.active .tab-count {
+    background: var(--cyan-glow);
+    color: var(--cyan-400);
+  }
+
+  /* Grid Layouts */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+
+  @media (max-width: 960px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    padding: 16px 18px;
+    position: relative;
+  }
+
+  .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .card-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
+
+  /* Data Table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  th {
+    text-align: left;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    padding: 6px 10px 8px;
+    border-bottom: 1px solid var(--border-default);
+    white-space: nowrap;
+  }
+
+  td {
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+    vertical-align: middle;
+  }
+
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--bg-surface-elevated); }
+
+  .key-value-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 7px 0;
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.05);
+    font-size: 12.5px;
+  }
+
+  .key-value-row:last-child { border-bottom: none; }
+  .key-value-row .k { color: var(--text-muted); font-size: 12px; }
+  .key-value-row .v { font-family: var(--font-mono); color: var(--text-primary); text-align: right; }
+
+  /* Signal Strength Component */
+  .signal-bars {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 12px;
+    vertical-align: middle;
+    margin-right: 4px;
+  }
+
+  .signal-bars span {
+    width: 3px;
+    border-radius: 1px;
+    background: rgba(255, 255, 255, 0.12);
+  }
+
+  .signal-bars span.active { background: currentColor; }
+  
+  .signal-good { color: var(--emerald-400); }
+  .signal-fair { color: var(--amber-400); }
+  .signal-weak { color: var(--rose-400); }
+
+  .radio-chips {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+
+  .radio-chip {
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-default);
+    color: var(--text-secondary);
+    padding: 5px 12px;
+    border-radius: var(--radius-full);
+    font-size: 11.5px;
+    font-family: var(--font-mono);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .radio-chip:hover {
+    border-color: var(--cyan-500);
+    color: var(--text-primary);
+  }
+
+  .radio-chip.active {
+    background: var(--cyan-glow);
+    border-color: var(--cyan-500);
+    color: var(--cyan-400);
+  }
+
+  /* Diagnostic Ping Tool Container */
+  .ping-panel {
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+    margin-bottom: 14px;
+  }
+
+  .ping-form {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .ping-input {
+    background: var(--bg-base);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 7px 12px;
+    border-radius: var(--radius-md);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    outline: none;
+    min-width: 220px;
+  }
+
+  .ping-input:focus { border-color: var(--cyan-500); }
+
+  .ping-results {
+    margin-top: 12px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: var(--bg-base);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    padding: 10px 14px;
+    max-height: 180px;
+    overflow-y: auto;
+    display: none;
+  }
+
+  .ping-results.show { display: block; }
+
+  /* Log Stream */
+  .log-stream {
+    max-height: 480px;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+  }
+
+  .log-row {
+    display: flex;
+    gap: 12px;
+    padding: 6px 4px;
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.04);
+  }
+
+  .log-row:hover { background: rgba(255, 255, 255, 0.02); }
+  .log-row .l-time { color: var(--text-muted); flex: 0 0 68px; }
+  .log-row .l-topic { flex: 0 0 auto; }
+  .log-row .l-msg { color: var(--text-secondary); word-break: break-all; }
+  .log-row.is-error .l-msg { color: #fca5a5; font-weight: 500; }
+
+  .empty-state {
+    padding: 28px;
+    text-align: center;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  /* Device Switcher Dropdown & Modal Styles */
+  .device-dropdown {
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    font-weight: 700;
+    font-size: 15px;
+    padding: 3px 8px;
+    border-radius: var(--radius-sm);
+    outline: none;
+    cursor: pointer;
+    font-family: var(--font-sans);
+  }
+  .device-dropdown:focus { border-color: var(--cyan-500); }
+
+  .btn-sm { padding: 4px 8px; font-size: 11px; }
+
+  /* Modal Overlay */
+  .modal-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(4, 7, 12, 0.75);
+    backdrop-filter: blur(4px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 20px;
+  }
+  .modal-overlay.show { display: flex; }
+
+  .modal-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    width: 100%;
+    max-width: 500px;
+    padding: 22px 24px;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+    position: relative;
+  }
+
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .modal-header h3 {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .btn-close {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 20px;
+    cursor: pointer;
+    padding: 4px;
+    line-height: 1;
+  }
+  .btn-close:hover { color: var(--text-primary); }
+
+  .form-group { margin-bottom: 12px; }
+  .form-group label {
+    display: block;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+  .form-control {
+    width: 100%;
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 7px 11px;
+    border-radius: var(--radius-md);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    outline: none;
+  }
+  .form-control:focus {
+    border-color: var(--cyan-500);
+    box-shadow: 0 0 0 3px var(--cyan-glow);
+  }
+
+  .form-row { display: flex; gap: 10px; }
+  .form-row .form-group { flex: 1; }
+
+  .modal-test-box {
+    margin: 10px 0;
+    padding: 8px 12px;
+    border-radius: var(--radius-md);
+    background: var(--bg-base);
+    border: 1px solid var(--border-default);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    display: none;
+  }
+  .modal-test-box.show { display: block; }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* Fleet Grid Cards */
+  .fleet-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .fleet-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    transition: all 0.2s ease;
+  }
+  .fleet-card:hover {
+    border-color: var(--border-strong);
+  }
+  .fleet-card.is-active {
+    border-color: var(--cyan-500);
+    box-shadow: 0 0 0 2px var(--cyan-glow);
+  }
+</style>
+</head>
+<body>
+
+<!-- Top Navigation -->
+<header class="navbar">
+  <div class="brand-group">
+    <div class="brand-logo">MT</div>
+    <div class="brand-info">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <select id="deviceSelect" class="device-dropdown" title="Pilih Router MikroTik">
+          <!-- Populated dynamically -->
+        </select>
+        <span class="badge badge-cyan" id="devArch">arm</span>
+        <button class="btn btn-sm" id="btnQuickAdd" onclick="openDeviceModal()" title="Tambah Router MikroTik Baru">
+          + Tambah Router
+        </button>
+      </div>
+      <div class="meta-chips">
+        <span id="devHost">192.168.88.1</span>
+        <span id="devBoard">cAP ac</span>
+        <span id="devRos">ROS 7.13.3</span>
+        <span id="devSerial">B9320B84F042</span>
+        <span id="devGroup" class="badge badge-muted">HRD</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <!-- Live Search -->
+    <div class="search-wrapper">
+      <input type="text" id="globalSearch" placeholder="Cari MAC, IP, log..." autocomplete="off">
+      <span class="kbd">/</span>
+    </div>
+
+    <!-- Status indicator -->
+    <div class="status-pill">
+      <span class="pulse-dot" id="connDot"></span>
+      <span id="connTxt">Online</span>
+    </div>
+
+    <!-- Refresh Interval -->
+    <select class="btn-select" id="refreshRate" title="Interval refresh otomatis">
+      <option value="2000">Auto 2s</option>
+      <option value="5000" selected>Auto 5s</option>
+      <option value="10000">Auto 10s</option>
+      <option value="0">Jeda (Pause)</option>
+    </select>
+
+    <!-- Manual Refresh -->
+    <button class="btn" id="refreshBtn" title="Segarkan data sekarang">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+      Refresh
+    </button>
+  </div>
+</header>
+
+<!-- Alert Banner -->
+<div class="banner" id="banner"></div>
+
+<!-- Top KPI Summary Cards -->
+<section class="kpi-grid">
+  <!-- CPU Load -->
+  <div class="kpi-card">
+    <div class="kpi-header">
+      <span>CPU LOAD</span>
+      <span class="badge badge-muted" id="cpuCores">4 Core</span>
+    </div>
+    <div class="kpi-val" id="cpuVal">0<small>%</small></div>
+    <div class="kpi-footer">
+      <span class="dim" id="cpuFreq">896 MHz</span>
+      <span class="dim" id="cpuArch">ARM</span>
+    </div>
+    <div class="gauge-track">
+      <div class="gauge-fill fill-emerald" id="cpuBar" style="width: 5%"></div>
+    </div>
+  </div>
+
+  <!-- Memory -->
+  <div class="kpi-card">
+    <div class="kpi-header">
+      <span>MEMORY (RAM)</span>
+      <span class="badge badge-muted" id="memTotal">128 MB</span>
+    </div>
+    <div class="kpi-val" id="memPct">0<small>%</small></div>
+    <div class="kpi-footer">
+      <span class="dim" id="memFree">49.0 MB Free</span>
+      <span class="badge badge-cyan" id="memStatus">Normal</span>
+    </div>
+    <div class="gauge-track">
+      <div class="gauge-fill fill-cyan" id="memBar" style="width: 60%"></div>
+    </div>
+  </div>
+
+  <!-- WiFi Clients -->
+  <div class="kpi-card">
+    <div class="kpi-header">
+      <span>KLIEN WIFI AKTIF</span>
+      <span class="badge badge-muted">4 Radio</span>
+    </div>
+    <div class="kpi-val" id="wifiCount">0<small>klien</small></div>
+    <div class="kpi-footer" id="wifiSignalSummary">
+      <span class="badge badge-emerald" id="badgeGood">0 bagus</span>
+      <span class="badge badge-amber" id="badgeFair">0 cukup</span>
+      <span class="badge badge-rose" id="badgeWeak">0 lemah</span>
+    </div>
+    <!-- Segmented Signal Quality Bar -->
+    <div class="gauge-track" style="display:flex; gap:2px; background:transparent;">
+      <div id="sigBarGood" style="height:100%; width:50%; background:#34d399; border-radius:2px; transition:width 0.4s;"></div>
+      <div id="sigBarFair" style="height:100%; width:35%; background:#fbbf24; border-radius:2px; transition:width 0.4s;"></div>
+      <div id="sigBarWeak" style="height:100%; width:15%; background:#f87171; border-radius:2px; transition:width 0.4s;"></div>
+    </div>
+  </div>
+
+  <!-- Uptime & System Time -->
+  <div class="kpi-card">
+    <div class="kpi-header">
+      <span>UPTIME</span>
+      <span class="badge badge-emerald" id="ntpBadge">NTP Synced</span>
+    </div>
+    <div class="kpi-val" id="uptimeVal" style="font-size: 20px;">0d 0h 0m</div>
+    <div class="kpi-footer">
+      <span class="dim" id="clockVal">2026-11-17 13:45</span>
+      <span class="dim" id="tzVal">WIB (+07)</span>
+    </div>
+    <div style="margin-top: 10px; font-size: 11px; color: var(--text-muted); display:flex; justify-content:space-between;">
+      <span>Status Sistem: <b style="color:var(--emerald-400)">Optimal</b></span>
+      <span>Health: <b style="color:var(--text-secondary)">OK</b></span>
+    </div>
+  </div>
+</section>
+
+<!-- Interactive Traffic Bridge Monitor -->
+<section class="chart-card">
+  <div class="chart-header">
+    <div class="chart-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      THROUGHPUT REAL-TIME
+      <select class="btn-select" id="ifaceSelector" style="padding: 2px 8px; font-size: 11px;">
+        <option value="bridge1">bridge1 (LAN AP)</option>
+        <option value="ether1">ether1 (Uplink)</option>
+        <option value="wlan1">wlan1 (2.4 GHz)</option>
+        <option value="wlan2">wlan2 (5 GHz)</option>
+      </select>
+    </div>
+    <div class="chart-controls">
+      <span class="dim">Puncak: <b id="chartPeak" style="color:var(--text-primary)">0 kbps</b></span>
+    </div>
+  </div>
+
+  <canvas id="chart" width="1200" height="72"></canvas>
+
+  <div class="chart-legend">
+    <div class="legend-streams">
+      <div class="legend-item">
+        <span class="dot-legend" style="background:#22d3ee"></span>
+        <span>Download (RX): <b id="rxRate" style="color:#22d3ee">0 kbps</b></span>
+      </div>
+      <div class="legend-item">
+        <span class="dot-legend" style="background:#a78bfa"></span>
+        <span>Upload (TX): <b id="txRate" style="color:#a78bfa">0 kbps</b></span>
+      </div>
+    </div>
+    <div class="dim" id="chartTotalBytes">Total akumulasi: ↓ 0 B · ↑ 0 B</div>
+  </div>
+</section>
+
+<!-- Main Navigation Tabs -->
+<nav class="tabs-nav" id="mainTabs">
+  <button class="tab-btn" data-tab="fleet">
+    Armada Router
+    <span class="tab-count" id="countFleet">1</span>
+  </button>
+  <button class="tab-btn active" data-tab="wireless">
+    Wireless
+    <span class="tab-count" id="countWireless">0</span>
+  </button>
+  <button class="tab-btn" data-tab="overview">
+    Ringkasan
+  </button>
+  <button class="tab-btn" data-tab="interfaces">
+    Interface
+    <span class="tab-count" id="countInterfaces">7</span>
+  </button>
+  <button class="tab-btn" data-tab="network">
+    Jaringan & ARP
+    <span class="tab-count" id="countArp">0</span>
+  </button>
+  <button class="tab-btn" data-tab="firewall">
+    Firewall
+    <span class="tab-count" id="countFw">0</span>
+  </button>
+  <button class="tab-btn" data-tab="services">
+    Service & Akun
+    <span class="tab-count" id="countServices">8</span>
+  </button>
+  <button class="tab-btn" data-tab="diagnostics">
+    Diagnostik (Ping)
+  </button>
+  <button class="tab-btn" data-tab="logs">
+    Log Router
+    <span class="tab-count" id="countLogs">120</span>
+  </button>
+</nav>
+
+<!-- Tab Content Container -->
+<main id="tabContent"></main>
+
+<!-- Modal Tambah / Edit MikroTik -->
+<div class="modal-overlay" id="deviceModal">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3 id="modalTitle">Tambah Router MikroTik</h3>
+      <button class="btn-close" onclick="closeDeviceModal()">&times;</button>
+    </div>
+    <form id="deviceForm" onsubmit="event.preventDefault(); saveDeviceFromModal();">
+      <input type="hidden" id="formDevId">
+      <div class="form-group">
+        <label>Nama Perangkat / Label <span class="dim" style="text-transform:none; font-weight:normal;">(Opsional — kosongkan agar otomatis mengikuti nama asli router)</span></label>
+        <input type="text" id="formDevName" class="form-control" placeholder="Otomatis mengikuti nama identity router (kosongkan saja)">
+      </div>
+      <div class="form-row">
+        <div class="form-group" style="flex:2;">
+          <label>IP Address / Host</label>
+          <input type="text" id="formDevHost" class="form-control" placeholder="192.168.88.xxx" required>
+        </div>
+        <div class="form-group" style="flex:1;">
+          <label>Port API</label>
+          <input type="number" id="formDevPort" class="form-control" value="8728" required>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Username API</label>
+          <input type="text" id="formDevUser" class="form-control" value="admin" required>
+        </div>
+        <div class="form-group">
+          <label>Password API</label>
+          <input type="password" id="formDevPass" class="form-control" value="Mikrotik@rsam.33">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Grup / Lokasi</label>
+          <input type="text" id="formDevGroup" class="form-control" placeholder="Contoh: Rawat Jalan / Lt 2">
+        </div>
+        <div class="form-group" style="display:flex; align-items:center; margin-top:18px;">
+          <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; text-transform:none; font-size:12px; color:var(--text-secondary);">
+            <input type="checkbox" id="formDevDefault"> Jadikan Default
+          </label>
+        </div>
+      </div>
+      <div id="modalTestResult" class="modal-test-box"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="btnModalTest" onclick="testDeviceFromModal()">Tes Koneksi</button>
+        <button type="button" class="btn" onclick="closeDeviceModal()">Batal</button>
+        <button type="submit" class="btn active" id="btnModalSave">Simpan Perangkat</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+/* =====================================================================
+   State & Helpers
+   ===================================================================== */
+const state = {
+  data: null,
+  devices: [],
+  currentDeviceId: localStorage.getItem('mikrotik_active_device') || 'apm-hrd',
+  fleetStatus: [],
+  activeTab: 'wireless',
+  activeRadio: 'all',
+  selectedIface: 'bridge1',
+  searchQuery: '',
+  logFilterTopic: 'all',
+  refreshTimer: null,
+  refreshMs: 5000,
+  trafficHistory: {
+    rx: Array.from({length: 45}, () => Math.round(150000 + Math.random() * 40000)),
+    tx: Array.from({length: 45}, () => Math.round(20000 + Math.random() * 15000))
+  },
+  isPolling: false
+};
+
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, m => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[m]);
+
+function formatBps(v) {
+  v = Number(v || 0);
+  if (v < 1000) return v.toFixed(0) + ' bps';
+  if (v < 1e6) return (v / 1e3).toFixed(1) + ' kbps';
+  if (v < 1e9) return (v / 1e6).toFixed(2) + ' Mbps';
+  return (v / 1e9).toFixed(2) + ' Gbps';
+}
+
+function formatBytes(v) {
+  v = Number(v || 0);
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i ? 1 : 0) + ' ' + units[i];
+}
+
+function getSignalClass(dbm) {
+  if (dbm == null) return { cls: 'signal-weak', label: 'tidak diketahui', badge: 'badge-muted' };
+  if (dbm >= -60) return { cls: 'signal-good', label: 'Bagus', badge: 'badge-emerald' };
+  if (dbm >= -74) return { cls: 'signal-fair', label: 'Cukup', badge: 'badge-amber' };
+  return { cls: 'signal-weak', label: 'Lemah', badge: 'badge-rose' };
+}
+
+function renderSignalBars(dbm) {
+  const level = dbm == null ? 0 : dbm >= -55 ? 4 : dbm >= -65 ? 3 : dbm >= -75 ? 2 : 1;
+  const { cls } = getSignalClass(dbm);
+  let bars = '';
+  for (let i = 1; i <= 4; i++) {
+    const h = 3 + i * 2.5;
+    bars += `<span class="${i <= level ? 'active' : ''}" style="height:${h}px"></span>`;
+  }
+  return `<span class="signal-bars ${cls}">${bars}</span>`;
+}
+
+/* =====================================================================
+   Canvas Bandwidth Spark-Chart
+   ===================================================================== */
+function drawTrafficChart() {
+  const canvas = $('#chart');
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth;
+  const H = 72;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  const rx = state.trafficHistory.rx;
+  const tx = state.trafficHistory.tx;
+  const max = Math.max(50000, ...rx, ...tx);
+  const len = rx.length;
+
+  $('#chartPeak').textContent = formatBps(max);
+
+  // Background Grid Lines & Axis Scale
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  for (let i = 1; i <= 3; i++) {
+    const y = Math.round((H * i) / 4);
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Axis scale hint on left
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+  ctx.font = '9px monospace';
+  ctx.fillText(formatBps(max), 6, 12);
+  ctx.fillText('0 bps', 6, H - 4);
+
+  const getX = i => (i / (len - 1)) * (W - 8) + 4;
+  const getY = v => H - 4 - (v / max) * (H - 18);
+
+  function drawStream(arr, strokeColor, gradientStart, shadowGlow) {
+    if (!arr.length) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.lineWidth = 2.2;
+    ctx.strokeStyle = strokeColor;
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = shadowGlow;
+
+    arr.forEach((v, i) => {
+      const x = getX(i);
+      const y = getY(v);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Area fill
+    ctx.shadowBlur = 0;
+    ctx.lineTo(getX(arr.length - 1), H);
+    ctx.lineTo(getX(0), H);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, gradientStart);
+    grad.addColorStop(1, 'transparent');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Draw active blip point at the latest sample (rightmost)
+    const lastX = getX(arr.length - 1);
+    const lastY = getY(arr[arr.length - 1]);
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+    ctx.fillStyle = strokeColor;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = strokeColor;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Draw TX (Purple) then RX (Cyan)
+  drawStream(tx, '#a78bfa', 'rgba(167, 139, 250, 0.25)', 'rgba(167, 139, 250, 0.6)');
+  drawStream(rx, '#22d3ee', 'rgba(34, 211, 238, 0.28)', 'rgba(34, 211, 238, 0.8)');
+}
+
+/* =====================================================================
+   Views Renderers
+   ===================================================================== */
+
+/* 1. Wireless Tab */
+function renderWirelessTab(d) {
+  const w = d.wireless || {};
+  const clients = w.clients || [];
+  const radios = w.interfaces || [];
+  const query = state.searchQuery.toLowerCase().trim();
+
+  // Radio selection chips
+  let chips = `<div class="radio-chips">
+    <button class="radio-chip ${state.activeRadio === 'all' ? 'active' : ''}" onclick="setRadio('all')">
+      Semua Radio (${clients.length})
+    </button>`;
+  radios.forEach(r => {
+    const count = (r.clients || []).length;
+    chips += `<button class="radio-chip ${state.activeRadio === r.name ? 'active' : ''}" onclick="setRadio('${r.name}')">
+      ${esc(r.name)} (${esc(r.ssid || 'Tanpa SSID')}) • ${count}
+    </button>`;
+  });
+  chips += `</div>`;
+
+  // Filter clients
+  let filtered = clients;
+  if (state.activeRadio !== 'all') {
+    filtered = filtered.filter(c => c.interface === state.activeRadio);
+  }
+  if (query) {
+    filtered = filtered.filter(c =>
+      (c.mac || '').toLowerCase().includes(query) ||
+      (c.interface || '').toLowerCase().includes(query)
+    );
+  }
+
+  const rows = filtered.map((c, idx) => {
+    const { cls, label, badge } = getSignalClass(c.signal_dbm);
+    const bars = renderSignalBars(c.signal_dbm);
+    return `<tr>
+      <td class="mono dim">${idx + 1}</td>
+      <td class="mono" style="font-weight:600; color:var(--text-primary)">
+        <span style="color:var(--cyan-400)">▪</span> ${esc(c.mac)}
+      </td>
+      <td><span class="badge badge-muted">${esc(c.interface)}</span></td>
+      <td>
+        <span class="${cls} mono">${bars} ${esc(c.signal || '—')}</span>
+      </td>
+      <td><span class="badge ${badge}">${label}</span></td>
+      <td class="mono dim right">${esc(c.tx_rate || '—')}</td>
+      <td class="mono dim right">${esc(c.rx_rate || '—')}</td>
+      <td class="mono right">${esc(c.uptime || '—')}</td>
+    </tr>`;
+  }).join('');
+
+  // Radios quick summary cards
+  const radioCards = radios.map(r => `
+    <div class="card" style="margin-bottom:12px;">
+      <div class="card-header">
+        <span class="card-title">${esc(r.name)} · ${esc(r.band || 'virtual')}</span>
+        <span class="badge ${r.running ? 'badge-emerald' : 'badge-rose'}">${r.running ? 'Running' : 'Down'}</span>
+      </div>
+      <div class="key-value-row">
+        <span class="k">SSID</span>
+        <span class="v" style="color:var(--cyan-400); font-weight:600;">${esc(r.ssid || '—')}</span>
+      </div>
+      <div class="key-value-row">
+        <span class="k">Channel / Frekuensi</span>
+        <span class="v">${esc(r.channel || r.frequency || 'auto')}</span>
+      </div>
+      <div class="key-value-row">
+        <span class="k">Kualitas Link (CCQ)</span>
+        <span class="v">${r.ccq ? esc(r.ccq) + '%' : '—'}</span>
+      </div>
+      <div class="key-value-row">
+        <span class="k">Noise Floor</span>
+        <span class="v">${r.noise_floor ? esc(r.noise_floor) + ' dBm' : '—'}</span>
+      </div>
+      <div class="key-value-row">
+        <span class="k">Klien Terhubung</span>
+        <span class="v"><b style="color:var(--emerald-400)">${r.registered_clients || 0}</b> klien</span>
+      </div>
+    </div>
+  `).join('');
+
+  return `
+    ${chips}
+    <div class="grid-2">
+      <div style="grid-column: 1 / -1">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">DAFTAR KLIEN WIRELESS (${filtered.length} Klien Terdeteksi)</span>
+            <span class="dim" style="font-size:11px;">Filter: Sinyal Hijau (≥ -60 dBm), Kuning (-61 s/d -74 dBm), Merah (&lt; -75 dBm)</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th style="width:30px">#</th>
+                <th>MAC Address</th>
+                <th>Interface</th>
+                <th>Sinyal (dBm)</th>
+                <th>Kualitas</th>
+                <th class="right">TX Rate</th>
+                <th class="right">RX Rate</th>
+                <th class="right">Uptime</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows || '<tr><td colspan="8" class="empty-state">Tidak ada klien yang cocok dengan filter.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div style="grid-column: 1 / -1; margin-top: 14px;">
+        <h4 style="font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); margin-bottom:10px;">
+          Status Radio Hardware (${radios.length} Radio)
+        </h4>
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:12px;">
+          ${radioCards}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* 2. Overview Tab */
+function renderOverviewTab(d) {
+  const s = d.system || {};
+  const n = d.network || {};
+  const fw = d.firewall || {};
+  const fwc = fw.counts || {};
+
+  return `
+    <div class="grid-2">
+      <!-- Hardware Specs -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Informasi Perangkat</span>
+          <span class="badge badge-cyan">${esc(s.board || 'MikroTik')}</span>
+        </div>
+        <div class="key-value-row"><span class="k">Device Identity</span><span class="v">${esc(s.identity || '—')}</span></div>
+        <div class="key-value-row"><span class="k">Model Hardware</span><span class="v">${esc(s.model || s.board || '—')}</span></div>
+        <div class="key-value-row"><span class="k">Serial Number</span><span class="v">${esc(s.serial || '—')}</span></div>
+        <div class="key-value-row"><span class="k">Arsitektur CPU</span><span class="v">${esc(s.architecture || '—')} (${s.cpu_count || 1} Cores @ ${s.cpu_frequency || 0} MHz)</span></div>
+        <div class="key-value-row"><span class="k">RouterOS Version</span><span class="v">${esc(s.version || '—')}</span></div>
+        <div class="key-value-row"><span class="k">Firmware Saat Ini</span><span class="v">${esc(s.firmware || '—')}</span></div>
+        <div class="key-value-row"><span class="k">Firmware Upgrade</span><span class="v">${esc(s.firmware_upgrade || 'Sudah terbaru')}</span></div>
+        <div class="key-value-row"><span class="k">Total Storage (Disk)</span><span class="v">${s.disk_free_mb || 0} MB Free / ${s.disk_total_mb || 0} MB</span></div>
+      </div>
+
+      <!-- Network & Routing Summary -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Konfigurasi Jaringan Utama</span>
+          <span class="badge badge-emerald">Aktif</span>
+        </div>
+        ${(n.addresses || []).map(a => `
+          <div class="key-value-row">
+            <span class="k">IP ${esc(a.interface)}</span>
+            <span class="v">${esc(a.address)} ${a.dynamic ? '<span class="badge badge-cyan">dhcp</span>' : '<span class="badge badge-muted">static</span>'}</span>
+          </div>
+        `).join('') || '<div class="empty-state">Tidak ada IP address</div>'}
+        <div class="key-value-row"><span class="k">Default Gateway</span><span class="v">${esc((n.routes || []).find(r => r.dst === '0.0.0.0/0')?.gateway || '—')}</span></div>
+        <div class="key-value-row"><span class="k">DNS Dinamis</span><span class="v">${esc(n.dns?.dynamic || '—')}</span></div>
+        <div class="key-value-row"><span class="k">Waktu & Jam</span><span class="v">${esc(s.date || '')} ${esc(s.clock || '')} (${esc(s.timezone || '')})</span></div>
+        <div class="key-value-row">
+          <span class="k">Audit Firewall</span>
+          <span class="v">
+            <span class="badge badge-muted">${fwc.filter || 0} Filter</span>
+            <span class="badge badge-muted">${fwc.nat || 0} NAT</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* 3. Interfaces Tab */
+function renderInterfacesTab(d) {
+  const ifaces = d.interfaces || [];
+  const query = state.searchQuery.toLowerCase().trim();
+
+  const filtered = ifaces.filter(i =>
+    !query || (i.name || '').toLowerCase().includes(query) || (i.mac || '').toLowerCase().includes(query)
+  );
+
+  const rows = filtered.map(i => {
+    const isUp = i.running && !i.disabled;
+    return `<tr>
+      <td class="mono" style="font-weight:600">
+        <span style="color:${isUp ? 'var(--emerald-400)' : 'var(--text-muted)'}">▪</span> ${esc(i.name)}
+      </td>
+      <td><span class="badge badge-cyan">${esc(i.type)}</span></td>
+      <td>
+        <span class="badge ${isUp ? 'badge-emerald' : 'badge-rose'}">
+          ${i.disabled ? 'Disabled' : i.running ? 'Running' : 'Down'}
+        </span>
+      </td>
+      <td class="mono dim">${esc(i.mac || '—')}</td>
+      <td class="mono dim right">${esc(i.mtu || '—')}</td>
+      <td class="mono right" style="color:var(--cyan-400)">${i.rx_bps != null ? formatBps(i.rx_bps) : '—'}</td>
+      <td class="mono right" style="color:var(--purple-400)">${i.tx_bps != null ? formatBps(i.tx_bps) : '—'}</td>
+      <td class="mono right dim">${formatBytes(i.rx_byte)}</td>
+      <td class="mono right dim">${formatBytes(i.tx_byte)}</td>
+      <td class="mono right ${i.rx_errors || i.tx_errors ? 'signal-weak' : 'dim'}">
+        ${i.rx_errors || 0} / ${i.tx_errors || 0}
+      </td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Daftar Interface Fisik & Virtual (${filtered.length} Interface)</span>
+        <span class="dim" style="font-size:11px">Throughput real-time dimonitor via socket API MikroTik</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Nama Port</th>
+            <th>Tipe</th>
+            <th>Status</th>
+            <th>MAC Address</th>
+            <th class="right">MTU</th>
+            <th class="right">RX Now</th>
+            <th class="right">TX Now</th>
+            <th class="right">Total RX</th>
+            <th class="right">Total TX</th>
+            <th class="right">Drops/Errors</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows || '<tr><td colspan="10" class="empty-state">Tidak ada interface yang cocok.</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+/* 4. Network & ARP Tab */
+function renderNetworkTab(d) {
+  const n = d.network || {};
+  const arp = n.arp || [];
+  const routes = n.routes || [];
+  const query = state.searchQuery.toLowerCase().trim();
+
+  const filteredArp = arp.filter(a =>
+    !query || (a.address || '').toLowerCase().includes(query) || (a.mac || '').toLowerCase().includes(query)
+  );
+
+  return `
+    <div class="grid-2">
+      <!-- ARP Table -->
+      <div class="card" style="grid-column: 1 / -1;">
+        <div class="card-header">
+          <span class="card-title">Tabel ARP Jaringan (${filteredArp.length} Host Terdeteksi)</span>
+          <span class="dim" style="font-size:11px">Mapping IP ke MAC address pada LAN lokal</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>IP Address</th>
+              <th>MAC Address</th>
+              <th>Interface</th>
+              <th>Tipe</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${filteredArp.map(a => `
+              <tr>
+                <td class="mono" style="font-weight:600; color:var(--text-primary)">${esc(a.address)}</td>
+                <td class="mono dim">${esc(a.mac || '—')}</td>
+                <td><span class="badge badge-muted">${esc(a.interface)}</span></td>
+                <td><span class="badge ${a.dynamic ? 'badge-cyan' : 'badge-emerald'}">${a.dynamic ? 'Dynamic' : 'Static'}</span></td>
+              </tr>
+            `).join('') || '<tr><td colspan="4" class="empty-state">Tabel ARP kosong.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- IP Addresses -->
+      <div class="card">
+        <div class="card-header"><span class="card-title">IP Address Assignment</span></div>
+        <table>
+          <thead>
+            <tr><th>Address</th><th>Network</th><th>Interface</th><th>Sumber</th></tr>
+          </thead>
+          <tbody>
+            ${(n.addresses || []).map(a => `
+              <tr>
+                <td class="mono">${esc(a.address)}</td>
+                <td class="mono dim">${esc(a.network)}</td>
+                <td>${esc(a.interface)}</td>
+                <td><span class="badge ${a.dynamic ? 'badge-cyan' : 'badge-emerald'}">${a.dynamic ? 'DHCP' : 'Static'}</span></td>
+              </tr>
+            `).join('') || '<tr><td colspan="4" class="empty-state">Kosong</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Routing Table -->
+      <div class="card">
+        <div class="card-header"><span class="card-title">Tabel Routing</span></div>
+        <table>
+          <thead>
+            <tr><th>Tujuan (Dst)</th><th>Gateway</th><th class="right">Distance</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            ${routes.map(r => `
+              <tr>
+                <td class="mono">${esc(r.dst)}</td>
+                <td class="mono">${esc(r.gateway || '—')}</td>
+                <td class="mono dim right">${esc(r.distance || '0')}</td>
+                <td><span class="badge ${r.active ? 'badge-emerald' : 'badge-muted'}">${r.active ? 'Active' : 'Inactive'}</span></td>
+              </tr>
+            `).join('') || '<tr><td colspan="4" class="empty-state">Kosong</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+/* 5. Firewall Tab */
+function renderFirewallTab(d) {
+  const fw = d.firewall || {};
+  const filter = fw.filter || [];
+  const nat = fw.nat || [];
+  const addrList = fw.address_list || [];
+
+  return `
+    <div class="grid-2">
+      <div class="card" style="grid-column: 1 / -1;">
+        <div class="card-header">
+          <span class="card-title">Firewall Filter Rules (${filter.length} Rules)</span>
+          <span class="badge ${filter.length ? 'badge-cyan' : 'badge-muted'}">${filter.length ? 'Aktif' : 'Kosong (AP Mode)'}</span>
+        </div>
+        <table>
+          <thead>
+            <tr><th>#</th><th>Chain</th><th>Action</th><th>Src Address</th><th>Dst Address</th><th>Protocol</th><th>Comment</th></tr>
+          </thead>
+          <tbody>
+            ${filter.map((r, i) => `
+              <tr>
+                <td class="mono dim">${i + 1}</td>
+                <td><span class="badge badge-muted">${esc(r.chain)}</span></td>
+                <td><span class="badge ${r.action === 'accept' ? 'badge-emerald' : 'badge-rose'}">${esc(r.action)}</span></td>
+                <td class="mono">${esc(r['src-address'] || 'any')}</td>
+                <td class="mono">${esc(r['dst-address'] || 'any')}</td>
+                <td class="mono dim">${esc(r.protocol || 'any')}</td>
+                <td class="dim">${esc(r.comment || '—')}</td>
+              </tr>
+            `).join('') || '<tr><td colspan="7" class="empty-state">Belum ada filter rule (Access Point murni).</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><span class="card-title">Firewall NAT Rules (${nat.length})</span></div>
+        <table>
+          <thead><tr><th>Chain</th><th>Action</th><th>Src</th><th>To</th></tr></thead>
+          <tbody>
+            ${nat.map(r => `
+              <tr>
+                <td>${esc(r.chain)}</td>
+                <td>${esc(r.action)}</td>
+                <td class="mono">${esc(r['src-address'] || 'any')}</td>
+                <td class="mono">${esc(r['to-addresses'] || '—')}</td>
+              </tr>
+            `).join('') || '<tr><td colspan="4" class="empty-state">Tidak ada NAT rule.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><span class="card-title">Address Lists (${addrList.length})</span></div>
+        <table>
+          <thead><tr><th>List Name</th><th>IP / CIDR</th><th>Comment</th></tr></thead>
+          <tbody>
+            ${addrList.map(a => `
+              <tr>
+                <td><span class="badge badge-cyan">${esc(a.list)}</span></td>
+                <td class="mono">${esc(a.address)}</td>
+                <td class="dim">${esc(a.comment || '—')}</td>
+              </tr>
+            `).join('') || '<tr><td colspan="3" class="empty-state">Address list kosong.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+/* 6. Services & Users Tab */
+function renderServicesTab(d) {
+  const svc = d.services || [];
+  const users = d.users || [];
+
+  return `
+    <div class="grid-2">
+      <!-- IP Services -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">IP Services MikroTik (${svc.length})</span>
+          <span class="dim" style="font-size:11px">Audit port keamanan manajemen</span>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Service</th><th class="right">Port</th><th>Allowed IP Range</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            ${svc.map(s => {
+              const isOpenAll = !s.disabled && !s.address;
+              return `<tr>
+                <td class="mono" style="font-weight:600">${esc(s.name)}</td>
+                <td class="mono dim right">${esc(s.port)}</td>
+                <td class="mono">
+                  ${s.address ? `<span class="badge badge-emerald">${esc(s.address)}</span>` : isOpenAll ? `<span class="badge badge-amber">Semua IP (Terbuka)</span>` : '<span class="dim">—</span>'}
+                </td>
+                <td>
+                  <span class="badge ${s.disabled ? 'badge-muted' : 'badge-emerald'}">
+                    ${s.disabled ? 'Disabled' : 'Enabled'}
+                  </span>
+                </td>
+              </tr>`;
+            }).join('') || '<tr><td colspan="4" class="empty-state">Kosong</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Users -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">User Manajemen (${users.length})</span>
+          <span class="badge badge-emerald">Aktif</span>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Nama User</th><th>Group</th><th>Login Terakhir</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            ${users.map(u => `
+              <tr>
+                <td class="mono" style="font-weight:600; color:var(--text-primary)">
+                  <span style="color:var(--cyan-400)">▪</span> ${esc(u.name)}
+                </td>
+                <td><span class="badge badge-cyan">${esc(u.group)}</span></td>
+                <td class="mono dim">${esc(u.last_logged_in || 'Belum pernah')}</td>
+                <td><span class="badge ${u.disabled ? 'badge-rose' : 'badge-emerald'}">${u.disabled ? 'Disabled' : 'Aktif'}</span></td>
+              </tr>
+            `).join('') || '<tr><td colspan="4" class="empty-state">Kosong</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+/* 7. Diagnostic (Ping) Tab */
+function renderDiagnosticsTab() {
+  return `
+    <div class="ping-panel">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
+        <h3 style="font-size:13px; font-weight:600; color:var(--text-primary);">
+          Alat Diagnostik Jaringan: Ping dari MikroTik Hardware
+        </h3>
+        <div style="display:flex; gap:6px;">
+          <button class="radio-chip" onclick="$('#pingTarget').value='192.168.88.1'; executePing();">Gateway (192.168.88.1)</button>
+          <button class="radio-chip" onclick="$('#pingTarget').value='1.1.1.1'; executePing();">Cloudflare (1.1.1.1)</button>
+          <button class="radio-chip" onclick="$('#pingTarget').value='8.8.8.8'; executePing();">Google (8.8.8.8)</button>
+        </div>
+      </div>
+      <p class="dim" style="font-size:12px; margin-bottom:12px;">
+        Menjalankan perintah <code>/ping</code> langsung di router MikroTik untuk memeriksa latensi koneksi internet atau gateway internal.
+      </p>
+      <div class="ping-form">
+        <input type="text" id="pingTarget" class="ping-input" value="192.168.88.1" placeholder="IP atau Hostname (contoh: 8.8.8.8)">
+        <select id="pingCount" class="btn-select">
+          <option value="2">2 Paket</option>
+          <option value="3" selected>3 Paket</option>
+          <option value="5">5 Paket</option>
+        </select>
+        <button class="btn active" id="btnRunPing" onclick="executePing()">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          Kirim Ping
+        </button>
+      </div>
+      <div id="pingOutput" class="ping-results">
+        <div class="dim">Hasil ping akan muncul di sini...</div>
+      </div>
+    </div>
+  `;
+}
+
+/* 8. Logs Tab */
+function renderLogsTab(d) {
+  const logs = d.logs || [];
+  const query = state.searchQuery.toLowerCase().trim();
+
+  let filtered = logs;
+  if (state.logFilterTopic !== 'all') {
+    filtered = filtered.filter(l => (l.topics || '').toLowerCase().includes(state.logFilterTopic));
+  }
+  if (query) {
+    filtered = filtered.filter(l =>
+      (l.message || '').toLowerCase().includes(query) || (l.topics || '').toLowerCase().includes(query)
+    );
+  }
+
+  const chips = `
+    <div class="radio-chips" style="margin-bottom:12px;">
+      <button class="radio-chip ${state.logFilterTopic === 'all' ? 'active' : ''}" onclick="setLogTopic('all')">Semua Log (${logs.length})</button>
+      <button class="radio-chip ${state.logFilterTopic === 'wireless' ? 'active' : ''}" onclick="setLogTopic('wireless')">Wireless</button>
+      <button class="radio-chip ${state.logFilterTopic === 'system' ? 'active' : ''}" onclick="setLogTopic('system')">System</button>
+      <button class="radio-chip ${state.logFilterTopic === 'account' ? 'active' : ''}" onclick="setLogTopic('account')">Account</button>
+      <button class="radio-chip ${state.logFilterTopic === 'error' ? 'active' : ''}" onclick="setLogTopic('error')">Error & Critical</button>
+    </div>
+  `;
+
+  const rows = filtered.map(l => {
+    const isErr = /error|critical|failure/i.test((l.topics || '') + (l.message || ''));
+    return `
+      <div class="log-row ${isErr ? 'is-error' : ''}">
+        <span class="l-time mono">${esc(l.time || '—')}</span>
+        <span class="l-topic"><span class="badge ${isErr ? 'badge-rose' : 'badge-muted'}">${esc(l.topics || 'info')}</span></span>
+        <span class="l-msg mono">${esc(l.message || '')}</span>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    ${chips}
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Stream Log Aktivitas Router</span>
+        <span class="dim" style="font-size:11px">${filtered.length} baris ditampilkan</span>
+      </div>
+      <div class="log-stream">
+        ${rows || '<div class="empty-state">Tidak ada entri log yang cocok.</div>'}
+      </div>
+    </div>
+  `;
+}
+
+/* =====================================================================
+   State Mutations & Triggers
+   ===================================================================== */
+async function loadDeviceList() {
+  try {
+    const res = await fetch('/api/devices');
+    const json = await res.json();
+    if (json.ok && Array.isArray(json.devices)) {
+      state.devices = json.devices;
+      if ($('#countFleet')) $('#countFleet').textContent = json.devices.length;
+      const select = $('#deviceSelect');
+      if (select) {
+        select.innerHTML = json.devices.map(d => `
+          <option value="${d.id}" ${d.id === state.currentDeviceId ? 'selected' : ''}>
+            ${esc(d.name)} (${esc(d.host)})
+          </option>
+        `).join('');
+      }
+      if (!json.devices.some(d => d.id === state.currentDeviceId)) {
+        const def = json.devices.find(d => d.is_default) || json.devices[0];
+        if (def) switchDevice(def.id, false);
+      }
+    }
+  } catch (e) {
+    console.error('Gagal memuat daftar perangkat:', e);
+  }
+}
+
+function switchDevice(deviceId, doFetch = true) {
+  state.currentDeviceId = deviceId;
+  localStorage.setItem('mikrotik_active_device', deviceId);
+  const select = $('#deviceSelect');
+  if (select) select.value = deviceId;
+  state.trafficHistory.rx = Array.from({length: 45}, () => 0);
+  state.trafficHistory.tx = Array.from({length: 45}, () => 0);
+  if (doFetch) fetchDashboard();
+  if (state.activeTab === 'fleet') renderCurrentTab();
+}
+
+async function fetchFleetStatus() {
+  try {
+    const res = await fetch('/api/devices/fleet');
+    const json = await res.json();
+    if (json.ok && Array.isArray(json.fleet)) {
+      state.fleetStatus = json.fleet;
+      if (state.activeTab === 'fleet') renderCurrentTab();
+    }
+  } catch (e) {
+    console.error('Gagal memuat status armada:', e);
+  }
+}
+
+function openDeviceModal(editData = null) {
+  const m = $('#deviceModal');
+  const title = $('#modalTitle');
+  const tBox = $('#modalTestResult');
+  tBox.className = 'modal-test-box';
+  tBox.innerHTML = '';
+
+  if (editData) {
+    title.textContent = 'Edit Router: ' + editData.name;
+    $('#formDevId').value = editData.id;
+    $('#formDevName').value = editData.name || '';
+    $('#formDevHost').value = editData.host || '';
+    $('#formDevPort').value = editData.port || 8728;
+    $('#formDevUser').value = editData.user || 'API';
+    $('#formDevPass').value = '';
+    $('#formDevPass').placeholder = editData.has_pass ? '•••••••• (Biarkan kosong jika tetap)' : '';
+    $('#formDevGroup').value = editData.group || '';
+    $('#formDevDefault').checked = !!editData.is_default;
+  } else {
+    title.textContent = 'Tambah Router MikroTik Baru';
+    $('#formDevId').value = '';
+    $('#formDevName').value = '';
+    $('#formDevHost').value = '';
+    $('#formDevPort').value = 8728;
+    $('#formDevUser').value = 'admin';
+    $('#formDevPass').value = 'Mikrotik@rsam.33';
+    $('#formDevGroup').value = 'Default';
+    $('#formDevDefault').checked = false;
+  }
+  m.classList.add('show');
+}
+
+function closeDeviceModal() {
+  $('#deviceModal')?.classList.remove('show');
+}
+
+async function testDeviceFromModal() {
+  const host = ($('#formDevHost')?.value || '').trim();
+  const port = parseInt($('#formDevPort')?.value || '8728', 10);
+  const user = ($('#formDevUser')?.value || '').trim();
+  const pass = $('#formDevPass')?.value || '';
+  const tBox = $('#modalTestResult');
+  const btn = $('#btnModalTest');
+
+  if (!host) {
+    tBox.className = 'modal-test-box show';
+    tBox.innerHTML = '<span style="color:var(--rose-400)">Harap masukkan IP Address/Host target!</span>';
+    return;
+  }
+
+  tBox.className = 'modal-test-box show';
+  tBox.innerHTML = `<span class="dim">Menguji koneksi ke <b>${esc(host)}:${port}</b> via user <b>${esc(user)}</b>...</span>`;
+  if (btn) btn.disabled = true;
+
+  try {
+    const res = await fetch('/api/devices/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host, port, user, pass })
+    });
+    const json = await res.json();
+    if (json.ok) {
+      if (!$('#formDevName')?.value && json.identity) {
+        $('#formDevName').value = json.identity + (json.board && json.board !== 'MikroTik' ? ` (${json.board})` : '');
+      }
+      tBox.innerHTML = `<div style="color:var(--emerald-400)">
+        ✓ <b>Koneksi Sukses!</b><br>
+        Identity: <b>${esc(json.identity)}</b> · Model: ${esc(json.board)} · ROS: ${esc(json.version)} · Uptime: ${esc(json.uptime)}
+      </div>`;
+    } else {
+      tBox.innerHTML = `<span style="color:var(--rose-400)">✕ Gagal koneksi: ${esc(json.error)}</span>`;
+    }
+  } catch (e) {
+    tBox.innerHTML = `<span style="color:var(--rose-400)">✕ Error: ${esc(e.message)}</span>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function saveDeviceFromModal() {
+  const id = ($('#formDevId')?.value || '').trim();
+  const name = ($('#formDevName')?.value || '').trim();
+  const host = ($('#formDevHost')?.value || '').trim();
+  const port = parseInt($('#formDevPort')?.value || '8728', 10);
+  const user = ($('#formDevUser')?.value || '').trim();
+  const pass = $('#formDevPass')?.value || '';
+  const group = ($('#formDevGroup')?.value || '').trim();
+  const is_default = $('#formDevDefault')?.checked || false;
+  const btn = $('#btnModalSave');
+
+  if (!host) {
+    alert('Host / IP Address router harus diisi');
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  try {
+    const payload = { host, port, user, group, is_default };
+    if (name) payload.name = name;
+    if (pass) payload.pass = pass;
+
+    let res;
+    if (id) {
+      res = await fetch(`/api/devices/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    } else {
+      res = await fetch('/api/devices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    }
+    const json = await res.json();
+    if (!res.ok || !json.ok) throw new Error(json.detail || json.error || 'Gagal menyimpan perangkat');
+
+    closeDeviceModal();
+    await loadDeviceList();
+    if (json.device?.id) switchDevice(json.device.id);
+  } catch (e) {
+    alert('Gagal simpan: ' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function quickTestDevice(deviceId) {
+  const dev = (state.devices || []).find(d => d.id === deviceId);
+  if (!dev) return;
+  alert(`Menguji koneksi ke ${dev.name} (${dev.host})...`);
+  try {
+    const res = await fetch(`/api/devices/${encodeURIComponent(deviceId)}/dashboard?limit_logs=1`);
+    const json = await res.json();
+    if (json.ok) {
+      alert(`✓ Sukses! Terhubung ke ${json.system?.identity || dev.name} (${json.system?.board || 'MikroTik'})`);
+    } else {
+      alert(`✕ Gagal: ${json.error}`);
+    }
+  } catch (e) {
+    alert(`✕ Error: ${e.message}`);
+  }
+}
+
+async function deleteDevice(deviceId) {
+  const dev = (state.devices || []).find(d => d.id === deviceId);
+  if (!confirm(`Yakin ingin menghapus ${dev?.name || deviceId}?`)) return;
+
+  try {
+    const res = await fetch(`/api/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
+    const json = await res.json();
+    if (!res.ok || !json.ok) throw new Error(json.detail || json.error || 'Gagal menghapus');
+    await loadDeviceList();
+    if (state.currentDeviceId === deviceId) {
+      const remaining = state.devices[0];
+      if (remaining) switchDevice(remaining.id);
+    }
+    renderCurrentTab();
+  } catch (e) {
+    alert('Gagal hapus: ' + e.message);
+  }
+}
+
+function renderFleetTab() {
+  const devs = state.devices || [];
+  const fleet = state.fleetStatus || [];
+  const fMap = {};
+  fleet.forEach(f => { fMap[f.id] = f; });
+
+  const cards = devs.map(d => {
+    const stat = fMap[d.id] || {};
+    const isCur = d.id === state.currentDeviceId;
+    const isOnline = stat.online !== undefined ? stat.online : true;
+    return `
+      <div class="fleet-card ${isCur ? 'is-active' : ''}">
+        <div>
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px;">
+            <div>
+              <div style="font-weight:700; font-size:14px; color:var(--text-primary); display:flex; align-items:center; gap:8px;">
+                <span class="pulse-dot ${isOnline ? '' : 'err'}" style="width:7px; height:7px;"></span>
+                ${esc(d.name)}
+                ${isCur ? '<span class="badge badge-cyan">Aktif</span>' : ''}
+              </div>
+              <div class="dim mono" style="font-size:11.5px; margin-top:2px;">
+                ${esc(d.host)}:${d.port || 8728} · <span class="badge badge-muted">${esc(d.group || 'Default')}</span>
+                ${d.is_default ? '<span class="badge badge-emerald">Default</span>' : ''}
+              </div>
+            </div>
+            <span class="badge ${isOnline ? 'badge-emerald' : 'badge-rose'}">
+              ${isOnline ? 'Online' : 'Offline'}
+            </span>
+          </div>
+
+          <div style="background:var(--bg-base); padding:10px 12px; border-radius:var(--radius-md); border:1px solid var(--border-default); margin-bottom:14px;">
+            <div class="key-value-row" style="padding:3px 0;">
+              <span class="k">Hardware / Model</span>
+              <span class="v">${esc(stat.board || 'cAP ac')}</span>
+            </div>
+            <div class="key-value-row" style="padding:3px 0;">
+              <span class="k">RouterOS Version</span>
+              <span class="v">${esc(stat.version || '7.13.3')}</span>
+            </div>
+            <div class="key-value-row" style="padding:3px 0;">
+              <span class="k">CPU Load</span>
+              <span class="v">${stat.cpu_load != null ? esc(stat.cpu_load) + '%' : '1-5%'}</span>
+            </div>
+            <div class="key-value-row" style="padding:3px 0;">
+              <span class="k">Uptime</span>
+              <span class="v">${esc(stat.uptime || 'Aktif')}</span>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap;">
+          <button class="btn btn-sm ${isCur ? 'active' : ''}" onclick="switchDevice('${d.id}')">
+            ${isCur ? '✓ Dibuka' : 'Buka Dashboard'}
+          </button>
+          <button class="btn btn-sm" onclick="quickTestDevice('${d.id}')" title="Uji Koneksi API">
+            Tes API
+          </button>
+          <button class="btn btn-sm" onclick='openDeviceModal(${JSON.stringify(d).replace(/'/g, "&apos;")})' title="Edit Perangkat">
+            Edit
+          </button>
+          ${devs.length > 1 ? `<button class="btn btn-sm" style="color:var(--rose-400)" onclick="deleteDevice('${d.id}')" title="Hapus Perangkat">Hapus</button>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:10px;">
+      <div>
+        <h3 style="font-size:14px; font-weight:700; color:var(--text-primary);">
+          Manajemen Armada MikroTik (${devs.length} Perangkat)
+        </h3>
+        <p class="dim" style="font-size:12px;">Kontrol dan monitoring terpusat seluruh perangkat router dari 1 dashboard gateway.</p>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn" onclick="fetchFleetStatus()" title="Perbarui status seluruh router">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+          Refresh Status Armada
+        </button>
+        <button class="btn active" onclick="openDeviceModal()">
+          + Tambah Router Baru
+        </button>
+      </div>
+    </div>
+    <div class="fleet-grid">
+      ${cards}
+    </div>
+  `;
+}
+
+function setRadio(r) {
+  state.activeRadio = r;
+  renderCurrentTab();
+}
+
+function setLogTopic(t) {
+  state.logFilterTopic = t;
+  renderCurrentTab();
+}
+
+function renderCurrentTab() {
+  if (!state.data) return;
+  const c = $('#tabContent');
+  const d = state.data;
+  if (state.activeTab === 'fleet') {
+    c.innerHTML = renderFleetTab();
+    return;
+  }
+  if (state.activeTab === 'diagnostics') {
+    if (!$('#pingTarget')) c.innerHTML = renderDiagnosticsTab();
+    return;
+  }
+  switch (state.activeTab) {
+    case 'wireless': c.innerHTML = renderWirelessTab(d); break;
+    case 'overview': c.innerHTML = renderOverviewTab(d); break;
+    case 'interfaces': c.innerHTML = renderInterfacesTab(d); break;
+    case 'network': c.innerHTML = renderNetworkTab(d); break;
+    case 'firewall': c.innerHTML = renderFirewallTab(d); break;
+    case 'services': c.innerHTML = renderServicesTab(d); break;
+    case 'logs': c.innerHTML = renderLogsTab(d); break;
+  }
+}
+
+async function executePing() {
+  const target = ($('#pingTarget')?.value || '8.8.8.8').trim();
+  const count = $('#pingCount')?.value || '3';
+  const out = $('#pingOutput');
+  const btn = $('#btnRunPing');
+  if (!out) return;
+
+  out.className = 'ping-results show';
+  out.innerHTML = `<span class="dim">Mengirim ${count} paket ICMP ke <b>${esc(target)}</b> dari router MikroTik...</span>`;
+  if (btn) btn.disabled = true;
+
+  try {
+    const res = await fetch(`/api/ping?device=${encodeURIComponent(state.currentDeviceId)}&host=${encodeURIComponent(target)}&count=${count}`);
+    const json = await res.json();
+    if (!res.ok || !json.ok) throw new Error(json.error || 'Ping gagal');
+
+    const packets = json.packets || [];
+    const last = packets[packets.length - 1] || {};
+    let lines = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid var(--border-subtle);">
+      <span><b>Target:</b> <span class="badge badge-cyan">${esc(json.target)}</span></span>
+      <span style="display:flex; gap:6px;">
+        <span class="badge badge-emerald">Loss: ${last['packet-loss'] || 0}%</span>
+        <span class="badge badge-cyan">Avg: ${last['avg-rtt'] || '—'}</span>
+        <span class="badge badge-muted">Min: ${last['min-rtt'] || '—'} / Max: ${last['max-rtt'] || '—'}</span>
+      </span>
+    </div>`;
+    packets.forEach(p => {
+      lines += `<div style="margin-top:4px; display:flex; justify-content:space-between; font-size:11.5px;">
+        <span><span class="dim">#${p.seq}</span> <span style="color:var(--text-secondary)">icmp_seq=${p.seq} ttl=${p.ttl} size=${p.size}B</span></span>
+        <span class="mono" style="color:var(--emerald-400); font-weight:600;">time=${p.time}</span>
+      </div>`;
+    });
+    out.innerHTML = lines;
+  } catch (e) {
+    out.innerHTML = `<span style="color:var(--rose-400)">Gagal: ${esc(e.message)}</span>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* =====================================================================
+   Polling & Data Pipeline
+   ===================================================================== */
+async function fetchDashboard() {
+  if (state.isPolling) return;
+  state.isPolling = true;
+
+  try {
+    const res = await fetch(`/api/dashboard?device=${encodeURIComponent(state.currentDeviceId)}&limit_logs=120`, { cache: 'no-store' });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || `HTTP ${res.status}`);
+
+    state.data = d;
+    const s = d.system || {};
+    const w = d.wireless || {};
+    const n = d.network || {};
+    const dev = d.device || {};
+
+    // Header info
+    if ($('#deviceSelect') && dev.id) $('#deviceSelect').value = dev.id;
+    $('#devArch').textContent = s.architecture || 'arm';
+    $('#devHost').textContent = dev.host || '—';
+    $('#devBoard').textContent = s.board || 'cAP ac';
+    $('#devRos').textContent = 'ROS ' + (s.version || '').split(' ')[0];
+    $('#devSerial').textContent = s.serial || '—';
+    if ($('#devGroup')) $('#devGroup').textContent = dev.group || 'Default';
+
+    // Status pill
+    $('#connDot').className = 'pulse-dot';
+    $('#connTxt').textContent = 'Online';
+    $('#banner').className = 'banner';
+
+    // Update KPI 1: CPU
+    const cpu = s.cpu_load ?? 0;
+    $('#cpuVal').innerHTML = `${cpu}<small>%</small>`;
+    $('#cpuCores').textContent = `${s.cpu_count || 4} Core`;
+    $('#cpuFreq').textContent = `${s.cpu_frequency || 0} MHz`;
+    $('#cpuArch').textContent = s.cpu || 'ARM';
+    const cpuBar = $('#cpuBar');
+    cpuBar.style.width = Math.min(cpu, 100) + '%';
+    cpuBar.className = 'gauge-fill ' + (cpu > 80 ? 'fill-rose' : cpu > 50 ? 'fill-amber' : 'fill-emerald');
+
+    // Update KPI 2: Memory
+    const memPct = s.memory_used_pct ?? 0;
+    $('#memPct').innerHTML = `${memPct.toFixed(0)}<small>%</small>`;
+    $('#memTotal').textContent = `${s.memory_total_mb || 0} MB`;
+    $('#memFree').textContent = `${s.memory_free_mb || 0} MB Free`;
+    const memBar = $('#memBar');
+    memBar.style.width = Math.min(memPct, 100) + '%';
+    memBar.className = 'gauge-fill ' + (memPct > 85 ? 'fill-rose' : 'fill-cyan');
+
+    // Update KPI 3: WiFi
+    const clients = w.clients || [];
+    $('#wifiCount').innerHTML = `${clients.length}<small>klien</small>`;
+    let good = 0, fair = 0, weak = 0;
+    clients.forEach(c => {
+      const sig = c.signal_dbm;
+      if (sig != null) {
+        if (sig >= -60) good++;
+        else if (sig >= -74) fair++;
+        else weak++;
+      }
+    });
+    $('#badgeGood').textContent = `${good} bagus`;
+    $('#badgeFair').textContent = `${fair} cukup`;
+    $('#badgeWeak').textContent = `${weak} lemah`;
+    const totSig = Math.max(clients.length, 1);
+    if ($('#sigBarGood')) $('#sigBarGood').style.width = ((good / totSig) * 100) + '%';
+    if ($('#sigBarFair')) $('#sigBarFair').style.width = ((fair / totSig) * 100) + '%';
+    if ($('#sigBarWeak')) $('#sigBarWeak').style.width = ((weak / totSig) * 100) + '%';
+
+    // Update KPI 4: Uptime & Clock
+    $('#uptimeVal').textContent = s.uptime || '—';
+    $('#clockVal').textContent = `${s.date || ''} ${s.clock || ''}`;
+    $('#tzVal').textContent = s.timezone || 'Asia/Jakarta';
+    const ntpOn = s.ntp_enabled === 'true';
+    $('#ntpBadge').textContent = ntpOn ? `NTP ${s.ntp_status || 'Synced'}` : 'NTP Nonaktif';
+    $('#ntpBadge').className = 'badge ' + (ntpOn ? 'badge-emerald' : 'badge-amber');
+
+    // Tab counters
+    $('#countWireless').textContent = clients.length;
+    $('#countInterfaces').textContent = (d.interfaces || []).length;
+    $('#countArp').textContent = (n.arp || []).length;
+    $('#countFw').textContent = Object.values(d.firewall?.counts || {}).reduce((a, b) => a + b, 0);
+    $('#countServices').textContent = (d.services || []).length;
+    $('#countLogs').textContent = (d.logs || []).length;
+
+    // Traffic stream from selected interface
+    const ifaceName = state.selectedIface;
+    const targetIface = (d.interfaces || []).find(i => i.name === ifaceName) ||
+                        (d.interfaces || []).find(i => /^bridge/i.test(i.name)) ||
+                        (d.interfaces || [])[0];
+
+    if (targetIface) {
+      const rx = targetIface.rx_bps || 0;
+      const tx = targetIface.tx_bps || 0;
+      state.trafficHistory.rx.push(rx);
+      state.trafficHistory.tx.push(tx);
+      if (state.trafficHistory.rx.length > 80) {
+        state.trafficHistory.rx.shift();
+        state.trafficHistory.tx.shift();
+      }
+      $('#rxRate').textContent = formatBps(rx);
+      $('#txRate').textContent = formatBps(tx);
+      $('#chartTotalBytes').textContent = `Total akumulasi: ↓ ${formatBytes(targetIface.rx_byte)} · ↑ ${formatBytes(targetIface.tx_byte)}`;
+    }
+
+    drawTrafficChart();
+    renderCurrentTab();
+  } catch (err) {
+    $('#connDot').className = 'pulse-dot err';
+    $('#connTxt').textContent = 'Terputus';
+    $('#banner').className = 'banner show';
+    $('#banner').textContent = 'Koneksi ke router terputus: ' + err.message;
+  } finally {
+    state.isPolling = false;
+  }
+}
+
+/* =====================================================================
+   Event Listeners & Keybindings
+   ===================================================================== */
+// Tab buttons click
+$$('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    $$('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.activeTab = btn.dataset.tab;
+    renderCurrentTab();
+  });
+});
+
+// Refresh rate change
+$('#refreshRate').addEventListener('change', e => {
+  const ms = parseInt(e.target.value, 10);
+  state.refreshMs = ms;
+  clearInterval(state.refreshTimer);
+  if (ms > 0) {
+    state.refreshTimer = setInterval(fetchDashboard, ms);
+  }
+});
+
+// Manual refresh button
+$('#refreshBtn').addEventListener('click', () => {
+  $('#refreshBtn').style.opacity = '0.5';
+  fetchDashboard().finally(() => { $('#refreshBtn').style.opacity = '1'; });
+});
+
+// Interface selector for bandwidth chart
+$('#ifaceSelector').addEventListener('change', e => {
+  state.selectedIface = e.target.value;
+  state.trafficHistory.rx = [];
+  state.trafficHistory.tx = [];
+});
+
+// Device selector change
+$('#deviceSelect')?.addEventListener('change', e => {
+  switchDevice(e.target.value);
+});
+
+// Global search input
+$('#globalSearch').addEventListener('input', e => {
+  state.searchQuery = e.target.value;
+  renderCurrentTab();
+});
+
+// Keyboard shortcuts
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') {
+    if (e.key === 'Escape') {
+      e.target.blur();
+      closeDeviceModal();
+    }
+    return;
+  }
+  if (e.key === '/') {
+    e.preventDefault();
+    $('#globalSearch')?.focus();
+  } else if (e.key.toLowerCase() === 'r') {
+    e.preventDefault();
+    fetchDashboard();
+  } else if (e.key >= '1' && e.key <= '9') {
+    const tabs = $$('.tab-btn');
+    const idx = parseInt(e.key, 10) - 1;
+    if (tabs[idx]) tabs[idx].click();
+  }
+});
+
+window.addEventListener('resize', drawTrafficChart);
+
+// Bootstrap
+loadDeviceList().then(() => {
+  fetchDashboard();
+  fetchFleetStatus();
+  state.refreshTimer = setInterval(fetchDashboard, state.refreshMs);
+});
+</script>
+</body>
+</html>
