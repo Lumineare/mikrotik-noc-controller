@@ -16,6 +16,10 @@ noc_history.db
 _patch_*.py
 _w2id.txt
 
+# ---- catatan perencanaan internal ----
+.superpowers/
+docs/superpowers/
+
 # ---- Python ----
 __pycache__/
 *.py[cod]
