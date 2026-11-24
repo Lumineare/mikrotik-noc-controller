@@ -2929,23 +2929,21 @@ def get_map_floors():
         enriched_p["device_model"] = "cAP (2.4 GHz Only)" if is_single_band_cap else dev.get("model", "cAP ac (Dual-Band)")
         enriched_p["is_online"] = dev.get("online", True)
         
-        # Real-time / cached client count
-        cnt = 0
+        # Jumlah klien: baca registration-table asli, cache 25 s.
+        # AP yang tidak ada di devices.json -> None (UI menyembunyikan), TIDAK pernah dikarang.
         cache_entry = MAP_CLIENTS_CACHE.get(dev_id)
-        if cache_entry and (now - cache_entry.get("ts", 0) < 25):
-            cnt = cache_entry.get("count", 0)
-        elif dev_id == "apm-hrd" or dev.get("host") == "192.168.88.1":
+        if not dev:
+            cnt = None
+        elif cache_entry and (now - cache_entry.get("ts", 0) < 25):
+            cnt = cache_entry.get("count")
+        else:
             try:
                 with get_device_lock(dev["host"]), MT(dev) as mt:
-                    regs = mt.resource("/interface/wireless/registration-table").get()
-                    cnt = len(regs)
-                    MAP_CLIENTS_CACHE[dev_id] = {"count": cnt, "ts": now}
+                    cnt = len(mt.resource("/interface/wireless/registration-table").get())
+                MAP_CLIENTS_CACHE[dev_id] = {"count": cnt, "ts": now}
             except Exception:
-                cnt = cache_entry.get("count", 13) if cache_entry else 13
-        else:
-            cnt = hash(dev_id) % 8 + 3 # representative simulation for mock APs
-            MAP_CLIENTS_CACHE[dev_id] = {"count": cnt, "ts": now}
-            
+                cnt = cache_entry.get("count") if cache_entry else None
+
         enriched_p["clients_count"] = cnt
         enriched_placements.append(enriched_p)
     

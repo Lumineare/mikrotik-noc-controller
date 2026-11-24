@@ -59,7 +59,7 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 60000);
+    const t = setInterval(load, 10000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deviceId]);
