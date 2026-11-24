@@ -11,5 +11,21 @@
   "max_client_drop": 0,
   "scan_duration": 8,
   "sample_interval_min": 5,
+  "channels_2g": [
+    1,
+    6,
+    11
+  ],
+  "channels_5g": [
+    36,
+    40,
+    44,
+    48,
+    149,
+    153,
+    157,
+    161,
+    165
+  ],
   "last_run_ts": 0.0
 }

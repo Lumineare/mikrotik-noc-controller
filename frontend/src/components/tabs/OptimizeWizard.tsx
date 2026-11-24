@@ -31,6 +31,8 @@ interface RrmConfig {
   apply_txpower: boolean;
   apply_steering: boolean;
   min_gain_pct: number;
+  channels_2g?: number[];
+  channels_5g?: number[];
 }
 
 const STEP_LABEL: Record<string, string> = {
@@ -415,6 +417,38 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
                 max={100}
                 value={cfg?.min_gain_pct ?? 15}
                 onChange={(e) => saveCfg({ min_gain_pct: Number(e.target.value) || 0 })}
+                className="block mt-0.5 w-full px-2 py-1 rounded-lg border border-slate-300 text-slate-800 font-mono"
+              />
+            </label>
+            <label className="text-slate-500 font-semibold" title="Hanya 1, 6, 11 yang tidak saling tumpang tindih. Ch 9 menabrak 6 dan 11.">
+              Channel 2.4GHz
+              <input
+                type="text"
+                defaultValue={(cfg?.channels_2g ?? [1, 6, 11]).join(',')}
+                onBlur={(e) =>
+                  saveCfg({
+                    channels_2g: e.target.value
+                      .split(/[,\s]+/)
+                      .map(Number)
+                      .filter((n) => n >= 1 && n <= 14),
+                  })
+                }
+                className="block mt-0.5 w-full px-2 py-1 rounded-lg border border-slate-300 text-slate-800 font-mono"
+              />
+            </label>
+            <label className="text-slate-500 font-semibold" title="149–161 = UNII-3, non-DFS, legal di Indonesia. 36–48 jangkauannya lebih jauh.">
+              Channel 5GHz
+              <input
+                type="text"
+                defaultValue={(cfg?.channels_5g ?? [36, 40, 44, 48, 149, 153, 157, 161, 165]).join(',')}
+                onBlur={(e) =>
+                  saveCfg({
+                    channels_5g: e.target.value
+                      .split(/[,\s]+/)
+                      .map(Number)
+                      .filter((n) => n >= 36 && n <= 177),
+                  })
+                }
                 className="block mt-0.5 w-full px-2 py-1 rounded-lg border border-slate-300 text-slate-800 font-mono"
               />
             </label>

@@ -32,10 +32,34 @@ CH_5G_DFS = [5260, 5280, 5300, 5320,
              5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720]
 
 
-def candidates(band: str, include_dfs: bool = False) -> list[int]:
+def _block_primary(freq: int, width: float) -> int:
+    """5 GHz channels wider than 20 MHz only exist as blocks; return the block anchor."""
+    if not freq:
+        return freq
+    span = 20 * max(1, int(width or 20) // 20)
+    if span <= 20:
+        return freq
+    if freq >= 5745:
+        return 5745 + ((freq - 5745) // span) * span
+    if freq >= 5180:
+        return 5180 + ((freq - 5180) // span) * span
+    return freq
+
+
+def candidates(band: str, include_dfs: bool = False, width: float = 20) -> list[int]:
     if (band or "").lower().startswith("2"):
         return list(CH_2G)
-    return list(CH_5G_NON_DFS) + (list(CH_5G_DFS) if include_dfs else [])
+    pool = list(CH_5G_NON_DFS) + (list(CH_5G_DFS) if include_dfs else [])
+    if int(width or 20) <= 20:
+        return pool
+    out: list[int] = []
+    span = 20 * max(1, int(width or 20) // 20)
+    for f in pool:
+        a = _block_primary(f, width)
+        if a in out or (a + span - 20) not in pool:
+            continue  # anchor whose last 20 MHz sub-channel is outside the band is not a real block
+        out.append(a)
+    return out
 
 
 def dbm_to_mw(dbm: float) -> float:
@@ -108,7 +132,8 @@ def total_cost(aps: list[dict], assign: dict) -> float:
     return total
 
 
-def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40) -> dict:
+def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
+             allowed: dict | None = None) -> dict:
     """Weighted-graph-colouring channel plan. `aps` entries:
         {id, band, freq, width, neighbours:[{freq,width,signal,owner?}], noise:{freq: dBm}}
     Returns {changes:[...], cost_before, cost_after, gain_pct, iterations}.
@@ -128,12 +153,18 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40) -
         iterations += 1
         improved = False
         for ap in aps:
-            opts = candidates(ap.get("band", "2g"), include_dfs)
+            band = ap.get("band", "2g")
+            width = ap.get("width", 20)
+            opts = candidates(band, include_dfs, width)
+            if allowed:
+                keep = allowed.get("2g" if str(band).startswith("2") else "5g")
+                if keep:
+                    opts = [f for f in opts if f in keep]
             if not opts:
                 continue
-            width = ap.get("width", 20)
             nb = _neighbours_for(ap, assign, ap_by_id, owner_idx)
             cur_f = assign[ap["id"]]
+            cur_block = cur_f if str(band).startswith("2") else _block_primary(cur_f, width)
             best_f, best_c = cur_f, None
             for f in opts:
                 c = channel_cost(f, width, nb, _noise_at(ap, f))
@@ -141,6 +172,8 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40) -
                     best_f, best_c = f, c
                 elif abs(c - best_c) <= best_c * 1e-9 and f == cur_f:
                     best_f = f  # tie: keep the channel the radio already uses
+            if not str(band).startswith("2") and _block_primary(best_f, width) == cur_block:
+                best_f = cur_f  # same 40/80 MHz block: moving the primary buys nothing, costs a restart
             if best_f != cur_f:
                 assign[ap["id"]] = best_f
                 improved = True
@@ -155,6 +188,9 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40) -
         old, new = int(ap.get("freq") or 0), best_assign[ap["id"]]
         if old == new:
             continue
+        if not str(ap.get("band", "")).startswith("2") and old and \
+                _block_primary(old, ap.get("width", 20)) == _block_primary(new, ap.get("width", 20)):
+            continue  # same 40/80 MHz block, only the primary label moved
         nb = _neighbours_for(ap, best_assign, ap_by_id, owner_idx)
         old_cost = channel_cost(old, ap.get("width", 20), nb, _noise_at(ap, old)) if old else cost_before
         new_cost = channel_cost(new, ap.get("width", 20), nb, _noise_at(ap, new))

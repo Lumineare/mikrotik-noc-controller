@@ -4338,8 +4338,35 @@ RRM_DEFAULT = {
     "max_client_drop": 0,      # rollback automatically if more clients vanish than this
     "scan_duration": 8,
     "sample_interval_min": 5,
+    "channels_2g": [1, 6, 11],                                  # channel numbers, not MHz
+    "channels_5g": [36, 40, 44, 48, 149, 153, 157, 161, 165],
     "last_run_ts": 0.0,
 }
+
+
+def ch_to_freq(band: str, ch: int) -> int:
+    """Channel number -> centre frequency (MHz)."""
+    ch = int(ch)
+    if str(band).startswith("2"):
+        return 2484 if ch == 14 else 2412 + 5 * (ch - 1)
+    if 36 <= ch <= 64:
+        return 5180 + 20 * (ch - 36)
+    if 100 <= ch <= 144:
+        return 5500 + 20 * (ch - 100)
+    if 149 <= ch <= 177:
+        return 5745 + 20 * (ch - 149)
+    return 0
+
+
+def rrm_allowed_freqs(cfg: dict) -> dict:
+    """Whitelist from config, in MHz, ready for rrm.plan_dca(allowed=...)."""
+    out = {}
+    for band, key in (("2g", "channels_2g"), ("5g", "channels_5g")):
+        freqs = [ch_to_freq(band, c) for c in (cfg.get(key) or []) if str(c).strip() != ""]
+        freqs = [f for f in freqs if f]
+        if freqs:
+            out[band] = freqs
+    return out
 RRM_LOCK = threading.Lock()
 
 
@@ -4617,7 +4644,7 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
             aps.extend(got)
             samples += n
 
-    dca = rrm.plan_dca(aps, include_dfs=include_dfs)
+    dca = rrm.plan_dca(aps, include_dfs=include_dfs, allowed=rrm_allowed_freqs(cfg))
     tpc = rrm.plan_tpc(aps)
     steering = []
     for d in devs:
