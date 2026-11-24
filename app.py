@@ -4961,6 +4961,183 @@ threading.Thread(target=_rf_sampler_loop, daemon=True, name="rf-sampler").start(
 threading.Thread(target=_rrm_auto_loop, daemon=True, name="rrm-auto").start()
 
 
+# ---------- AI auto-push: recommendations → applied by the backend, no clicking ----------
+# Channel work is owned by the RRM engine (DCA/TPC), so set_2ghz_channel is deliberately NOT
+# auto-pushed here — two controllers fighting over the same radio is how you get flapping.
+AI_AUTO_POLICY = {
+    "flush_dns":                  {"auto": True,  "risk": "low",    "label": "flush cache DNS"},
+    "clean_storage_and_cache":    {"auto": True,  "risk": "low",    "label": "bersihkan cache + proteksi flash"},
+    "disable_dns_remote":         {"auto": True,  "risk": "low",    "label": "tutup DNS open resolver"},
+    "enable_fasttrack":           {"auto": True,  "risk": "low",    "label": "aktifkan FastTrack"},
+    "optimize_5ghz_throughput":   {"auto": True,  "risk": "medium", "label": "lebar pita 5GHz → 80MHz"},
+    "set_2ghz_channel":           {"auto": False, "risk": "medium", "label": "kunci channel 2.4GHz"},
+    "disable_service":            {"auto": False, "risk": "medium", "label": "nonaktifkan service"},
+    "kick_weak_clients":          {"auto": False, "risk": "high",   "label": "putus klien lemah"},
+}
+
+
+class AiAutoReq(BaseModel):
+    device: str | None = None
+    dry_run: bool = False
+    include_medium: bool = True
+    actions: list[str] | None = None
+
+
+def _ai_snapshot(dev: dict, mt) -> dict:
+    snap = {"wireless": [], "dns": None, "fasttrack_ids": []}
+    try:
+        for w in mt.resource("/interface/wireless").get():
+            snap["wireless"].append({
+                "device_id": dev["id"], "interface": w["name"],
+                "channel_width": w.get("channel-width"), "frequency": w.get("frequency"),
+            })
+    except Exception:
+        pass
+    try:
+        d = mt.resource("/ip/dns").get()
+        snap["dns"] = {"allow_remote_requests": (d[0] if d else {}).get("allow-remote-requests")}
+    except Exception:
+        pass
+    try:
+        snap["fasttrack_ids"] = [r["id"] for r in mt.resource("/ip/firewall/filter").get()
+                                 if r.get("comment") == "AI-FastTrack"]
+    except Exception:
+        pass
+    return snap
+
+
+@app.post("/api/ai/optimize/auto")
+def api_ai_optimize_auto(req: AiAutoReq):
+    dev = get_device(req.device)
+    diag = api_ai_diagnose(device=dev["id"])
+    recs = diag.get("recommendations") or []
+
+    eligible, skipped = [], []
+    for r in recs:
+        action = r.get("action_type")
+        pol = AI_AUTO_POLICY.get(action)
+        if not pol or not pol.get("auto"):
+            skipped.append({"id": r.get("id"), "action_type": action, "title": r.get("title"),
+                            "reason": ("tidak ada di whitelist auto-push" if not pol
+                                       else f"risk {pol['risk']} — {pol['label']} butuh persetujuan manual")})
+            continue
+        if pol["risk"] == "medium" and not req.include_medium:
+            skipped.append({"id": r.get("id"), "action_type": action, "title": r.get("title"),
+                            "reason": "risk medium dinonaktifkan (include_medium=false)"})
+            continue
+        if req.actions and action not in req.actions:
+            skipped.append({"id": r.get("id"), "action_type": action, "title": r.get("title"),
+                            "reason": "tidak diminta di filter actions"})
+            continue
+        eligible.append(r)
+
+    if req.dry_run:
+        return {"ok": True, "dry_run": True, "score": diag.get("score"), "grade": diag.get("grade"),
+                "would_apply": [{"action_type": r["action_type"], "title": r.get("title"),
+                                 "command": r.get("command")} for r in eligible],
+                "skipped": skipped}
+
+    if not eligible:
+        return {"ok": True, "run_id": None, "steps": [], "skipped": skipped,
+                "score_before": diag.get("score"), "score_after": diag.get("score"),
+                "message": "Tidak ada rekomendasi aman untuk di-push — router sudah bersih"}
+
+    try:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            snap = _ai_snapshot(dev, mt)
+    except Exception as e:
+        raise HTTPException(503, f"Snapshot gagal, push dibatalkan: {type(e).__name__}: {e}")
+
+    steps = []
+    for r in eligible:
+        action = r["action_type"]
+        try:
+            res = api_ai_apply(AiApplyReq(device=dev["id"], action_type=action,
+                                          action_params=r.get("action_params")))
+            steps.append({"action_type": action, "label": AI_AUTO_POLICY[action]["label"],
+                          "title": r.get("title"), "ok": True,
+                          "message": res.get("message"), "command": r.get("command")})
+        except Exception as e:
+            steps.append({"action_type": action, "label": AI_AUTO_POLICY[action]["label"],
+                          "title": r.get("title"), "ok": False,
+                          "error": f"{type(e).__name__}: {e}", "command": r.get("command")})
+
+    run = {
+        "id": f"ai_{secrets.token_hex(4)}", "ts": time.time(), "mode": "ai-auto", "status": "applied",
+        "gain_pct": 0.0,
+        "plan": {"device": dev["id"], "score_before": diag.get("score"),
+                 "eligible": [r["action_type"] for r in eligible]},
+        "snapshot": {"ai": snap},
+        "result": {"steps": steps},
+    }
+    db_rrm_run_save(run)
+
+    after = None
+    try:
+        after = api_ai_diagnose(device=dev["id"]).get("score")
+    except Exception:
+        pass
+    return {"ok": True, "run_id": run["id"], "steps": steps, "skipped": skipped,
+            "applied": sum(1 for s in steps if s["ok"]),
+            "failed": sum(1 for s in steps if not s["ok"]),
+            "score_before": diag.get("score"), "score_after": after,
+            "rollback_hint": f"POST /api/ai/optimize/rollback {{'run_id': '{run['id']}'}}"}
+
+
+@app.post("/api/ai/optimize/rollback")
+def api_ai_optimize_rollback(req: RrmRollbackReq):
+    run = db_rrm_run_get(req.run_id)
+    if not run:
+        raise HTTPException(404, "Run tidak ditemukan")
+    snap = (run.get("snapshot") or {}).get("ai")
+    if not snap:
+        raise HTTPException(400, "Run ini tidak punya snapshot AI (bukan ai-auto)")
+    restored, removed = 0, 0
+    for entry in snap.get("wireless") or []:
+        dev = get_device(entry["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                wl = mt.resource("/interface/wireless")
+                target = wl.get(name=entry["interface"])
+                if not target:
+                    continue
+                attrs = {}
+                if entry.get("channel_width"):
+                    attrs["channel_width"] = entry["channel_width"]
+                if entry.get("frequency"):
+                    attrs["frequency"] = str(entry["frequency"])
+                cur = target[0]
+                attrs = {k: v for k, v in attrs.items()
+                         if str(cur.get(k.replace("_", "-")) or "") != str(v)}
+                if attrs:
+                    wl.set(id=cur["id"], **attrs)
+                    restored += 1
+        except Exception:
+            continue
+    if snap.get("dns") and snap["dns"].get("allow_remote_requests") is not None:
+        dev = get_device((run.get("plan") or {}).get("device"))
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                mt.resource("/ip/dns").set(
+                    allow_remote_requests=str(snap["dns"]["allow_remote_requests"]))
+        except Exception:
+            pass
+    keep = set(snap.get("fasttrack_ids") or [])
+    dev = get_device((run.get("plan") or {}).get("device"))
+    try:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            flt = mt.resource("/ip/firewall/filter")
+            for r in flt.get():
+                if r.get("comment") == "AI-FastTrack" and r["id"] not in keep:
+                    flt.remove(id=r["id"])
+                    removed += 1
+    except Exception:
+        pass
+    db_rrm_run_mark_rolled_back(req.run_id)
+    return {"ok": True, "run_id": req.run_id, "interfaces_restored": restored,
+            "fasttrack_rules_removed": removed}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8090")), log_level="info")
