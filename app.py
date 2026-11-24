@@ -4874,6 +4874,136 @@ def api_rrm_config(req: dict):
     return {"ok": True, "config": cfg}
 
 
+# ---------- WiFi diagnostics (overview dashboard) ----------
+RETRY_BUCKETS = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 35), (35, 1001)]
+RSSI_BUCKETS = [(-50, 0), (-60, -50), (-70, -60), (-80, -70), (-200, -80)]
+
+# disconnect reasons RouterOS logs that mean the link actually failed (vs. client left on purpose)
+FAIL_REASONS = ("extensive data loss", "no beacons", "4-way handshake", "invalid mic",
+                "unauthorized", "key exchange", "connection lost")
+LEAVE_REASONS = ("disabling", "registered to other interface", "sending station leaving",
+                 "received deauth", "not in bridge", "unknown")
+
+
+def _log_wireless_stats(logs: list[dict]) -> dict:
+    connected, reasons = 0, {}
+    for l in logs:
+        msg = (l.get("message") or "").lower()
+        if "wireless" not in (l.get("topics") or "") and "@wlan" not in msg:
+            continue
+        if "disconnected," in msg:
+            r = msg.split("disconnected,", 1)[1]
+            r = r.split(", signal strength")[0].strip() or "unknown"
+            reasons[r] = reasons.get(r, 0) + 1
+        elif "connected," in msg:
+            connected += 1
+    failed = sum(n for r, n in reasons.items() if any(k in r for k in FAIL_REASONS))
+    left = sum(n for r, n in reasons.items() if any(k in r for k in LEAVE_REASONS))
+    auth_fail = sum(n for r, n in reasons.items()
+                    if any(k in r for k in ("4-way handshake", "invalid mic", "unauthorized", "key exchange")))
+    return {"connected": connected, "failed": failed, "left": left,
+            "auth_fail": auth_fail, "reasons": reasons}
+
+
+def _bucket_pct(values: list[float], buckets: list[tuple]) -> list[dict]:
+    n = len(values)
+    out = []
+    for lo, hi in buckets:
+        c = sum(1 for v in values if lo <= v < hi)
+        out.append({"lo": lo, "hi": None if hi >= 1001 or hi <= -200 else hi, "count": c,
+                    "pct": round(100.0 * c / n, 1) if n else 0.0})
+    return out
+
+
+@app.get("/api/wifi/diagnostics")
+def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1, le=168)):
+    dev = get_device(device)
+    cutoff = time.time() - hours * 3600
+    samples = [s for s in db_rf_samples(dev.get("id"), limit=40000) if (s.get("ts") or 0) >= cutoff]
+    retry_vals = [float(s.get("retry_pct") or 0) for s in samples]
+    rssi_vals = [float(s.get("rssi")) for s in samples if s.get("rssi") is not None]
+
+    clients: list[dict] = []
+    logstats = {"connected": 0, "failed": 0, "left": 0, "auth_fail": 0, "reasons": {}}
+    dns_ms = None
+    try:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            reg = mt.resource("/interface/wireless/registration-table").get()
+            for c in reg:
+                rssi = _sig_dbm(c.get("signal-strength"))
+                try:
+                    tx = float(str(c.get("frames", "0,0")).split(",")[1])
+                    to = float(c.get("tx-frames-timed-out") or 0)
+                    retry = round(100.0 * to / tx, 1) if tx > 0 else 0.0
+                except (TypeError, ValueError, IndexError):
+                    retry = 0.0
+                clients.append({"mac": c.get("mac-address"), "interface": c.get("interface"),
+                                "rssi": rssi, "retry_pct": retry,
+                                "has_ip": bool(c.get("last-ip")), "uptime": c.get("uptime")})
+            try:
+                logstats = _log_wireless_stats(mt.resource("/log").get())
+            except Exception:
+                pass
+            t0 = time.time()
+            try:
+                res = mt.resource("/").call("ping", {"address": "cloud.mikrotik.com", "count": "3"})
+                if res and int(str(res[-1].get("received", "0")) or 0) > 0:
+                    dns_ms = int((time.time() - t0) * 1000)
+            except Exception:
+                dns_ms = None
+    except Exception as e:
+        return {"ok": False, "error": str(e), "device_id": dev.get("id")}
+
+    conn, authf = logstats["connected"], logstats["auth_fail"]
+    association = round(100.0 * conn / (conn + logstats["failed"]), 1) if (conn + logstats["failed"]) else 100.0
+    authentication = round(100.0 * conn / (conn + authf), 1) if (conn + authf) else 100.0
+    with_ip = sum(1 for c in clients if c["has_ip"])
+    dhcp = round(100.0 * with_ip / len(clients), 1) if clients else 100.0
+    live_rssi = [c["rssi"] for c in clients if c["rssi"] is not None]
+    live = sorted(live_rssi)
+    median = live[len(live) // 2] if live else None
+    weak = sum(1 for v in live_rssi if v < -70)
+    weak_pct = round(100.0 * weak / len(live_rssi), 1) if live_rssi else 0.0
+    need_density = bool(live_rssi) and (median is not None and median < -67 or weak_pct > 20)
+    return {
+        "ok": True, "device_id": dev.get("id"), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "window_h": hours,
+        "retries": {
+            "buckets": _bucket_pct(retry_vals, RETRY_BUCKETS),
+            "samples": len(retry_vals),
+            "avg_pct": round(sum(retry_vals) / len(retry_vals), 1) if retry_vals else 0.0,
+            "ccq_est": _bucket_pct([100.0 - float(s.get("tx_ccq") or 0) for s in samples], RETRY_BUCKETS),
+            "ccq_est_used": not any(retry_vals),
+            "live": [{"mac": c["mac"], "interface": c["interface"], "retry_pct": c["retry_pct"]} for c in clients],
+            "source": "/interface/wireless/registration-table — tx-frames-timed-out / tx frames (sampler 5 menit)",
+        },
+        "connectivity": {
+            "association": association, "authentication": authentication,
+            "dhcp": dhcp, "dns": 100.0 if dns_ms is not None else 0.0,
+            "dns_ms": dns_ms,
+            "counts": logstats,
+            "basis": {
+                "association": f"log wireless: {conn} connected vs {logstats['failed']} gagal (data loss/no beacon)",
+                "authentication": f"log wireless: {authf} kegagalan handshake/MIC/unauthorized",
+                "dhcp": f"{with_ip}/{len(clients)} klien punya IP (last-ip, live)",
+                "dns": "probe DNS+ICMP dari router (ping cloud.mikrotik.com)" + (f" — ok {dns_ms} ms" if dns_ms else " — gagal"),
+            },
+        },
+        "signal": {
+            "buckets": _bucket_pct(rssi_vals, RSSI_BUCKETS),
+            "live": [{"mac": c["mac"], "interface": c["interface"], "rssi": c["rssi"]} for c in clients],
+            "median_dbm": median, "weak_pct": weak_pct, "clients": len(live_rssi),
+            "source": "rf_samples (rssi) + registration-table live",
+        },
+        "density": {
+            "need_improvement": need_density,
+            "title": "Kerapatan AP perlu diperbaiki" if need_density else "Kerapatan AP memadai",
+            "detail": (f"median {median} dBm, {weak_pct}% klien di bawah -70 dBm"
+                       if live_rssi else "belum ada klien terhubung"),
+        },
+    }
+
+
 # ---------- ML anomaly engine (IsolationForest) ----------
 ML_FEATURES = ["rssi", "snr", "tx_ccq", "retry_pct", "noise_dbm"]
 

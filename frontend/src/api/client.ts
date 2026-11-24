@@ -60,6 +60,13 @@ async function handleResponse<T>(res: Response): Promise<T> {
 }
 
 export const api = {
+  async getWifiDiagnostics(qs = ''): Promise<any> {
+    const res = await fetch(`${BASE_URL}/api/wifi/diagnostics${qs}`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse<any>(res);
+  },
+
   // Authentication methods
   async login(username: string, password: string): Promise<LoginResult> {
     const res = await fetch(`${BASE_URL}/api/auth/login`, {

@@ -469,7 +469,7 @@ export const DeviceWorkspace: React.FC<DeviceWorkspaceProps> = ({
 
       {/* Tab Panels */}
       <div>
-        {activeTab === 'overview' && <TabOverview system={system} />}
+        {activeTab === 'overview' && <TabOverview system={system} deviceId={data.device_id} />}
         {activeTab === 'ai' && (
           <TabAiOptimizer
             deviceId={data.device_id}
