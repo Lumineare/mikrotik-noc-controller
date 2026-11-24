@@ -54,6 +54,18 @@ NOC_USER_ROLE = os.getenv("NOC_USER_ROLE", "Administrator")
 NOC_USER_EMAIL = os.getenv("NOC_USER_EMAIL", "")
 NOC_USER_SITE = os.getenv("NOC_USER_SITE", "RS Anwar Medika")
 ACTIVE_SESSIONS: dict[str, dict] = {}
+SESSION_TTL = float(os.getenv("NOC_SESSION_TTL_H", "12")) * 3600
+
+
+def _sess_get(token: str):
+    """Sesi dengan masa berlaku — token lama dibuang supaya dict tidak bocor."""
+    s = ACTIVE_SESSIONS.get(token)
+    if not s:
+        return None
+    if time.time() - float(s.get("_ts") or 0) > SESSION_TTL:
+        ACTIVE_SESSIONS.pop(token, None)
+        return None
+    return s
 
 
 class LoginReq(BaseModel):
@@ -70,8 +82,10 @@ _DB_LOCK = threading.Lock()
 
 def init_noc_db():
     with _DB_LOCK:
-        conn = sqlite3.connect(str(NOC_DB_FILE))
+        conn = sqlite3.connect(str(NOC_DB_FILE), timeout=10)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=10000")
         c.execute("""
             CREATE TABLE IF NOT EXISTS alert_history (
                 id TEXT PRIMARY KEY,
@@ -98,6 +112,14 @@ def init_noc_db():
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_dev ON fleet_telemetry (device_id, timestamp)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_time ON alert_history (created_at DESC)")
+        # Job optimasi hidup di memori; yang tercatat "running" saat proses mati
+        # tidak akan pernah selesai dan bikin UI polling selamanya.
+        try:
+            c.execute("UPDATE optimize_jobs SET status='error', "
+                      "error=COALESCE(error,'server restart saat job berjalan') "
+                      "WHERE status='running'")
+        except sqlite3.OperationalError:
+            pass  # tabel belum ada pada instalasi baru
         conn.commit()
         conn.close()
 
@@ -232,7 +254,11 @@ def load_devices() -> list[dict]:
 
 
 def save_devices(devices: list[dict]):
-    DEVICES_FILE.write_text(json.dumps(devices, indent=2), encoding="utf-8")
+    # Tulis atomik: kalau proses mati di tengah write, devices.json lama tetap utuh.
+    # write_text langsung bisa meninggalkan file setengah jadi = semua AP hilang.
+    tmp = DEVICES_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(devices, indent=2), encoding="utf-8")
+    os.replace(tmp, DEVICES_FILE)
 
 
 def get_device(device_id: str | None = None) -> dict:
@@ -285,7 +311,7 @@ class DeviceCreate(BaseModel):
     host: str
     port: int = 8728
     user: str = "admin"
-    pass_: str = Field(default="Mikrotik@rsam.33", alias="pass")
+    pass_: str = Field(default="", alias="pass")
     group: str = "Default"
     is_default: bool = False
 
@@ -304,7 +330,7 @@ class DeviceTestReq(BaseModel):
     host: str
     port: int = 8728
     user: str = "admin"
-    pass_: str = Field(default="Mikrotik@rsam.33", alias="pass")
+    pass_: str = Field(default="", alias="pass")
 
 
 class BatchReq(BaseModel):
@@ -343,6 +369,7 @@ def api_auth_login(req: LoginReq):
             "hospital": NOC_USER_SITE,
             "login_time": time.strftime("%Y-%m-%d %H:%M:%S")
         }
+        session_data["_ts"] = time.time()
         ACTIVE_SESSIONS[token] = session_data
         return {
             "status": "ok",
@@ -356,8 +383,9 @@ def api_auth_login(req: LoginReq):
 def api_auth_me(authorization: str | None = Header(None)):
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split("Bearer ", 1)[1].strip()
-        if token in ACTIVE_SESSIONS:
-            return {"authenticated": True, "user": ACTIVE_SESSIONS[token]}
+        sess = _sess_get(token)
+        if sess:
+            return {"authenticated": True, "user": {k: v for k, v in sess.items() if not k.startswith("_")}}
     raise HTTPException(status_code=401, detail="Sesi telah kedaluwarsa atau belum login")
 
 
@@ -462,7 +490,7 @@ def build_system(mt):
         "cpu": res.get("cpu"),
         "cpu_count": _int(res.get("cpu-count")),
         "cpu_frequency": _int(res.get("cpu-frequency")),
-        "cpu_load": _int(res.get("cpu-load")),
+        "cpu_load": _cpu_pct(mt),
         "memory_total_mb": round(total_mem / 1048576, 1),
         "memory_free_mb": round(free_mem / 1048576, 1),
         "memory_used_pct": round((1 - free_mem / total_mem) * 100, 1) if total_mem else None,
@@ -824,6 +852,10 @@ def build_wireless(mt):
         mon = _safe(lambda n=name: mt.wireless_monitor(n), [], f"wlmon {name}")
         m = mon[0] if mon else {}
         ifaces.append({
+            # .id wajib: frontend memakainya untuk update/supported-channels;
+            # tanpa ini semua request edit radio berakhir "Interface tidak ditemukan".
+            # librouteros menormalkan ".id" jadi "id" — terima keduanya.
+            "id": w.get("id") or w.get(".id"),
             "name": name,
             "ssid": w.get("ssid"),
             "band": w.get("band"),
@@ -4441,7 +4473,9 @@ def load_rrm_cfg() -> dict:
 def save_rrm_cfg(cfg: dict) -> dict:
     merged = load_rrm_cfg()
     merged.update(cfg or {})
-    RRM_CFG_FILE.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    tmp = RRM_CFG_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    os.replace(tmp, RRM_CFG_FILE)
     return merged
 
 
@@ -4917,6 +4951,8 @@ def _apply_tpc_changes(changes: list[dict]) -> list[dict]:
                 wl = mt.resource("/interface/wireless")
                 target = wl.get(name=t["interface"])
                 if not target:
+                    done.append({**t, "applied": False,
+                                 "error": f"interface {t['interface']} tidak ada di {dev['id']}"})
                     continue
                 # RouterOS wireless: tx-power hanya dipakai kalau tx-power-mode
                 # sudah all-rates-fixed. Dikirim satu paket, tx-power diabaikan
@@ -4968,6 +5004,15 @@ def _apply_roam_rules(rules: list[dict], expire_min: int = 10) -> list[dict]:
         try:
             with get_device_lock(dev["host"]), MT(dev) as mt:
                 acl = mt.resource("/interface/wireless/access-list")
+                # Idempoten: entry lama untuk MAC yang sama dicabut dulu, kalau tidak
+                # tiap run menumpuk ACL ganda dengan expiry berbeda.
+                for old in acl.get():
+                    if str(old.get("comment") or "").startswith(ROAM_PREFIX) and \
+                            str(old.get("comment") or "").endswith(f"-{r['mac']}"):
+                        try:
+                            acl.remove(id=old["id"])
+                        except Exception:
+                            pass
                 acl.add(**{"mac-address": r["mac"], "signal-range": r["signal_range"],
                            "authentication": "no", "forwarding": "no",
                            "interface": r.get("interface") or "", "comment": comment})
@@ -5822,6 +5867,20 @@ def _opt_roaming_issues(samples: list[dict]) -> list[dict]:
     return issues
 
 
+def _cpu_pct(mt) -> float:
+    """CPU % satu desimal. /system/resource cpu-load itu integer, jadi AP idle
+    selalu tampil 0% walau ada beban — rata-rata per-core lebih jujur."""
+    try:
+        cores = mt.resource("/system/resource/cpu").get()
+        loads = [float(c.get("load") or 0) for c in cores]
+        if loads:
+            return round(sum(loads) / len(loads), 1)
+    except Exception:
+        pass
+    res = mt.resource("/system/resource").get()
+    return float((res[0] if res else {}).get("cpu-load") or 0)
+
+
 def _opt_worker(job_id: str, opts: dict):
     job = OPT_JOBS.get(job_id)
     if not job:
@@ -5842,8 +5901,7 @@ def _opt_worker(job_id: str, opts: dict):
             try:
                 with get_device_lock(d["host"]), MT(d) as mt:
                     regs = mt.resource("/interface/wireless/registration-table").get()
-                    res = mt.resource("/system/resource").get()
-                    cpu = float((res[0] if res else {}).get("cpu-load") or 0)
+                    cpu = _cpu_pct(mt)
                 entry.update({"clients": len(regs), "cpu_load": cpu,
                               "critical": bool(len(regs) >= 8 or cpu >= 60)})
             except Exception as e:
@@ -5851,6 +5909,11 @@ def _opt_worker(job_id: str, opts: dict):
                               "error": f"{type(e).__name__}: {e}"})
             critical.append(entry)
         job["details"]["critical_aps"] = critical
+        # Semua AP tidak terjangkau = tidak ada yang bisa dioptimasi. Tanpa ini job
+        # selesai "done" padahal nol data terkumpul (false success di UI).
+        if critical and all(e.get("error") for e in critical):
+            raise RuntimeError("semua AP tidak terjangkau: " +
+                               "; ".join(f"{e['device']}: {e['error']}" for e in critical))
         _opt_set_stage(job, 0, "done")
 
         # --- 2. collect historical data + roaming analysis ---
@@ -6045,7 +6108,9 @@ def api_optimize_start(req: OptStartReq):
         lock_key = dev["id"]
     with OPT_LOCK:
         for j in OPT_JOBS.values():
-            if j["status"] == "running" and j.get("device") == lock_key:
+            # fleet menyentuh semua AP, jadi job fleet bertabrakan dengan job AP mana pun
+            if j["status"] == "running" and (j.get("device") == lock_key or
+                                             lock_key == "fleet" or j.get("device") == "fleet"):
                 return {"ok": False, "running": True, "job_id": j["id"],
                         "message": "Optimasi untuk device ini masih berjalan"}
         cfg = load_rrm_cfg()
@@ -6057,6 +6122,9 @@ def api_optimize_start(req: OptStartReq):
             "details": {}, "started": time.time(), "updated": time.time(), "run_id": None,
         }
         OPT_JOBS[job["id"]] = job
+        for old_id, old in list(OPT_JOBS.items()):
+            if old["status"] != "running" and time.time() - float(old.get("updated") or 0) > 86400:
+                OPT_JOBS.pop(old_id, None)
         _opt_job_save(job)
     threading.Thread(target=_opt_worker, daemon=True,
                      args=(job["id"], {"device": dev_filter,
@@ -6098,6 +6166,17 @@ def _live_channels(dev: dict, ttl: float = 30.0) -> dict:
     return out
 
 
+def _live_channels_safe(dev_id):
+    """AP bisa sudah dihapus sementara job lama masih dipolling — jangan 404-kan
+    endpoint polling hanya karena device-nya hilang."""
+    if not dev_id or dev_id == "fleet":
+        return {}
+    try:
+        return _live_channels(get_device(dev_id))
+    except Exception:
+        return {}
+
+
 @app.get("/api/optimize/current")
 def api_optimize_current(device: str | None = None, job_id: str | None = None):
     if job_id:
@@ -6118,7 +6197,7 @@ def api_optimize_current(device: str | None = None, job_id: str | None = None):
             "stage_index": job.get("stage_index"), "progress_pct": round(100 * done / total),
             "stages": job["stages"], "details": job.get("details") or {},
             "run_id": job.get("run_id"), "started": job.get("started"),
-            "live_channels": _live_channels(get_device(jdev)) if jdev and jdev != "fleet" else {},
+            "live_channels": _live_channels_safe(jdev),
             "error": job.get("error")}
 
 
