@@ -285,7 +285,13 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
       )}
 
       {/* FULL PIPELINE: identify → history → scan → compute → deliver (background) */}
-      <OptimizeWizard deviceId={deviceId} onApplied={onRefreshParent} />
+      <OptimizeWizard
+        deviceId={deviceId}
+        onApplied={() => {
+          fetchDiagnosis();
+          if (onRefreshParent) onRefreshParent();
+        }}
+      />
 
 
       {/* HERO SECTION: AI HEALTH SCORE & TELEMETRY */}
