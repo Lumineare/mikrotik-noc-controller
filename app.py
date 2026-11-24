@@ -4815,23 +4815,47 @@ def _apply_channel_changes(changes: list[dict]) -> list[dict]:
     done = []
     for ch in changes:
         dev = get_device(ch["device_id"])
-        try:
+
+        def push() -> dict:
             with get_device_lock(dev["host"]), MT(dev) as mt:
                 wl = mt.resource("/interface/wireless")
                 target = wl.get(name=ch["interface"])
                 if not target:
-                    continue
+                    return {**ch, "applied": False, "error": "interface tidak ada di router"}
                 # width tak valid (mis. 5mhz di 2.4GHz) bikin radio "no supported
                 # channels" — set frequency saja tak akan pernah start.
                 if ch.get("fix_width"):
                     wl.set(id=target[0]["id"], **{"channel-width": ch["fix_width"]})
-                wl.set(id=target[0]["id"], frequency=str(ch["to_freq"]))
+                extra = {}
+                try:
+                    wl.set(id=target[0]["id"], frequency=str(ch["to_freq"]))
+                except Exception as e:
+                    if "bad band or frequency" not in str(e):
+                        raise
+                    # Lebar channel tak didukung di channel tujuan (country=etsi:
+                    # 80MHz hanya legal di 5470-5725, jadi ch36 ditolak). Sempitkan
+                    # ke 20MHz — lebih baik radio hidup 20MHz daripada gagal total.
+                    wl.set(id=target[0]["id"], **{"channel-width": "20mhz",
+                                                  "frequency": str(ch["to_freq"])})
+                    extra["width_fallback"] = "20mhz"
                 time.sleep(3)
                 mon = _wl_monitor(mt.api, [ch["interface"]]).get(ch["interface"]) or {}
-                done.append({**ch, "applied": True, "verified_freq": mon.get("freq"),
-                             "status": mon.get("status")})
-        except Exception as e:
-            done.append({**ch, "applied": False, "error": f"{type(e).__name__}: {e}"})
+                return {**ch, "applied": True, "verified_freq": mon.get("freq"),
+                        "status": mon.get("status"), **extra}
+
+        row = None
+        for attempt in (1, 2):
+            try:
+                row = push()
+                break
+            except Exception as e:
+                if attempt == 2:
+                    row = {**ch, "applied": False, "error": f"{type(e).__name__}: {e}"}
+                else:
+                    # restart radio AP sebelumnya kerap memutus sesi API router;
+                    # satu AP gagal jangan sampai menggagalkan seluruh batch.
+                    time.sleep(4)
+        done.append(row)
     return done
 
 
@@ -4953,10 +4977,15 @@ def api_rrm_apply(req: RrmApplyReq):
     dca = plan.get("dca") or {}
     only = req.device
     ch_skip = None
-    if only and do_ch:
-        ch_skip = f"channel dikelola global (fleet) — AP {only} hanya dikirimi TX power/steering"
-        do_ch = False
     changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
+    if only:
+        # Optimasi channel tetap fleet-only (joint coloring lintas AP), TAPI
+        # perbaikan (radio mati / channel di luar rencana) harus tetap dikirim
+        # walau user menekan "Optimize AP" untuk satu AP — kalau tidak, klik
+        # Optimize AP tidak pernah memperbaiki apa pun.
+        changes = [c for c in changes if c.get("repair") or not c.get("from_freq")]
+        ch_skip = (f"channel optimasi dikelola global (fleet) — AP {only} "
+                   f"hanya dikirimi perbaikan + TX power/steering")
     # Radio tanpa channel eksplisit (from_freq 0) = perbaikan, bukan optimasi:
     # gate gain tidak berlaku, kalau tidak radio 'auto' selamanya dibiarkan.
     repairs = [c for c in changes if c.get("repair") or not c.get("from_freq")]

@@ -142,7 +142,29 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
         return {"changes": [], "cost_before": 0.0, "cost_after": 0.0,
                 "gain_pct": 0.0, "iterations": 0}
 
-    assign = {a["id"]: int(a.get("freq") or candidates(a.get("band", "2g"))[0]) for a in aps}
+    def _opts_for(ap):
+        band = ap.get("band", "2g")
+        width = ap.get("width", 20)
+        opts = candidates(band, include_dfs, width)
+        if allowed:
+            keep = allowed.get("2g" if str(band).startswith("2") else "5g")
+            if keep:
+                opts = [f for f in opts if f in keep]
+        return opts
+
+    # Channel di luar rencana (ch13, DFS, sisa utak-atik Winbox) = tidak valid,
+    # bukan "sudah optimal". Tanpa ini cost model melihat semua channel sama
+    # murah (0 tetangga) lalu mempertahankan nilai yang salah.
+    off_plan = {}
+    assign = {}
+    for a in aps:
+        opts = _opts_for(a)
+        cur = int(a.get("freq") or 0)
+        if opts and cur and cur not in opts:
+            off_plan[a["id"]] = cur
+            assign[a["id"]] = opts[0]
+        else:
+            assign[a["id"]] = cur or (opts[0] if opts else 0)
     ap_by_id = {a["id"]: a for a in aps}
     owner_idx = _owner_index(aps)
     cost_before = total_cost(aps, assign)
@@ -155,11 +177,7 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
         for ap in aps:
             band = ap.get("band", "2g")
             width = ap.get("width", 20)
-            opts = candidates(band, include_dfs, width)
-            if allowed:
-                keep = allowed.get("2g" if str(band).startswith("2") else "5g")
-                if keep:
-                    opts = [f for f in opts if f in keep]
+            opts = _opts_for(ap)
             if not opts:
                 continue
             nb = _neighbours_for(ap, assign, ap_by_id, owner_idx)
@@ -194,13 +212,17 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
         nb = _neighbours_for(ap, best_assign, ap_by_id, owner_idx)
         old_cost = channel_cost(old, ap.get("width", 20), nb, _noise_at(ap, old)) if old else cost_before
         new_cost = channel_cost(new, ap.get("width", 20), nb, _noise_at(ap, new))
-        changes.append({
+        ch = {
             "device_id": ap.get("device_id") or ap["id"], "interface": ap.get("interface"),
             "band": ap.get("band"), "from_freq": old, "to_freq": new,
             "interference_before_mw": float(f"{old_cost:.6g}"),
             "interference_after_mw": float(f"{new_cost:.6g}"),
             "relief_pct": round(100.0 * (1 - new_cost / old_cost), 1) if old_cost > 0 else 0.0,
-        })
+        }
+        if ap["id"] in off_plan:
+            ch["repair"] = True
+            ch["reason"] = f"channel {old} di luar rencana — dikembalikan ke {new}"
+        changes.append(ch)
 
     gain = 0.0
     if cost_before > 0:
