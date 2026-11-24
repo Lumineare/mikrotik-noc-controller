@@ -29,7 +29,7 @@ interface Diag {
   };
   signal: {
     buckets: Bucket[];
-    live: { mac: string; interface: string; rssi: number | null }[];
+    live: { mac: string; interface: string; rssi: number | null; rssi_avg?: number | null; samples?: number }[];
     median_dbm: number | null;
     weak_pct: number;
     clients: number;
@@ -40,9 +40,6 @@ interface Diag {
 
 const label = (b: Bucket, unit = '%') =>
   b.hi === null ? `${b.lo}${unit}+` : `${b.lo}–${b.hi}${unit}`;
-
-const rssiLabel = (b: Bucket) =>
-  b.lo === -50 ? '≥ -50' : b.lo <= -200 ? '< -80' : `${b.lo} … ${b.hi}`;
 
 const barColor = (b: Bucket) => {
   if (b.lo >= 20) return 'bg-rose-500';
@@ -96,7 +93,13 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
     ['DNS', d.connectivity.dns],
   ] as [string, number][];
   const overall = Math.round(stages.reduce((s, [, v]) => s + v, 0) / stages.length);
-  const sigMax = Math.max(...d.signal.buckets.map((b) => b.pct), 1);
+  const pos = (dbm: number) => Math.max(0, Math.min(100, ((dbm + 90) / 60) * 100));
+  const points = d.signal.live
+    .map((c) => {
+      const v = c.rssi_avg ?? c.rssi;
+      return v == null ? null : { mac: c.mac, label: (c.mac || '').slice(-5), rssi: Math.round(v) };
+    })
+    .filter((x): x is { mac: string; label: string; rssi: number } => x !== null);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-3.5">
@@ -181,45 +184,92 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
         </p>
       </div>
 
-      {/* Signal spread / density */}
+      {/* AP Deployment Density */}
       <div className="lg:col-span-3 bg-white border border-slate-200/90 rounded-2xl p-4 shadow-sm">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-1">
           <div className="flex items-center gap-2 text-xs font-mono text-blue-700 uppercase font-bold">
             <SignalHigh className="w-4 h-4 text-blue-600" />
-            <span>Sebaran Sinyal Klien</span>
+            <span>AP Deployment Density</span>
           </div>
           <span className="text-[10px] font-mono text-slate-400">
             median {d.signal.median_dbm ?? '-'} dBm / {d.window_h}j · {d.signal.clients} klien live
           </span>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-center">
-          <div className="space-y-1.5">
-            {d.signal.buckets.map((b) => (
-              <div key={String(b.lo)} className="flex items-center gap-2">
-                <span className="w-20 text-[10px] font-mono text-slate-500 text-right">{rssiLabel(b)} dBm</span>
-                <div className="flex-1 h-4 bg-slate-100 rounded-md overflow-hidden">
-                  <div
-                    className={`h-full ${b.lo <= -80 ? 'bg-rose-500' : b.lo <= -70 ? 'bg-amber-400' : 'bg-emerald-500'}`}
-                    style={{ width: `${Math.round((b.pct / sigMax) * 100)}%` }}
-                  />
-                </div>
-                <span className="w-10 text-[10px] font-mono text-slate-600 text-right">{b.pct}%</span>
-              </div>
+        <p className="text-[10px] text-slate-500 mb-3">
+          Tiap lingkaran = satu klien pada skala kekuatan sinyal. Makin ke kanan makin kuat.
+          Hijau ≥ −65 dBm, kuning −65…−75, merah &lt; −75 dBm (area lemah).
+        </p>
+
+        <div className="relative h-56 mx-4">
+          {/* zona kekuatan sinyal */}
+          <div className="absolute inset-x-0 top-0 bottom-8 rounded-lg overflow-hidden bg-slate-50">
+            <div className="absolute inset-y-0 left-0 bg-rose-50" style={{ width: `${pos(-75)}%` }} />
+            <div className="absolute inset-y-0 bg-amber-50" style={{ left: `${pos(-75)}%`, width: `${pos(-65) - pos(-75)}%` }} />
+            <div className="absolute inset-y-0 right-0 bg-emerald-50" style={{ left: `${pos(-65)}%` }} />
+            {[-90, -80, -70, -60, -50, -40, -30].map((t) => (
+              <div key={t} className="absolute inset-y-0 border-l border-dashed border-slate-200" style={{ left: `${pos(t)}%` }} />
             ))}
           </div>
-          <div
-            className={`rounded-xl border p-3 text-xs font-mono ${
-              d.density.need_improvement
-                ? 'bg-amber-50 border-amber-200 text-amber-800'
-                : 'bg-emerald-50 border-emerald-200 text-emerald-800'
-            }`}
-          >
-            <div className="flex items-center gap-2 font-bold mb-1">
-              {d.density.need_improvement ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
-              {d.density.title}
+
+          {/* titik klien */}
+          {points.map((pt, i) => (
+            <div
+              key={pt.mac + i}
+              className="absolute -translate-x-1/2 flex flex-col items-center"
+              style={{ left: `${pos(pt.rssi)}%`, top: 10 + (i % 4) * 46 }}
+              title={`${pt.mac} · ${pt.rssi} dBm`}
+            >
+              <span className="text-[9px] font-mono text-slate-600 whitespace-nowrap">{pt.rssi} dBm</span>
+              <span
+                className={`w-4 h-4 rounded-full border-2 ring-2 ring-white shadow-sm ${
+                  pt.rssi >= -65
+                    ? 'bg-emerald-500 border-emerald-600'
+                    : pt.rssi >= -75
+                    ? 'bg-amber-400 border-amber-500'
+                    : 'bg-rose-500 border-rose-600'
+                }`}
+              />
+              <span className="text-[9px] font-mono text-slate-400 whitespace-nowrap">…{pt.label}</span>
             </div>
-            <div className="text-[10px] leading-relaxed">{d.density.detail}</div>
-            <div className="text-[10px] leading-relaxed mt-1 text-slate-500">{d.signal.source}</div>
+          ))}
+
+          {points.length === 0 && (
+            <div className="absolute inset-0 flex items-center justify-center text-[11px] font-mono text-slate-400">
+              belum ada klien terhubung
+            </div>
+          )}
+
+          {/* sumbu dBm */}
+          <div className="absolute inset-x-0 bottom-0 h-6 border-t border-slate-300">
+            {[-90, -80, -70, -60, -50, -40, -30].map((t) => (
+              <span
+                key={t}
+                className="absolute -translate-x-1/2 text-[9px] font-mono text-slate-500"
+                style={{ left: `${pos(t)}%`, top: 4 }}
+              >
+                {t}
+              </span>
+            ))}
+            <span className="absolute right-0 top-4 text-[9px] font-mono text-slate-400">dBm</span>
+          </div>
+        </div>
+
+        <div
+          className={`mt-3 rounded-xl border p-3 text-xs font-mono ${
+            d.density.need_improvement
+              ? 'bg-amber-50 border-amber-200 text-amber-800'
+              : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+          }`}
+        >
+          <div className="flex items-center gap-2 font-bold">
+            {d.density.need_improvement ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
+            AP Deployment Density {d.density.need_improvement ? 'May Need Improvement' : 'OK'}
+          </div>
+          <div className="text-[10px] leading-relaxed mt-0.5">
+            {d.density.need_improvement
+              ? 'Ada klien di area sinyal lemah — pertimbangkan tambah/geser AP atau turunkan lebar channel.'
+              : 'Tidak ada klien di area lemah — sebaran AP sudah memadai.'}{' '}
+            {d.density.detail}
           </div>
         </div>
       </div>

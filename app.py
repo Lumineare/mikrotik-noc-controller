@@ -4970,6 +4970,14 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
     authentication = round(100.0 * conn / (conn + authf), 1) if (conn + authf) else 100.0
     with_ip = sum(1 for c in clients if c["has_ip"])
     dhcp = round(100.0 * with_ip / len(clients), 1) if clients else 100.0
+    per_mac: dict[str, list[float]] = {}
+    for s in samples:
+        if s.get("rssi") is not None:
+            per_mac.setdefault(s.get("mac") or "?", []).append(float(s["rssi"]))
+    for c in clients:
+        vals = per_mac.get(c["mac"] or "?", [])
+        c["rssi_avg"] = round(sum(vals) / len(vals), 1) if vals else c["rssi"]
+        c["samples"] = len(vals)
     live_rssi = [c["rssi"] for c in clients if c["rssi"] is not None]
     series_rssi = rssi_vals or live_rssi
     live = sorted(series_rssi)
@@ -5004,7 +5012,8 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
         },
         "signal": {
             "buckets": _bucket_pct(rssi_vals, RSSI_BUCKETS),
-            "live": [{"mac": c["mac"], "interface": c["interface"], "rssi": c["rssi"]} for c in clients],
+            "live": [{"mac": c["mac"], "interface": c["interface"], "rssi": c["rssi"],
+                      "rssi_avg": c.get("rssi_avg"), "samples": c.get("samples", 0)} for c in clients],
             "median_dbm": median, "weak_pct": weak_pct, "clients": len(live_rssi),
             "samples": len(series_rssi),
             "source": "rf_samples (rssi) + registration-table live",
