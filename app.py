@@ -15,6 +15,7 @@ import re
 import socket
 import threading
 import time
+import datetime
 import traceback
 import urllib.request
 import urllib.error
@@ -77,8 +78,60 @@ def init_noc_db():
                 version TEXT
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS client_presence (
+                mac TEXT PRIMARY KEY,
+                ip TEXT,
+                device_name TEXT,
+                brand TEXT,
+                model_series TEXT,
+                device_type TEXT,
+                vendor TEXT,
+                is_custom_name INTEGER DEFAULT 0,
+                ap_id TEXT NOT NULL,
+                ap_name TEXT NOT NULL,
+                ap_host TEXT,
+                interface TEXT,
+                band TEXT,
+                ssid TEXT,
+                signal_dbm INTEGER,
+                signal_raw TEXT,
+                tx_rate TEXT,
+                rx_rate TEXT,
+                uptime TEXT,
+                first_seen REAL,
+                last_seen REAL,
+                status TEXT DEFAULT 'online',
+                roam_count INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS client_roaming_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                time_str TEXT,
+                mac TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                from_ap_id TEXT,
+                from_ap_name TEXT,
+                from_signal_dbm INTEGER,
+                from_band TEXT,
+                to_ap_id TEXT NOT NULL,
+                to_ap_name TEXT NOT NULL,
+                to_signal_dbm INTEGER,
+                to_band TEXT,
+                to_interface TEXT,
+                to_ssid TEXT,
+                to_ip TEXT,
+                details TEXT
+            )
+        """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_dev ON fleet_telemetry (device_id, timestamp)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_time ON alert_history (created_at DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_presence_last_seen ON client_presence (last_seen DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_presence_ap ON client_presence (ap_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_roam_mac ON client_roaming_events (mac, timestamp DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_roam_time ON client_roaming_events (timestamp DESC)")
         conn.commit()
         conn.close()
 
@@ -1975,6 +2028,444 @@ def api_set_client_alias(req: ClientAliasReq):
         }
     save_client_aliases(aliases)
     return {"status": "ok", "mac": mac_norm, "entry": aliases.get(mac_norm, {})}
+
+
+# ---------------------------------------------------------------- Client Locator & Roaming Trail Telemetry
+def enrich_client_floor_info(client: dict) -> dict:
+    floors_data = load_floors_data()
+    ap_id = client.get("ap_id")
+    for p in floors_data.get("placements", []):
+        if p.get("device_id") == ap_id:
+            floor_id = p.get("floor_id")
+            floor_match = next((f for f in floors_data.get("floors", []) if f.get("id") == floor_id), None)
+            return {
+                **client,
+                "floor_id": floor_id,
+                "floor_name": floor_match.get("name") if floor_match else floor_id,
+                "floor_x": p.get("x"),
+                "floor_y": p.get("y"),
+                "has_floor_map": True
+            }
+    return {**client, "has_floor_map": False}
+
+
+def probe_fleet_clients_and_record():
+    """Probe all APs for wireless clients and record presence / roaming events."""
+    devs = load_devices()
+    if not devs:
+        return {"status": "ok", "total_online": 0, "roams": 0}
+
+    def _probe_dev(d):
+        try:
+            pool = routeros_api.RouterOsApiPool(
+                d["host"],
+                username=d.get("user", "API"),
+                password=d.get("pass", ""),
+                port=int(d.get("port", 8728)),
+                plaintext_login=True,
+            )
+            pool.set_timeout(1.2)
+            api = pool.get_api()
+            res = api.get_resource("/interface/wireless/registration-table").get()
+            pool.disconnect()
+            return (d, res)
+        except Exception:
+            return (d, None)
+
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        results = list(ex.map(_probe_dev, devs))
+
+    now = time.time()
+    now_str = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+
+    client_map = {}
+    for d, reg_list in results:
+        if not reg_list:
+            continue
+        for r in reg_list:
+            mac = (r.get("mac-address") or "").upper().strip()
+            if not mac:
+                continue
+            sig_raw = r.get("signal-strength") or ""
+            sig_dbm = _parse_dbm(sig_raw)
+            if mac in client_map:
+                if (sig_dbm or -999) <= (client_map[mac]["sig_dbm"] or -999):
+                    continue
+            client_map[mac] = {
+                "device": d,
+                "reg": r,
+                "sig_raw": sig_raw,
+                "sig_dbm": sig_dbm,
+            }
+
+    new_clients = 0
+    roam_events = 0
+
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            c = conn.cursor()
+
+            c.execute("SELECT mac, ap_id, ap_name, signal_dbm, roam_count, first_seen FROM client_presence")
+            existing = {
+                row[0]: {
+                    "ap_id": row[1],
+                    "ap_name": row[2],
+                    "signal_dbm": row[3],
+                    "roam_count": row[4],
+                    "first_seen": row[5],
+                }
+                for row in c.fetchall()
+            }
+
+            for mac, item in client_map.items():
+                d = item["device"]
+                r = item["reg"]
+                sig_raw = item["sig_raw"]
+                sig_dbm = item["sig_dbm"]
+                ip = r.get("last-ip") or ""
+                iface = r.get("interface") or ""
+                band = "5 GHz" if ("wlan2" in iface.lower() or "5g" in iface.lower()) else "2.4 GHz"
+                dev_info = resolve_client_device(mac, ip)
+
+                if mac not in existing:
+                    new_clients += 1
+                    c.execute("""
+                        INSERT OR REPLACE INTO client_presence 
+                        (mac, ip, device_name, brand, model_series, device_type, vendor, is_custom_name,
+                         ap_id, ap_name, ap_host, interface, band, ssid, signal_dbm, signal_raw,
+                         tx_rate, rx_rate, uptime, first_seen, last_seen, status, roam_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', 0)
+                    """, (
+                        mac, ip, dev_info["device_name"], dev_info.get("brand", ""), dev_info.get("model_series", ""),
+                        dev_info.get("device_type", "unknown"), dev_info.get("vendor", ""),
+                        1 if dev_info.get("is_custom_name") else 0,
+                        d["id"], d["name"], d["host"], iface, band, r.get("ssid", ""), sig_dbm, sig_raw,
+                        r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""), now, now
+                    ))
+                    c.execute("""
+                        INSERT INTO client_roaming_events
+                        (timestamp, time_str, mac, event_type, from_ap_id, from_ap_name, from_signal_dbm, from_band,
+                         to_ap_id, to_ap_name, to_signal_dbm, to_band, to_interface, to_ssid, to_ip, details)
+                        VALUES (?, ?, ?, 'ASSOCIATED', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        now, now_str, mac, d["id"], d["name"], sig_dbm, band, iface, r.get("ssid", ""), ip,
+                        f"Terhubung pertama kali ke {d['name']}"
+                    ))
+                    existing[mac] = {"ap_id": d["id"], "ap_name": d["name"], "signal_dbm": sig_dbm, "roam_count": 0, "first_seen": now}
+                else:
+                    prev = existing[mac]
+                    if prev["ap_id"] != d["id"]:
+                        roam_events += 1
+                        new_roam_count = (prev.get("roam_count") or 0) + 1
+                        c.execute("""
+                            UPDATE client_presence SET
+                            ip = ?, device_name = ?, brand = ?, model_series = ?, device_type = ?, vendor = ?,
+                            ap_id = ?, ap_name = ?, ap_host = ?, interface = ?, band = ?, ssid = ?,
+                            signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
+                            last_seen = ?, status = 'online', roam_count = ?
+                            WHERE mac = ?
+                        """, (
+                            ip, dev_info["device_name"], dev_info.get("brand", ""), dev_info.get("model_series", ""),
+                            dev_info.get("device_type", "unknown"), dev_info.get("vendor", ""),
+                            d["id"], d["name"], d["host"], iface, band, r.get("ssid", ""),
+                            sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
+                            now, new_roam_count, mac
+                        ))
+                        c.execute("""
+                            INSERT INTO client_roaming_events
+                            (timestamp, time_str, mac, event_type, from_ap_id, from_ap_name, from_signal_dbm, from_band,
+                             to_ap_id, to_ap_name, to_signal_dbm, to_band, to_interface, to_ssid, to_ip, details)
+                            VALUES (?, ?, ?, 'ROAMED', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            now, now_str, mac, prev["ap_id"], prev["ap_name"], prev.get("signal_dbm"),
+                            d["id"], d["name"], sig_dbm, band, iface, r.get("ssid", ""), ip,
+                            f"Roaming dari {prev['ap_name']} ({prev.get('signal_dbm')} dBm) ke {d['name']} ({sig_dbm} dBm)"
+                        ))
+                        existing[mac] = {"ap_id": d["id"], "ap_name": d["name"], "signal_dbm": sig_dbm, "roam_count": new_roam_count, "first_seen": prev.get("first_seen", now)}
+                    else:
+                        c.execute("""
+                            UPDATE client_presence SET
+                            ip = ?, signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
+                            last_seen = ?, status = 'online'
+                            WHERE mac = ?
+                        """, (
+                            ip, sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
+                            now, mac
+                        ))
+
+            # Mark inactive clients (> 180s without sight) as offline
+            cutoff = now - 180
+            c.execute("UPDATE client_presence SET status = 'offline' WHERE last_seen < ? AND status = 'online'", (cutoff,))
+            conn.commit()
+            conn.close()
+        except Exception as ex:
+            print(f"Error in probe_fleet_clients_and_record: {ex}")
+
+    return {
+        "status": "ok",
+        "total_seen": len(client_map),
+        "new_clients": new_clients,
+        "roams_detected": roam_events
+    }
+
+
+def client_roaming_tracker_thread():
+    time.sleep(3)
+    while True:
+        try:
+            probe_fleet_clients_and_record()
+        except Exception as e:
+            print(f"Roaming tracker error: {e}")
+        time.sleep(25)
+
+
+_roam_thread = threading.Thread(target=client_roaming_tracker_thread, daemon=True, name="ClientRoamingTracker")
+_roam_thread.start()
+
+
+@app.get("/api/clients/locator")
+def api_clients_locator(
+    query: str = "",
+    status: str = "all",
+    band: str = "all",
+    ap_id: str = "",
+    roamed_only: bool = False,
+    weak_signal: bool = False,
+    sort: str = "last_seen",
+    limit: int = 150,
+    offset: int = 0
+):
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            conditions = []
+            params = []
+
+            if query.strip():
+                q = f"%{query.strip()}%"
+                conditions.append("""(
+                    mac LIKE ? OR ip LIKE ? OR device_name LIKE ? OR brand LIKE ? 
+                    OR model_series LIKE ? OR vendor LIKE ? OR ap_name LIKE ?
+                )""")
+                params.extend([q, q, q, q, q, q, q])
+
+            if status in ["online", "offline"]:
+                conditions.append("status = ?")
+                params.append(status)
+
+            if band in ["2.4 GHz", "5 GHz"]:
+                conditions.append("band = ?")
+                params.append(band)
+
+            if ap_id.strip():
+                conditions.append("ap_id = ?")
+                params.append(ap_id.strip())
+
+            if roamed_only:
+                conditions.append("roam_count > 0")
+
+            if weak_signal:
+                conditions.append("status = 'online' AND signal_dbm IS NOT NULL AND signal_dbm < -75")
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            sort_map = {
+                "last_seen": "last_seen DESC",
+                "signal": "signal_dbm DESC",
+                "roams": "roam_count DESC",
+                "name": "device_name ASC",
+                "first_seen": "first_seen DESC",
+            }
+            order_by = sort_map.get(sort, "last_seen DESC")
+
+            # Count total
+            c.execute(f"SELECT COUNT(*) FROM client_presence {where_clause}", params)
+            total = c.fetchone()[0]
+
+            # Fetch rows
+            query_sql = f"""
+                SELECT * FROM client_presence 
+                {where_clause} 
+                ORDER BY {order_by} 
+                LIMIT ? OFFSET ?
+            """
+            c.execute(query_sql, params + [limit, offset])
+            rows = [enrich_client_floor_info(dict(r)) for r in c.fetchall()]
+            conn.close()
+
+            return {
+                "status": "ok",
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "clients": rows
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+
+@app.get("/api/clients/locator/stats")
+def api_clients_locator_stats():
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            c.execute("SELECT COUNT(*) FROM client_presence")
+            total_tracked = c.fetchone()[0]
+
+            c.execute("SELECT COUNT(*) FROM client_presence WHERE status = 'online'")
+            online_now = c.fetchone()[0]
+
+            c.execute("SELECT COUNT(*) FROM client_presence WHERE status = 'online' AND signal_dbm IS NOT NULL AND signal_dbm < -75")
+            weak_signal = c.fetchone()[0]
+
+            c.execute("SELECT COUNT(*) FROM client_presence WHERE roam_count > 0")
+            roamed_clients = c.fetchone()[0]
+
+            one_day_ago = time.time() - 86400
+            c.execute("SELECT COUNT(*) FROM client_roaming_events WHERE timestamp > ? AND event_type = 'ROAMED'", (one_day_ago,))
+            roams_today = c.fetchone()[0]
+
+            # Band distribution
+            c.execute("SELECT band, COUNT(*) FROM client_presence WHERE status = 'online' GROUP BY band")
+            band_dist = {r[0]: r[1] for r in c.fetchall() if r[0]}
+
+            # Top roaming clients
+            c.execute("""
+                SELECT mac, ip, device_name, brand, model_series, device_type, ap_name, roam_count, signal_dbm
+                FROM client_presence 
+                WHERE roam_count > 0 
+                ORDER BY roam_count DESC 
+                LIMIT 8
+            """)
+            top_roamers = [dict(r) for r in c.fetchall()]
+
+            # Recent roam events
+            c.execute("""
+                SELECT r.*, p.device_name, p.brand, p.model_series, p.device_type
+                FROM client_roaming_events r
+                LEFT JOIN client_presence p ON r.mac = p.mac
+                WHERE r.event_type = 'ROAMED'
+                ORDER BY r.timestamp DESC
+                LIMIT 10
+            """)
+            recent_roams = [dict(r) for r in c.fetchall()]
+
+            # Top APs by client count
+            c.execute("""
+                SELECT ap_id, ap_name, COUNT(*) as count 
+                FROM client_presence 
+                WHERE status = 'online' 
+                GROUP BY ap_id 
+                ORDER BY count DESC 
+                LIMIT 8
+            """)
+            top_aps = [dict(r) for r in c.fetchall()]
+
+            conn.close()
+
+            return {
+                "status": "ok",
+                "total_tracked": total_tracked,
+                "online_now": online_now,
+                "offline_count": total_tracked - online_now,
+                "weak_signal_count": weak_signal,
+                "roamed_clients_count": roamed_clients,
+                "roams_today": roams_today,
+                "band_distribution": band_dist,
+                "top_roamers": top_roamers,
+                "recent_roams": recent_roams,
+                "top_aps": top_aps
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+
+@app.get("/api/clients/locator/{mac}/trail")
+def api_client_trail(mac: str):
+    mac_norm = mac.strip().upper()
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            c.execute("SELECT * FROM client_presence WHERE mac = ?", (mac_norm,))
+            row = c.fetchone()
+            if not row:
+                conn.close()
+                raise HTTPException(status_code=404, detail=f"Klien dengan MAC '{mac_norm}' belum pernah terdeteksi")
+            
+            client_dict = enrich_client_floor_info(dict(row))
+
+            c.execute("""
+                SELECT * FROM client_roaming_events 
+                WHERE mac = ? 
+                ORDER BY timestamp DESC 
+                LIMIT 100
+            """, (mac_norm,))
+            events = [dict(r) for r in c.fetchall()]
+            conn.close()
+
+            # Enrich each event with floor info if available
+            floors_data = load_floors_data()
+            placements = {p.get("device_id"): p for p in floors_data.get("placements", [])}
+            floors_map = {f.get("id"): f.get("name") for f in floors_data.get("floors", [])}
+
+            enriched_events = []
+            for ev in events:
+                to_ap = ev.get("to_ap_id")
+                from_ap = ev.get("from_ap_id")
+                p_to = placements.get(to_ap)
+                p_from = placements.get(from_ap)
+
+                to_floor = {
+                    "floor_id": p_to.get("floor_id"),
+                    "floor_name": floors_map.get(p_to.get("floor_id")),
+                    "x": p_to.get("x"),
+                    "y": p_to.get("y"),
+                } if p_to else None
+
+                from_floor = {
+                    "floor_id": p_from.get("floor_id"),
+                    "floor_name": floors_map.get(p_from.get("floor_id")),
+                    "x": p_from.get("x"),
+                    "y": p_from.get("y"),
+                } if p_from else None
+
+                delta_signal = None
+                if ev.get("to_signal_dbm") is not None and ev.get("from_signal_dbm") is not None:
+                    delta_signal = ev["to_signal_dbm"] - ev["from_signal_dbm"]
+
+                enriched_events.append({
+                    **ev,
+                    "delta_signal": delta_signal,
+                    "to_floor": to_floor,
+                    "from_floor": from_floor,
+                })
+
+            return {
+                "status": "ok",
+                "client": client_dict,
+                "trail": enriched_events,
+                "total_events": len(enriched_events),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+
+@app.post("/api/clients/locator/poll-now")
+def api_client_locator_poll_now():
+    res = probe_fleet_clients_and_record()
+    return res
 
 @app.post("/api/interfaces/toggle")
 def api_interface_toggle(req: InterfaceToggleReq):

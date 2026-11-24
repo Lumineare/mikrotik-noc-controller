@@ -27,7 +27,9 @@ import {
   Laptop,
   Tag,
   Radar,
+  Footprints,
 } from 'lucide-react';
+import { ClientTrailDrawer } from '../locator/ClientTrailDrawer';
 import {
   WirelessClient,
   WirelessInterface,
@@ -63,6 +65,7 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
 
   // Kick client state
   const [kickingMac, setKickingMac] = useState<string | null>(null);
+  const [selectedMacForTrail, setSelectedMacForTrail] = useState<string | null>(null);
 
   // Add SSID Modal state
   const [showAddModal, setShowAddModal] = useState(false);
@@ -794,15 +797,25 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
                           )}
                         </td>
                         <td className="py-3 px-4 text-center">
-                          <button
-                            onClick={() => handleKickClient(c.mac, (c as any).id)}
-                            disabled={kickingMac === c.mac}
-                            className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[11px] font-mono flex items-center gap-1 mx-auto transition-colors font-semibold cursor-pointer shadow-xs"
-                            title="Putuskan koneksi client ini (Winbox registration-table remove)"
-                          >
-                            <UserMinus className="w-3 h-3 text-rose-600" />
-                            <span>{kickingMac === c.mac ? 'Memutus...' : 'Kick'}</span>
-                          </button>
+                          <div className="flex items-center justify-center gap-1.5">
+                            <button
+                              onClick={() => setSelectedMacForTrail(c.mac)}
+                              className="px-2 py-1 rounded-lg bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-700 text-[11px] font-mono flex items-center gap-1 transition-colors font-semibold cursor-pointer shadow-xs"
+                              title="Lihat riwayat roaming / jejak perangkat ini"
+                            >
+                              <Footprints className="w-3 h-3 text-blue-600" />
+                              <span>Jejak</span>
+                            </button>
+                            <button
+                              onClick={() => handleKickClient(c.mac, (c as any).id)}
+                              disabled={kickingMac === c.mac}
+                              className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[11px] font-mono flex items-center gap-1 transition-colors font-semibold cursor-pointer shadow-xs"
+                              title="Putuskan koneksi client ini (Winbox registration-table remove)"
+                            >
+                              <UserMinus className="w-3 h-3 text-rose-600" />
+                              <span>{kickingMac === c.mac ? 'Memutus...' : 'Kick'}</span>
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -1918,6 +1931,12 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
         message={alertModal.message}
         type={alertModal.type}
         onClose={() => setAlertModal((prev) => ({ ...prev, isOpen: false }))}
+      />
+
+      {/* Roaming Trail Drawer */}
+      <ClientTrailDrawer
+        mac={selectedMacForTrail}
+        onClose={() => setSelectedMacForTrail(null)}
       />
     </div>
   );

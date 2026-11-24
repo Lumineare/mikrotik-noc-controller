@@ -29,6 +29,10 @@ import {
   TelegramConfig,
   TelegramAlertRecord,
   SupportedChannelsResponse,
+  ClientPresence,
+  RoamingEvent,
+  ClientTrailResponse,
+  LocatorStats,
 } from '../types';
 
 const BASE_URL = '';
@@ -637,6 +641,57 @@ export const api = {
 
   async clearTelegramHistory(): Promise<{ status: string; message: string }> {
     const res = await fetch(`${BASE_URL}/api/telegram/clear-history`, {
+      method: 'POST',
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  // --- Client Locator & Roaming Trail ---
+  async getClientLocator(params?: {
+    query?: string;
+    status?: string;
+    band?: string;
+    ap_id?: string;
+    roamed_only?: boolean;
+    weak_signal?: boolean;
+    sort?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ status: string; total: number; limit: number; offset: number; clients: ClientPresence[] }> {
+    const q = new URLSearchParams();
+    if (params?.query) q.append('query', params.query);
+    if (params?.status) q.append('status', params.status);
+    if (params?.band) q.append('band', params.band);
+    if (params?.ap_id) q.append('ap_id', params.ap_id);
+    if (params?.roamed_only) q.append('roamed_only', 'true');
+    if (params?.weak_signal) q.append('weak_signal', 'true');
+    if (params?.sort) q.append('sort', params.sort);
+    if (params?.limit) q.append('limit', String(params.limit));
+    if (params?.offset) q.append('offset', String(params.offset));
+
+    const res = await fetch(`${BASE_URL}/api/clients/locator?${q.toString()}`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async getClientLocatorStats(): Promise<LocatorStats> {
+    const res = await fetch(`${BASE_URL}/api/clients/locator/stats`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async getClientTrail(mac: string): Promise<ClientTrailResponse> {
+    const res = await fetch(`${BASE_URL}/api/clients/locator/${encodeURIComponent(mac)}/trail`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async pollClientLocatorNow(): Promise<{ status: string; total_seen: number; new_clients: number; roams_detected: number }> {
+    const res = await fetch(`${BASE_URL}/api/clients/locator/poll-now`, {
       method: 'POST',
       headers: { ...getAuthHeaders() },
     });

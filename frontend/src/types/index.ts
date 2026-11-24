@@ -607,5 +607,119 @@ export interface OptimizeAndPushResult {
   message: string;
 }
 
+export interface ClientPresence {
+  mac: string;
+  ip?: string;
+  device_name: string;
+  brand?: string;
+  model_series?: string;
+  device_type?: string;
+  vendor?: string;
+  is_custom_name: number | boolean;
+  ap_id: string;
+  ap_name: string;
+  ap_host?: string;
+  interface?: string;
+  band?: string;
+  ssid?: string;
+  signal_dbm?: number;
+  signal_raw?: string;
+  tx_rate?: string;
+  rx_rate?: string;
+  uptime?: string;
+  first_seen: number;
+  last_seen: number;
+  status: 'online' | 'offline';
+  roam_count: number;
+  floor_id?: string;
+  floor_name?: string;
+  floor_x?: number;
+  floor_y?: number;
+  has_floor_map?: boolean;
+}
+
+export interface RoamingEvent {
+  id: number;
+  timestamp: number;
+  time_str: string;
+  mac: string;
+  event_type: 'ASSOCIATED' | 'ROAMED' | 'DISCONNECTED' | 'RECONNECTED';
+  from_ap_id?: string;
+  from_ap_name?: string;
+  from_signal_dbm?: number;
+  from_band?: string;
+  to_ap_id: string;
+  to_ap_name: string;
+  to_signal_dbm?: number;
+  to_band?: string;
+  to_interface?: string;
+  to_ssid?: string;
+  to_ip?: string;
+  details?: string;
+  delta_signal?: number;
+  to_floor?: {
+    floor_id?: string;
+    floor_name?: string;
+    x?: number;
+    y?: number;
+  } | null;
+  from_floor?: {
+    floor_id?: string;
+    floor_name?: string;
+    x?: number;
+    y?: number;
+  } | null;
+}
+
+export interface ClientTrailResponse {
+  status: string;
+  client: ClientPresence;
+  trail: RoamingEvent[];
+  total_events: number;
+}
+
+export interface LocatorStats {
+  status: string;
+  total_tracked: number;
+  online_now: number;
+  offline_count: number;
+  weak_signal_count: number;
+  roamed_clients_count: number;
+  roams_today: number;
+  band_distribution: Record<string, number>;
+  top_roamers: Array<{
+    mac: string;
+    ip?: string;
+    device_name: string;
+    brand?: string;
+    model_series?: string;
+    device_type?: string;
+    ap_name: string;
+    roam_count: number;
+    signal_dbm?: number;
+  }>;
+  recent_roams: Array<{
+    id: number;
+    timestamp: number;
+    time_str: string;
+    mac: string;
+    event_type: string;
+    from_ap_name?: string;
+    to_ap_name: string;
+    from_signal_dbm?: number;
+    to_signal_dbm?: number;
+    to_band?: string;
+    details?: string;
+    device_name?: string;
+    brand?: string;
+    model_series?: string;
+  }>;
+  top_aps: Array<{
+    ap_id: string;
+    ap_name: string;
+    count: number;
+  }>;
+}
+
 
 
