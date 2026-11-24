@@ -50,7 +50,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
   };
 
   const handleFillDefaults = () => {
-    setUsername('admin');
+    setUsername('Admin');
     setPassword('');
     setError(null);
   };
@@ -182,7 +182,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
                   className="text-[11px] text-slate-500 hover:text-blue-600 flex items-center gap-1 transition-colors cursor-pointer"
                 >
                   <KeyRound className="w-3.5 h-3.5 text-blue-600/80" />
-                  Isi Username Default (admin)
+                  Isi Username Default (Admin)
                 </button>
               </div>
 

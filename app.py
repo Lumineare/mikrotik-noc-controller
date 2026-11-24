@@ -32,6 +32,20 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------- NOC Authentication
+# Kredensial login dibaca dari .env (NOC_ADMIN_USER / NOC_ADMIN_PASS) supaya
+# ganti user tidak perlu edit kode dan tidak ada password hardcoded di repo.
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_dotenv(Path(__file__).resolve().parent / ".env")
 NOC_ADMIN_USER = os.getenv("NOC_ADMIN_USER", "admin")
 NOC_ADMIN_PASS = os.getenv("NOC_ADMIN_PASS", "admin123")
 ACTIVE_SESSIONS: dict[str, dict] = {}
@@ -314,7 +328,7 @@ def api_auth_login(req: LoginReq):
     user = req.username.strip()
     pwd = req.password.strip()
     
-    if (user == NOC_ADMIN_USER and pwd == NOC_ADMIN_PASS) or (user == "admin" and pwd == NOC_ADMIN_PASS):
+    if user == NOC_ADMIN_USER and pwd == NOC_ADMIN_PASS:
         token = secrets.token_hex(24)
         session_data = {
             "username": user,
