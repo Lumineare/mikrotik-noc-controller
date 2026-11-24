@@ -29,6 +29,7 @@ import {
 } from '../../types';
 import { api } from '../../api/client';
 import { ConfirmModal } from '../ConfirmModal';
+import { RrmPanel } from './RrmPanel';
 
 interface TabAiOptimizerProps {
   deviceId: string;
@@ -223,6 +224,9 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
           <span className="flex-1 font-semibold">{actionFeedback.text}</span>
         </div>
       )}
+
+      {/* DIRECT-PUSH RRM: DCA + TPC + steering, autonomous */}
+      <RrmPanel deviceId={deviceId} onApplied={onRefreshParent} />
 
       {/* HERO SECTION: AI HEALTH SCORE & TELEMETRY */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">

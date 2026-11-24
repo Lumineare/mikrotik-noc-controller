@@ -370,6 +370,7 @@ class MT:
             port=int(self.cfg.get("port", 8728)),
             plaintext_login=True,
         )
+        self.pool.set_timeout(float(os.getenv("MT_TIMEOUT", "5")))
         self.api = self.pool.get_api()
         return self
 
@@ -939,6 +940,7 @@ def test_connection_helper(host: str, port: int, user: str, password: str) -> di
             port=int(port),
             plaintext_login=True,
         )
+        pool.set_timeout(3.0)  # tanpa ini default 15s → UI "add device" terasa hang
         api = pool.get_api()
         try:
             ident = api.get_resource("/system/identity").get()[0].get("name", "Unknown")
@@ -4315,6 +4317,648 @@ def health(device: str | None = None):
         return f"ok device={name} host={dev['host']} id={dev['id']}"
     except Exception as e:
         return PlainTextResponse(f"fail {type(e).__name__}: {e}", status_code=503)
+
+
+# ---------------------------------------------------------------- RRM / auto-optimizer
+# Direct-push self-optimising WLAN (Ruijie-style): DCA + TPC + steering from rrm_engine,
+# applied by the backend itself on a schedule, with snapshot/rollback and client-drop guard.
+import rrm_engine as rrm
+
+RRM_CFG_FILE = BASE / "rrm_config.json"
+RRM_DEFAULT = {
+    "enabled": False,          # auto-push on/off
+    "interval_min": 15,        # evaluation period
+    "include_dfs": False,      # DFS channels opt-in only (radar hit drops the radio)
+    "apply_channel": True,
+    "apply_txpower": False,
+    "apply_steering": False,
+    "min_gain_pct": 15.0,      # do not touch a working network for less than this
+    "quiet_start": "01:00",    # auto-push only inside this window unless no clients attached
+    "quiet_end": "05:00",
+    "max_client_drop": 0,      # rollback automatically if more clients vanish than this
+    "scan_duration": 8,
+    "sample_interval_min": 5,
+    "last_run_ts": 0.0,
+}
+RRM_LOCK = threading.Lock()
+
+
+def init_rrm_db():
+    with _DB_LOCK:
+        conn = sqlite3.connect(str(NOC_DB_FILE))
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS rf_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, device_id TEXT, interface TEXT, band TEXT, mac TEXT,
+                rssi REAL, snr REAL, tx_ccq REAL, retry_pct REAL, noise_dbm REAL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rf_samples_dev ON rf_samples (device_id, ts)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS rrm_runs (
+                id TEXT PRIMARY KEY, ts REAL, mode TEXT, status TEXT,
+                gain_pct REAL, plan_json TEXT, snapshot_json TEXT,
+                result_json TEXT, rolled_back INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+
+def load_rrm_cfg() -> dict:
+    cfg = dict(RRM_DEFAULT)
+    if RRM_CFG_FILE.exists():
+        try:
+            cfg.update(json.loads(RRM_CFG_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_rrm_cfg(cfg: dict) -> dict:
+    merged = load_rrm_cfg()
+    merged.update(cfg or {})
+    RRM_CFG_FILE.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    return merged
+
+
+def _hhmm_to_min(s: str) -> int:
+    try:
+        h, m = str(s).split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return 0
+
+
+def _in_quiet_window(cfg: dict) -> bool:
+    now = time.localtime()
+    cur = now.tm_hour * 60 + now.tm_min
+    start, end = _hhmm_to_min(cfg.get("quiet_start", "01:00")), _hhmm_to_min(cfg.get("quiet_end", "05:00"))
+    if start == end:
+        return True
+    return start <= cur < end if start < end else (cur >= start or cur < end)
+
+
+# ---------- RF sample store (training data for the ML anomaly engine) ----------
+def db_rf_samples_insert(rows: list[tuple]):
+    if not rows:
+        return
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.executemany("""
+                INSERT INTO rf_samples (ts, device_id, interface, band, mac, rssi, snr, tx_ccq, retry_pct, noise_dbm)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            conn.execute("DELETE FROM rf_samples WHERE ts < ?", (time.time() - 30 * 86400,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_rf_samples(device_id: str | None = None, limit: int = 20000) -> list[dict]:
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            if device_id:
+                rows = conn.execute(
+                    "SELECT * FROM rf_samples WHERE device_id=? ORDER BY ts DESC LIMIT ?",
+                    (device_id, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM rf_samples ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+
+def db_rrm_run_save(run: dict):
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute("""
+                INSERT OR REPLACE INTO rrm_runs
+                (id, ts, mode, status, gain_pct, plan_json, snapshot_json, result_json, rolled_back)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """, (run["id"], run["ts"], run["mode"], run.get("status", "applied"),
+                  run.get("gain_pct", 0.0), json.dumps(run.get("plan") or {}),
+                  json.dumps(run.get("snapshot") or {}), json.dumps(run.get("result") or {})))
+            conn.execute("DELETE FROM rrm_runs WHERE ts < ?", (time.time() - 90 * 86400,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_rrm_runs(limit: int = 20) -> list[dict]:
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM rrm_runs ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            conn.close()
+            out = []
+            for r in rows:
+                d = dict(r)
+                for k in ("plan_json", "snapshot_json", "result_json"):
+                    try:
+                        d[k.replace("_json", "")] = json.loads(d.pop(k) or "{}")
+                    except Exception:
+                        d[k.replace("_json", "")] = {}
+                out.append(d)
+            return out
+        except Exception:
+            return []
+
+
+def db_rrm_run_get(run_id: str) -> dict | None:
+    return next((r for r in db_rrm_runs(200) if r["id"] == run_id), None)
+
+
+def db_rrm_run_mark_rolled_back(run_id: str):
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute("UPDATE rrm_runs SET rolled_back=1 WHERE id=?", (run_id,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+# ---------- live data collection ----------
+def _sig_dbm(raw) -> float | None:
+    try:
+        return float(str(raw).split("@")[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _band_of(iface: dict) -> str:
+    return "5g" if "5ghz" in (iface.get("band") or "").lower() else "2g"
+
+
+def _width_mhz(iface: dict) -> int:
+    m = re.search(r"(\d+)", str(iface.get("channel-width") or "20"))
+    return int(m.group(1)) if m else 20
+
+
+def collect_rf_samples(dev: dict, mt) -> int:
+    """One row per associated client: the feature vector the ML engine trains on."""
+    ts = time.time()
+    rows = []
+    try:
+        reg = mt.resource("/interface/wireless/registration-table").get()
+    except Exception:
+        return 0
+    ifaces = {i["name"]: i for i in mt.resource("/interface/wireless").get()}
+    for c in reg:
+        rssi = _sig_dbm(c.get("signal-strength"))
+        if rssi is None:
+            continue
+        try:
+            snr = float(c.get("signal-to-noise") or 0)
+        except (TypeError, ValueError):
+            snr = 0.0
+        try:
+            ccq = float(c.get("tx-ccq") or 0)
+        except (TypeError, ValueError):
+            ccq = 0.0
+        try:
+            tx_frames = float(str(c.get("frames", "0,0")).split(",")[1])
+            timed_out = float(c.get("tx-frames-timed-out") or 0)
+            retry_pct = (100.0 * timed_out / tx_frames) if tx_frames > 0 else 0.0
+        except (TypeError, ValueError, IndexError):
+            retry_pct = 0.0
+        iface = ifaces.get(c.get("interface"), {})
+        rows.append((ts, dev["id"], c.get("interface"), _band_of(iface), c.get("mac-address"),
+                     rssi, snr, ccq, round(retry_pct, 2), rssi - snr))
+    db_rf_samples_insert(rows)
+    return len(rows)
+
+
+def _gather_ap(dev: dict, duration: int) -> list[dict]:
+    """Per-band engine input for one AP: own channel, noise floor, neighbour BSSes."""
+    out = []
+    known = {}
+    try:
+        known = get_fleet_known_bssids() or {}
+    except Exception:
+        known = {}
+    for band in ("2g", "5g"):
+        try:
+            scan = api_rf_scan(device=dev["id"], band=band, duration=duration)
+        except HTTPException:
+            continue
+        except Exception:
+            continue
+        iface_name = scan.get("interface")
+        cur = scan.get("current_channel") or {}
+        freq = int(cur.get("freq") or 0)
+        if not freq:
+            continue
+        noise = {int(c["freq"]): float(c["noise_floor"])
+                 for c in scan.get("channels", [])
+                 if c.get("noise_floor") is not None}
+        neighbours = []
+        for b in scan.get("bss_list", []):
+            owner = (known.get(str(b.get("bssid", "")).upper().replace("-", ":")) or {}).get("device_id")
+            neighbours.append({
+                "freq": int(b.get("freq") or 0),
+                "width": int(b.get("width") or 20),
+                "signal": float(b.get("signal") or -95),
+                "owner": owner,
+                "ssid": b.get("ssid"),
+                "bssid": b.get("bssid"),
+            })
+        out.append({
+            "id": f"{dev['id']}#{band}", "device_id": dev["id"],
+            "interface": iface_name, "band": band,
+            "freq": freq, "width": _width_mhz({"channel-width": cur.get("width")}),
+            "neighbours": neighbours, "noise": noise,
+            "current_quality": scan.get("current_channel_quality"),
+            "tx_power": None,
+        })
+    return out
+
+
+def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None) -> dict:
+    cfg = load_rrm_cfg()
+    if include_dfs is None:
+        include_dfs = bool(cfg.get("include_dfs"))
+    if duration is None:
+        duration = int(cfg.get("scan_duration", 8))
+    devs = load_devices()
+    aps: list[dict] = []
+    samples = 0
+
+    def gather(d):
+        got = _gather_ap(d, duration)
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                wl = {w["name"]: w for w in mt.resource("/interface/wireless").get()}
+                for a in got:
+                    w = wl.get(a["interface"]) or {}
+                    try:
+                        a["tx_power"] = float(w.get("tx-power")) if w.get("tx-power") else None
+                    except (TypeError, ValueError):
+                        a["tx_power"] = None
+                n = collect_rf_samples(d, mt)
+        except Exception:
+            n = 0
+        return got, n
+
+    with ThreadPoolExecutor(max_workers=min(len(devs), 4) or 1) as ex:
+        for got, n in ex.map(gather, devs):
+            aps.extend(got)
+            samples += n
+
+    dca = rrm.plan_dca(aps, include_dfs=include_dfs)
+    tpc = rrm.plan_tpc(aps)
+    steering = []
+    for d in devs:
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                wl = mt.resource("/interface/wireless").get()
+                i2 = next((w["name"] for w in wl if _band_of(w) == "2g"), None)
+                i5 = next((w["name"] for w in wl if _band_of(w) == "5g"), None)
+                clients = mt.resource("/interface/wireless/registration-table").get()
+        except Exception:
+            continue
+        c2 = [c for c in clients if c.get("interface") == i2]
+        rules = rrm.steering_rules(i2, i5, [{"mac": c.get("mac-address"),
+                                            "signal_strength": c.get("signal-strength")} for c in c2])
+        for r in rules:
+            r["device_id"] = d["id"]
+        steering.extend(rules)
+
+    return {
+        "ok": True,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "include_dfs": include_dfs,
+        "devices_scanned": len(devs),
+        "bands_seen": len(aps),
+        "samples_collected": samples,
+        "dca": dca,
+        "tpc": tpc,
+        "steering": steering,
+        "summary": {
+            "channel_changes": len(dca["changes"]),
+            "txpower_changes": len(tpc),
+            "steering_rules": len(steering),
+            "expected_gain_pct": dca["gain_pct"],
+            "actionable": bool(dca["changes"] or tpc or steering),
+        },
+    }
+
+
+# ---------- apply / rollback ----------
+def _snapshot_wireless(dev: dict, mt) -> list[dict]:
+    snap = []
+    for w in mt.resource("/interface/wireless").get():
+        snap.append({
+            "device_id": dev["id"], "interface": w["name"],
+            "frequency": w.get("frequency"), "channel_width": w.get("channel-width"),
+            "tx_power": w.get("tx-power"), "tx_power_mode": w.get("tx-power-mode"),
+            "acl_ids": [],
+        })
+    return snap
+
+
+def _apply_channel_changes(changes: list[dict]) -> list[dict]:
+    done = []
+    for ch in changes:
+        dev = get_device(ch["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                wl = mt.resource("/interface/wireless")
+                target = wl.get(name=ch["interface"])
+                if not target:
+                    continue
+                wl.set(id=target[0]["id"], frequency=str(ch["to_freq"]))
+                done.append({**ch, "applied": True})
+        except Exception as e:
+            done.append({**ch, "applied": False, "error": f"{type(e).__name__}: {e}"})
+    return done
+
+
+def _apply_tpc_changes(changes: list[dict]) -> list[dict]:
+    done = []
+    for t in changes:
+        dev = get_device(t["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                wl = mt.resource("/interface/wireless")
+                target = wl.get(name=t["interface"])
+                if not target:
+                    continue
+                wl.set(id=target[0]["id"], tx_power=str(int(t["to_dbm"])),
+                       tx_power_mode="all-rates-fixed")
+                done.append({**t, "applied": True})
+        except Exception as e:
+            done.append({**t, "applied": False, "error": f"{type(e).__name__}: {e}"})
+    return done
+
+
+def _apply_steering_rules(rules: list[dict]) -> list[dict]:
+    done = []
+    for r in rules:
+        dev = get_device(r["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                acl = mt.resource("/interface/wireless/access-list")
+                acl.add(interface=r["interface"], signal_range=r["signal_range"],
+                        authentication="no", forwarding="no", comment=r["comment"])
+                created = acl.get(comment=r["comment"])
+                done.append({**r, "applied": True, "acl_ids": [x["id"] for x in created]})
+        except Exception as e:
+            done.append({**r, "applied": False, "error": f"{type(e).__name__}: {e}"})
+    return done
+
+
+class RrmApplyReq(BaseModel):
+    apply_channel: bool | None = None
+    apply_txpower: bool | None = None
+    apply_steering: bool | None = None
+    include_dfs: bool | None = None
+    min_gain_pct: float | None = None
+    plan: dict | None = None
+
+
+class RrmRollbackReq(BaseModel):
+    run_id: str
+
+
+@app.post("/api/rrm/plan")
+def api_rrm_plan(include_dfs: bool | None = None, duration: int | None = Query(None, ge=4, le=20)):
+    return build_rrm_plan(include_dfs=include_dfs, duration=duration)
+
+
+@app.post("/api/rrm/apply")
+def api_rrm_apply(req: RrmApplyReq):
+    cfg = load_rrm_cfg()
+    plan = req.plan or build_rrm_plan(include_dfs=req.include_dfs)
+    do_ch = cfg["apply_channel"] if req.apply_channel is None else req.apply_channel
+    do_tpc = cfg["apply_txpower"] if req.apply_txpower is None else req.apply_txpower
+    do_steer = cfg["apply_steering"] if req.apply_steering is None else req.apply_steering
+    min_gain = cfg["min_gain_pct"] if req.min_gain_pct is None else req.min_gain_pct
+
+    dca = plan.get("dca") or {}
+    if do_ch and dca.get("gain_pct", 0) < float(min_gain):
+        return {"ok": False, "skipped": True,
+                "reason": f"gain {dca.get('gain_pct', 0)}% < min_gain {min_gain}% — jaringan tidak disentuh"}
+
+    devs = {d["id"]: d for d in load_devices()}
+    clients_before = {}
+    snapshot = []
+    for did in devs:
+        try:
+            dev = devs[did]
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                snapshot.extend(_snapshot_wireless(dev, mt))
+                clients_before[did] = len(mt.resource(
+                    "/interface/wireless/registration-table").get())
+        except Exception:
+            continue
+
+    result = {"channel": [], "txpower": [], "steering": []}
+    if do_ch and dca.get("changes"):
+        result["channel"] = _apply_channel_changes(dca["changes"])
+    if do_tpc and plan.get("tpc"):
+        result["txpower"] = _apply_tpc_changes(plan["tpc"])
+    if do_steer and plan.get("steering"):
+        result["steering"] = _apply_steering_rules(plan["steering"])
+
+    run = {
+        "id": f"rrm_{secrets.token_hex(4)}", "ts": time.time(), "mode": "manual",
+        "status": "applied", "gain_pct": dca.get("gain_pct", 0.0),
+        "plan": plan, "snapshot": {"wireless": snapshot, "clients_before": clients_before},
+        "result": result,
+    }
+    db_rrm_run_save(run)
+    applied = sum(1 for k in result for x in result[k] if x.get("applied"))
+    return {"ok": True, "run_id": run["id"], "applied_actions": applied,
+            "gain_pct": run["gain_pct"], "result": result,
+            "rollback_hint": f"POST /api/rrm/rollback {{'run_id': '{run['id']}'}}"}
+
+
+@app.post("/api/rrm/rollback")
+def api_rrm_rollback(req: RrmRollbackReq):
+    run = db_rrm_run_get(req.run_id)
+    if not run:
+        raise HTTPException(404, "Run tidak ditemukan")
+    snap = (run.get("snapshot") or {}).get("wireless") or []
+    restored, acl_removed = 0, 0
+    for entry in snap:
+        dev = get_device(entry["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                wl = mt.resource("/interface/wireless")
+                target = wl.get(name=entry["interface"])
+                if not target:
+                    continue
+                attrs = {}
+                if entry.get("frequency"):
+                    attrs["frequency"] = str(entry["frequency"])
+                if entry.get("channel_width"):
+                    attrs["channel_width"] = entry["channel_width"]
+                if entry.get("tx_power"):
+                    attrs["tx_power"] = str(entry["tx_power"])
+                if entry.get("tx_power_mode"):
+                    attrs["tx_power_mode"] = entry["tx_power_mode"]
+                cur = target[0]
+                attrs = {k: v for k, v in attrs.items()
+                         if str(cur.get(k.replace("_", "-")) or "") != str(v)}
+                if attrs:
+                    wl.set(id=cur["id"], **attrs)
+                    restored += 1
+                acl = mt.resource("/interface/wireless/access-list")
+                for r in acl.get(comment="RRM-steer-5g"):
+                    acl.remove(id=r["id"])
+                    acl_removed += 1
+        except Exception:
+            continue
+    db_rrm_run_mark_rolled_back(req.run_id)
+    return {"ok": True, "run_id": req.run_id, "interfaces_restored": restored,
+            "steering_rules_removed": acl_removed}
+
+
+@app.get("/api/rrm/status")
+def api_rrm_status():
+    cfg = load_rrm_cfg()
+    samples = len(db_rf_samples(limit=100000))
+    return {
+        "ok": True,
+        "config": cfg,
+        "in_quiet_window": _in_quiet_window(cfg),
+        "rf_samples": samples,
+        "ml_ready": samples >= 100,
+        "runs": db_rrm_runs(10),
+    }
+
+
+@app.post("/api/rrm/config")
+def api_rrm_config(req: dict):
+    cfg = save_rrm_cfg(req or {})
+    return {"ok": True, "config": cfg}
+
+
+# ---------- ML anomaly engine (IsolationForest) ----------
+ML_FEATURES = ["rssi", "snr", "tx_ccq", "retry_pct", "noise_dbm"]
+
+
+@app.post("/api/ai/ml/anomaly")
+def api_ml_anomaly(device: str | None = None, min_samples: int = Query(100, ge=30, le=5000)):
+    rows = db_rf_samples(device, limit=20000)
+    if len(rows) < min_samples:
+        return {"ok": False, "status": "collecting", "samples": len(rows),
+                "needed": min_samples,
+                "note": "sampel RF dikumpulkan tiap 5 menit — biarkan sampler berjalan"}
+    try:
+        import numpy as np
+        from sklearn.ensemble import IsolationForest
+    except ImportError:
+        raise HTTPException(503, "scikit-learn belum terpasang: pip install scikit-learn")
+    X = np.array([[float(r[f] or 0) for f in ML_FEATURES] for r in rows], dtype=float)
+    model = IsolationForest(n_estimators=200, contamination="auto", random_state=42)
+    pred = model.fit_predict(X)
+    score = model.decision_function(X)
+    anomalies = []
+    for r, p, s in zip(rows, pred, score):
+        if p != -1:
+            continue
+        anomalies.append({
+            "mac": r["mac"], "device_id": r["device_id"], "interface": r["interface"],
+            "band": r["band"], "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"])),
+            "score": round(float(s), 4), "features": {f: r[f] for f in ML_FEATURES},
+            "verdict": _anomaly_verdict(r),
+        })
+    anomalies.sort(key=lambda a: a["score"])
+    return {"ok": True, "samples": len(rows), "anomalies": anomalies[:50],
+            "anomaly_count": len(anomalies),
+            "anomaly_rate_pct": round(100.0 * len(anomalies) / len(rows), 2),
+            "model": "IsolationForest(n_estimators=200)"}
+
+
+def _anomaly_verdict(r: dict) -> str:
+    """Human label for a flagged sample — hidden-node / non-Wi-Fi interference patterns."""
+    snr, retry, ccq = float(r.get("snr") or 0), float(r.get("retry_pct") or 0), float(r.get("tx_ccq") or 0)
+    if snr >= 25 and retry > 15:
+        return "hidden node collision — high SNR but heavy retries"
+    if snr < 15 and retry > 10:
+        return "non-Wi-Fi interference / noise floor rise"
+    if ccq < 60:
+        return "airtime starvation — channel congestion"
+    return "transmission anomaly"
+
+
+# ---------- background workers ----------
+def _rf_sampler_loop():
+    while True:
+        cfg = load_rrm_cfg()
+        try:
+            for d in load_devices():
+                try:
+                    with get_device_lock(d["host"]), MT(d) as mt:
+                        collect_rf_samples(d, mt)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(max(60, int(cfg.get("sample_interval_min", 5)) * 60))
+
+
+def _rrm_auto_loop():
+    while True:
+        cfg = load_rrm_cfg()
+        try:
+            due = time.time() - float(cfg.get("last_run_ts") or 0) >= int(cfg.get("interval_min", 15)) * 60
+            if cfg.get("enabled") and due and _in_quiet_window(cfg):
+                plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"))
+                gain = (plan.get("dca") or {}).get("gain_pct", 0)
+                if plan["summary"]["actionable"] and gain >= float(cfg.get("min_gain_pct", 15.0)):
+                    clients_before = _client_count()
+                    res = api_rrm_apply(RrmApplyReq())
+                    run_id = res.get("run_id")
+                    save_rrm_cfg({"last_run_ts": time.time()})
+                    if run_id:
+                        time.sleep(60)  # let clients re-associate
+                        dropped = clients_before - _client_count()
+                        if dropped > int(cfg.get("max_client_drop", 0)):
+                            api_rrm_rollback(RrmRollbackReq(run_id=run_id))
+                            db_save_alert({
+                                "id": f"rrm_{secrets.token_hex(4)}",
+                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "status": "warning", "device_id": "rrm",
+                                "alert_type": "RRM_AUTO_ROLLBACK",
+                                "text": (f"RRM auto-rollback: {dropped} klien hilang setelah "
+                                         f"push {run_id} (batas {cfg.get('max_client_drop')})"),
+                            })
+                else:
+                    save_rrm_cfg({"last_run_ts": time.time()})
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+def _client_count() -> int:
+    total = 0
+    for d in load_devices():
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                total += len(mt.resource("/interface/wireless/registration-table").get())
+        except Exception:
+            continue
+    return total
+
+
+init_rrm_db()
+threading.Thread(target=_rf_sampler_loop, daemon=True, name="rf-sampler").start()
+threading.Thread(target=_rrm_auto_loop, daemon=True, name="rrm-auto").start()
 
 
 if __name__ == "__main__":
