@@ -399,6 +399,7 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
           {deliver && !deliver.dry_run && !deliver.skipped && (
             <div>
               • Kirim: {deliver.applied_actions ?? 0} aksi, gain {deliver.gain_pct ?? 0}%
+              {deliver.channel_skipped && <span className="text-amber-600"> (channel dilewati: {deliver.channel_skipped})</span>}
               {deliver.ai?.applied != null &&
                 `, AI ${deliver.ai.applied}/${deliver.ai.applied + (deliver.ai.failed || 0)} ok`}
               {job.run_id && <span className="text-slate-400"> · {job.run_id}</span>}

@@ -4775,9 +4775,14 @@ def api_rrm_apply(req: RrmApplyReq):
     min_gain = cfg["min_gain_pct"] if req.min_gain_pct is None else req.min_gain_pct
 
     dca = plan.get("dca") or {}
+    ch_skip = None
     if do_ch and dca.get("gain_pct", 0) < float(min_gain):
+        ch_skip = f"gain {dca.get('gain_pct', 0)}% < min_gain {min_gain}% — channel tidak diubah"
+        do_ch = False
+    if not do_ch and not (do_tpc and plan.get("tpc")) and not (do_steer and plan.get("steering")):
         return {"ok": False, "skipped": True,
-                "reason": f"gain {dca.get('gain_pct', 0)}% < min_gain {min_gain}% — jaringan tidak disentuh"}
+                "reason": ch_skip or "tidak ada aksi yang lolos guard — jaringan tidak disentuh",
+                "channel_skipped": ch_skip}
 
     devs = {d["id"]: d for d in load_devices()}
     clients_before = {}
@@ -4809,7 +4814,7 @@ def api_rrm_apply(req: RrmApplyReq):
     db_rrm_run_save(run)
     applied = sum(1 for k in result for x in result[k] if x.get("applied"))
     return {"ok": True, "run_id": run["id"], "applied_actions": applied,
-            "gain_pct": run["gain_pct"], "result": result,
+            "gain_pct": run["gain_pct"], "result": result, "channel_skipped": ch_skip,
             "rollback_hint": f"POST /api/rrm/rollback {{'run_id': '{run['id']}'}}"}
 
 
