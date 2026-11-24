@@ -48,6 +48,11 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(Path(__file__).resolve().parent / ".env")
 NOC_ADMIN_USER = os.getenv("NOC_ADMIN_USER", "admin")
 NOC_ADMIN_PASS = os.getenv("NOC_ADMIN_PASS", "admin123")
+# Profil yang tampil di dashboard — bukan identitas hardcoded di kode.
+NOC_USER_NAME = os.getenv("NOC_USER_NAME", "Admin")
+NOC_USER_ROLE = os.getenv("NOC_USER_ROLE", "Administrator")
+NOC_USER_EMAIL = os.getenv("NOC_USER_EMAIL", "")
+NOC_USER_SITE = os.getenv("NOC_USER_SITE", "RS Anwar Medika")
 ACTIVE_SESSIONS: dict[str, dict] = {}
 
 
@@ -332,10 +337,10 @@ def api_auth_login(req: LoginReq):
         token = secrets.token_hex(24)
         session_data = {
             "username": user,
-            "name": "Ahmad Jibril Al Hamdani",
-            "role": "Super Admin NOC",
-            "email": "ahmadjibrilalhamdani@gmail.com",
-            "hospital": "RS Anwar Medika",
+            "name": NOC_USER_NAME,
+            "role": NOC_USER_ROLE,
+            "email": NOC_USER_EMAIL,
+            "hospital": NOC_USER_SITE,
             "login_time": time.strftime("%Y-%m-%d %H:%M:%S")
         }
         ACTIVE_SESSIONS[token] = session_data

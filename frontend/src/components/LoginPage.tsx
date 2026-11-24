@@ -225,7 +225,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
             Akses dibatasi khusus untuk Administrator Jaringan RS Anwar Medika.
           </p>
           <p className="text-[10px] text-slate-600 font-mono font-medium">
-            Lead NOC: Ahmad Jibril Al Hamdani
+            Lead NOC: Administrator
           </p>
         </div>
       </div>
