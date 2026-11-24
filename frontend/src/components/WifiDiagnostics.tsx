@@ -9,14 +9,14 @@ interface Diag {
   error?: string;
   generated_at: string;
   window_h: number;
-  retries: {
+  quality: {
     buckets: Bucket[];
     samples: number;
     avg_pct: number;
-    ccq_est: Bucket[];
-    ccq_est_used: boolean;
-    live: { mac: string; interface: string; retry_pct: number }[];
-    bands?: Record<string, { samples: number; buckets: Bucket[]; ccq_est: Bucket[]; ccq_est_used: boolean }>;
+    measured_retry: boolean;
+    worst: { mac: string; band: string; pct: number; samples: number }[];
+    live: { mac: string; interface: string; ccq_pct: number | null }[];
+    bands?: Record<string, { samples: number; buckets: Bucket[]; avg_pct: number }>;
     source: string;
   };
   connectivity: {
@@ -82,10 +82,9 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
     );
   }
 
-  const series = band === 'all' ? null : d.retries.bands?.[band];
-  const useCcq = series ? series.ccq_est_used : d.retries.ccq_est_used;
-  const bars = series ? (useCcq ? series.ccq_est : series.buckets) : d.retries.ccq_est_used ? d.retries.ccq_est : d.retries.buckets;
-  const samples = series ? series.samples : d.retries.samples;
+  const series = band === 'all' ? null : d.quality.bands?.[band];
+  const bars = series ? series.buckets : d.quality.buckets;
+  const samples = series ? series.samples : d.quality.samples;
   const maxPct = Math.max(...bars.map((b) => b.pct), 1);
   const stages = [
     ['Association', d.connectivity.association],
@@ -106,7 +105,10 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2 text-xs font-mono text-blue-700 uppercase font-bold">
             <Activity className="w-4 h-4 text-blue-600" />
-            <span>AP Radio TX Retries</span>
+            <span>Link Quality · 100 − CCQ</span>
+            <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-500 normal-case font-normal">
+              estimasi
+            </span>
             {deviceName && <span className="text-[10px] normal-case font-normal text-slate-400">· {deviceName}</span>}
           </div>
           <div className="flex items-center gap-2">
@@ -143,12 +145,29 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
             </div>
           ))}
         </div>
+        {d.quality.worst.length > 0 && (
+          <div className="mt-3 border-t border-slate-100 pt-2">
+            <div className="text-[10px] font-mono text-slate-400 mb-1">Klien paling tertekan (rata-rata 24j)</div>
+            <div className="flex flex-wrap gap-1.5">
+              {d.quality.worst.map((w) => (
+                <span
+                  key={w.mac}
+                  className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                    w.pct >= 20 ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-slate-50 border-slate-200 text-slate-600'
+                  }`}
+                  title={`${w.samples} sampel`}
+                >
+                  {w.mac} · {w.band} · {w.pct}%
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
         <p className="mt-2 text-[10px] font-mono text-slate-400 leading-relaxed">
-          {d.retries.ccq_est_used
-            ? 'RouterOS (driver legacy) tidak melaporkan jumlah retry hardware — batang di atas = 100 − CCQ (tekanan udara/retry tersembunyi).'
-            : `Frame timeout nyata dari router · rata-rata ${d.retries.avg_pct}%`}
+          Angka = estimasi tekanan link, bukan jumlah retry hardware (driver legacy cAP ac tidak melaporkan
+          tx-frames-timed-out). Rata-rata {series ? series.avg_pct : d.quality.avg_pct}%.
           <br />
-          {d.retries.source}
+          {d.quality.source}
         </p>
       </div>
 

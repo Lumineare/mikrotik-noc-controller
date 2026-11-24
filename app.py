@@ -5098,24 +5098,39 @@ def _fleet_ap_coverage(cutoff: float) -> list[dict]:
     return out
 
 
+def _worst_link_clients(samples: list[dict], top: int = 5) -> list[dict]:
+    """MAC dengan rata-rata (100 - tx-ccq) tertinggi — biang kerok agregat."""
+    per_mac: dict[str, list[float]] = {}
+    bands: dict[str, str] = {}
+    for s in samples:
+        if s.get("tx_ccq") is None or not s.get("mac"):
+            continue
+        per_mac.setdefault(s["mac"], []).append(100.0 - float(s["tx_ccq"]))
+        bands.setdefault(s["mac"], s.get("band") or "?")
+    out = [{"mac": m, "band": bands[m], "pct": round(sum(v) / len(v), 1), "samples": len(v)}
+           for m, v in per_mac.items()]
+    out.sort(key=lambda x: -x["pct"])
+    return out[:top]
+
+
 @app.get("/api/wifi/diagnostics")
 def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1, le=168)):
     dev = get_device(device)
     cutoff = time.time() - hours * 3600
     samples = [s for s in db_rf_samples(dev.get("id"), limit=40000) if (s.get("ts") or 0) >= cutoff]
-    retry_vals = [float(s.get("retry_pct") or 0) for s in samples]
+    def _quality(sub: list[dict]) -> dict:
+        """Tekanan link = 100 - tx-ccq. Driver legacy cAP ac selalu melaporkan
+        tx-frames-timed-out = 0, jadi retry hardware tak bisa diukur di sini."""
+        pct = [100.0 - float(s["tx_ccq"]) for s in sub if s.get("tx_ccq") is not None]
+        return {"buckets": _bucket_pct(pct, RETRY_BUCKETS), "samples": len(pct),
+                "avg_pct": round(sum(pct) / len(pct), 1) if pct else 0.0}
+
     rssi_vals = [float(s.get("rssi")) for s in samples if s.get("rssi") is not None]
     bands = {}
     for bkey in ("2g", "5g"):
         sub = [s for s in samples if (s.get("band") or "").lower().startswith(bkey)]
         if sub:
-            rv = [float(s.get("retry_pct") or 0) for s in sub]
-            bands[bkey] = {
-                "samples": len(sub),
-                "buckets": _bucket_pct(rv, RETRY_BUCKETS),
-                "ccq_est": _bucket_pct([100.0 - float(s.get("tx_ccq") or 0) for s in sub], RETRY_BUCKETS),
-                "ccq_est_used": not any(rv),
-            }
+            bands[bkey] = _quality(sub)
 
     clients: list[dict] = []
     logstats = {"connected": 0, "failed": 0, "left": 0, "auth_fail": 0, "reasons": {}}
@@ -5126,13 +5141,11 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
             for c in reg:
                 rssi = _sig_dbm(c.get("signal-strength"))
                 try:
-                    tx = float(str(c.get("frames", "0,0")).split(",")[1])
-                    to = float(c.get("tx-frames-timed-out") or 0)
-                    retry = round(100.0 * to / tx, 1) if tx > 0 else 0.0
-                except (TypeError, ValueError, IndexError):
-                    retry = 0.0
+                    ccq_pct = round(100.0 - float(c.get("tx-ccq") or 0), 1)
+                except (TypeError, ValueError):
+                    ccq_pct = None
                 clients.append({"mac": c.get("mac-address"), "interface": c.get("interface"),
-                                "rssi": rssi, "retry_pct": retry,
+                                "rssi": rssi, "ccq_pct": ccq_pct,
                                 "has_ip": bool(c.get("last-ip")), "uptime": c.get("uptime")})
             try:
                 logstats = _log_wireless_stats(mt.resource("/log").get())
@@ -5176,15 +5189,13 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
     return {
         "ok": True, "device_id": dev.get("id"), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "window_h": hours,
-        "retries": {
-            "buckets": _bucket_pct(retry_vals, RETRY_BUCKETS),
-            "samples": len(retry_vals),
-            "avg_pct": round(sum(retry_vals) / len(retry_vals), 1) if retry_vals else 0.0,
-            "ccq_est": _bucket_pct([100.0 - float(s.get("tx_ccq") or 0) for s in samples], RETRY_BUCKETS),
-            "ccq_est_used": not any(retry_vals),
-            "live": [{"mac": c["mac"], "interface": c["interface"], "retry_pct": c["retry_pct"]} for c in clients],
+        "quality": {
+            **_quality(samples),
+            "measured_retry": False,
+            "worst": _worst_link_clients(samples),
+            "live": [{"mac": c["mac"], "interface": c["interface"], "ccq_pct": c["ccq_pct"]} for c in clients],
             "bands": bands,
-            "source": "/interface/wireless/registration-table — tx-frames-timed-out / tx frames (sampler 5 menit)",
+            "source": "sampler 5 menit — 100 − tx-ccq; driver legacy cAP ac tak melaporkan tx-frames-timed-out",
         },
         "connectivity": {
             "association": association, "authentication": authentication,
