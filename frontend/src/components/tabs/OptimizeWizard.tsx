@@ -205,10 +205,23 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
         <button
           onClick={start}
           disabled={busy || !deviceId}
-          className="mt-3 w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm flex items-center justify-center gap-2 disabled:opacity-50 shadow-sm cursor-pointer"
+          className="group relative mt-3 w-full overflow-hidden rounded-2xl bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 px-5 py-3.5 text-white shadow-lg shadow-blue-600/25 transition-all duration-300 hover:-translate-y-0.5 hover:shadow-xl hover:shadow-indigo-600/30 active:translate-y-0 disabled:opacity-60 disabled:hover:translate-y-0 cursor-pointer"
         >
-          <Play className="w-4 h-4" />
-          {job?.status === 'done' ? 'Optimalkan Ulang' : 'Optimalkan Sekarang'}
+          <span className="pointer-events-none absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/25 to-transparent transition-transform duration-700 group-hover:translate-x-full" />
+          <span className="relative flex items-center justify-center gap-2.5">
+            <span className="grid place-items-center w-8 h-8 rounded-xl bg-white/15 ring-1 ring-white/30">
+              {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+            </span>
+            <span className="text-left">
+              <span className="block text-sm font-extrabold tracking-wide">
+                {job?.status === 'done' ? 'Optimalkan Ulang' : 'Optimalkan Sekarang'}
+              </span>
+              <span className="block text-[10px] font-medium text-white/75">
+                5 langkah otomatis · bisa dibatalkan kapan saja
+              </span>
+            </span>
+            <Play className="w-4 h-4 ml-1 opacity-80 transition-transform group-hover:translate-x-0.5" />
+          </span>
         </button>
       )}
 
@@ -306,18 +319,31 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
           ))}
           {((scan?.bands as any[]) || []).map((b, i) => (
             <div key={`${b.device}-${b.band}-${i}`}>
-              • Scan {b.device} {b.band}: ch {b.current_channel?.channel ?? '?'} → {b.best_channel ?? '?'},
-              tetangga {b.neighbours ?? 0}, interferensi {b.interference_level ?? '?'}
+              • Scan {b.device} {b.band}: sekarang ch {b.current_channel?.channel ?? '?'}, kandidat udara
+              terbaik ch {b.best_channel ?? '?'}, tetangga {b.neighbours ?? 0}, interferensi{' '}
+              {b.interference_level ?? '?'}
               {b.error && <span className="text-rose-500"> ({b.error})</span>}
             </div>
           ))}
           {compute && (
             <div>
-              • Hitung: channel gain {compute.channel?.gain_pct ?? 0}%, {compute.tx_power?.length ?? 0}{' '}
-              tx-power, roaming {compute.roaming_sensitivity_dbm} dBm
+              {compute.actionable === false || compute.channel?.gain_pct === 0 ? (
+                <>
+                  • Hitung: tidak ada perubahan perlu — channel & tx-power sudah optimal (gain 0%), roaming
+                  threshold {compute.roaming_sensitivity_dbm} dBm
+                  {compute.sticky_clients
+                    ? `, ${compute.sticky_clients} klien lemah bisa di-steer`
+                    : ', tak ada klien lemah untuk di-steer'}
+                </>
+              ) : (
+                <>
+                  • Hitung: channel gain {compute.channel?.gain_pct ?? 0}%,{' '}
+                  {compute.tx_power?.length ?? 0} tx-power, roaming {compute.roaming_sensitivity_dbm} dBm
+                </>
+              )}
             </div>
           )}
-          {deliver && !deliver.dry_run && (
+          {deliver && !deliver.dry_run && !deliver.skipped && (
             <div>
               • Kirim: {deliver.applied_actions ?? 0} aksi, gain {deliver.gain_pct ?? 0}%
               {deliver.ai?.applied != null &&

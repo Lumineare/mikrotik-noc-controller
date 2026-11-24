@@ -5282,7 +5282,8 @@ def _opt_roaming_issues(samples: list[dict]) -> list[dict]:
                 "scope": "intra-AP band", "devices": devices, "interfaces": radios,
                 "samples": len(rows),
                 "avg_rssi": round(sum(rssi) / len(rssi), 1) if rssi else None,
-                "note": "Klien bolak-balik 2.4/5GHz — band steering belum menahan klien capable di 5GHz.",
+                "note": "Klien bolak-balik 2.4/5GHz — band steering belum menahan klien capable di 5GHz. "
+                        "Tidak diubah otomatis: RSSI masih kuat, perlu band-steering per-MAC (manual).",
             })
         elif weak and len(weak) >= max(3, len(rows) // 2):
             issues.append({
@@ -5401,6 +5402,9 @@ def _opt_worker(job_id: str, opts: dict):
             "roaming_sensitivity_dbm": sensitivity,
             "roaming_rationale": f"median RSSI klien lemah {weak_rssi[len(weak_rssi)//2] if weak_rssi else 'n/a'} dBm → "
                                  f"steering threshold {sensitivity} dBm",
+            "actionable": bool((plan.get("summary") or {}).get("actionable")),
+            "steering_rules": len(plan.get("steering") or []),
+            "sticky_clients": sum(1 for i in issues if i.get("type") == "sticky_weak"),
         }
         job["details"]["plan"] = plan
         _opt_set_stage(job, 3, "done")
