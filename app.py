@@ -3406,11 +3406,20 @@ def api_rf_scan(
 
     ranked = sorted(channels_out, key=_rank_key)
     best3 = ranked[:3]
-    _cur_freq = int(target.get("frequency", "0") or 0)
+    # RouterOS lapor frequency='auto' saat radio tak terkunci / sedang scanning.
+    # Dulu int('auto') melempar ValueError dan seluruh tahap Scan gagal.
+    def _freq_num(v) -> int:
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return 0
+
+    _cur_freq = _freq_num(target.get("frequency"))
     current = {
         "channel": (round((_cur_freq - 2407) / 5) if band == "2g"
-                    else (_cur_freq - 5000) // 5 if _cur_freq else 0),
-        "freq": int(target.get("frequency", "0") or 0),
+                    else (_cur_freq - 5000) // 5 if _cur_freq else 0) if _cur_freq else None,
+        "freq": _cur_freq,
+        "channel_known": bool(_cur_freq),
         "width": target.get("channel-width"),
         "ssid": target.get("ssid"),
         "interface": target.get("name"),
@@ -4590,9 +4599,13 @@ def _gather_ap(dev: dict, duration: int) -> list[dict]:
             continue
         iface_name = scan.get("interface")
         cur = scan.get("current_channel") or {}
-        freq = int(cur.get("freq") or 0)
-        if not freq:
-            continue
+        try:
+            freq = int(float(cur.get("freq")))
+        except (TypeError, ValueError):
+            freq = 0
+        # freq 0 = radio tak punya channel eksplisit ('auto' / sedang scanning /
+        # mati). Dulu di-skip total sehingga plan melihat "tak ada AP" lalu bilang
+        # "sudah optimal". Sekarang tetap masuk plan sebagai perbaikan.
         noise = {int(c["freq"]): float(c["noise_floor"])
                  for c in scan.get("channels", [])
                  if c.get("noise_floor") is not None}
@@ -4627,6 +4640,7 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
     devs = load_devices()
     aps: list[dict] = []
     samples = 0
+    unhealthy: list[dict] = []
 
     def gather(d):
         got = _gather_ap(d, duration)
@@ -4639,6 +4653,27 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
                         a["tx_power"] = float(w.get("tx-power")) if w.get("tx-power") else None
                     except (TypeError, ValueError):
                         a["tx_power"] = None
+                # Radio mati / frequency 'auto' tak pernah masuk plan (scan-nya
+                # timeout), jadi dulu dilaporkan "sudah optimal". Deteksi di sini
+                # dan jadikan perbaikan channel eksplisit.
+                for name, w in wl.items():
+                    if str(w.get("disabled")).lower() == "true" or w.get("master-interface"):
+                        continue
+                    if str(w.get("mode") or "") != "ap-bridge":
+                        continue
+                    band = _band_of(w)
+                    if band not in ("2g", "5g"):
+                        continue
+                    running = str(w.get("running")).lower() == "true"
+                    freq_raw = str(w.get("frequency") or "").strip()
+                    if running and freq_raw and freq_raw.lower() != "auto":
+                        continue
+                    unhealthy.append({
+                        "device_id": d["id"], "interface": name, "band": band,
+                        "freq": int(float(freq_raw)) if freq_raw.replace(".", "", 1).isdigit() else 0,
+                        "reason": "frequency=auto" if freq_raw.lower() == "auto" else (
+                            f"radio tidak running ({w.get('status') or 'status tak dilaporkan'})"),
+                    })
                 n = collect_rf_samples(d, mt)
         except Exception:
             n = 0
@@ -4649,7 +4684,20 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
             aps.extend(got)
             samples += n
 
-    dca = rrm.plan_dca(aps, include_dfs=include_dfs, allowed=rrm_allowed_freqs(cfg))
+    allowed = rrm_allowed_freqs(cfg)
+    dca = rrm.plan_dca(aps, include_dfs=include_dfs, allowed=allowed)
+    for u in unhealthy:
+        if any(c.get("device_id") == u["device_id"] and c.get("interface") == u["interface"]
+               for c in dca["changes"]):
+            continue
+        to_freq = (allowed.get(u["band"]) or [None])[0]
+        if not to_freq:
+            continue
+        dca["changes"].append({
+            "device_id": u["device_id"], "interface": u["interface"], "band": u["band"],
+            "from_freq": u["freq"], "to_freq": to_freq, "repair": True, "reason": u["reason"],
+            "interference_before_mw": 0.0, "interference_after_mw": 0.0, "relief_pct": 0.0,
+        })
     tpc = rrm.plan_tpc(aps)
     steering = []
     seen: dict[str, dict[str, list[float]]] = {}
@@ -4700,6 +4748,7 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
         "roam": roam,
         "summary": {
             "channel_changes": len(dca["changes"]),
+            "repairs": len([c for c in dca["changes"] if c.get("repair")]),
             "txpower_changes": len(tpc),
             "steering_rules": len(steering),
             "roam_rules": len(roam),
@@ -4860,10 +4909,15 @@ def api_rrm_apply(req: RrmApplyReq):
     if only and do_ch:
         ch_skip = f"channel dikelola global (fleet) — AP {only} hanya dikirimi TX power/steering"
         do_ch = False
-    if do_ch and dca.get("gain_pct", 0) < float(min_gain):
+    changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
+    # Radio tanpa channel eksplisit (from_freq 0) = perbaikan, bukan optimasi:
+    # gate gain tidak berlaku, kalau tidak radio 'auto' selamanya dibiarkan.
+    repairs = [c for c in changes if c.get("repair") or not c.get("from_freq")]
+    if do_ch and not repairs and dca.get("gain_pct", 0) < float(min_gain):
         ch_skip = f"gain {dca.get('gain_pct', 0)}% < min_gain {min_gain}% — channel tidak diubah"
         do_ch = False
-    changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
+    elif do_ch and repairs:
+        ch_skip = f"{len(repairs)} radio tanpa channel eksplisit — dipulihkan tanpa gate gain"
     tpc = [t for t in (plan.get("tpc") or []) if not only or t.get("device_id") == only]
     steer = [s for s in (plan.get("steering") or []) if not only or s.get("device_id") == only]
     roam = [r for r in (plan.get("roam") or []) if not only or r.get("device_id") == only]
