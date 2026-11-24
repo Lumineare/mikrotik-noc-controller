@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "interval_min": 15,
+  "include_dfs": true,
+  "apply_channel": true,
+  "apply_txpower": true,
+  "apply_steering": true,
+  "min_gain_pct": 15.0,
+  "quiet_start": "01:00",
+  "quiet_end": "05:00",
+  "max_client_drop": 0,
+  "scan_duration": 8,
+  "sample_interval_min": 5,
+  "last_run_ts": 0.0
+}

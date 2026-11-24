@@ -5335,8 +5335,11 @@ def _opt_worker(job_id: str, opts: dict):
             rows = [r for r in rows if r.get("device_id") == dev_filter]
         window = [r for r in rows if (r.get("ts") or 0) >= cutoff]
         issues = _opt_roaming_issues(window)
+        _ts = [float(r.get("ts") or 0) for r in window if r.get("ts")]
         job["details"]["history"] = {
             "window_min": history_min, "samples": len(window),
+            "span_min": round((max(_ts) - min(_ts)) / 60, 1) if _ts else 0.0,
+            "fields": ["rssi", "snr", "tx_ccq", "retry_pct", "noise_dbm"],
             "clients_seen": len({r.get("mac") for r in window if r.get("mac")}),
             "roaming_issues_count": len(issues), "roaming_issues": issues[:50],
         }

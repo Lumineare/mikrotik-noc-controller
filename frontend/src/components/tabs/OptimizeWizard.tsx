@@ -299,6 +299,9 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
       {showDetail && job && (
         <div className="mt-3 border-t border-slate-100 pt-3 space-y-1.5 text-[11px] text-slate-600">
           <div className="font-bold text-slate-800">Hasil tiap langkah</div>
+          <div className="text-slate-400">
+            Semua angka di bawah dari router &amp; database lokal. LLM tidak dipakai di jalur ini.
+          </div>
           {((job.details?.critical_aps as any[]) || []).map((a) => (
             <div key={a.device}>
               • {a.name || a.device}: {a.clients ?? '?'} klien, CPU {a.cpu_load ?? '?'}%
@@ -306,9 +309,20 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
               {a.error && <span className="text-rose-500"> ({a.error})</span>}
             </div>
           ))}
+          <div className="text-slate-400">
+            sumber: RouterOS <code>/system/resource</code> + <code>/interface/wireless/registration-table</code>{' '}
+            (live)
+          </div>
           <div>
             • Riwayat: {(job.details?.history as any)?.samples ?? 0} sampel,{' '}
             {(job.details?.history as any)?.clients_seen ?? 0} klien
+            {(job.details?.history as any)?.span_min != null &&
+              `, rentang ${(job.details?.history as any).span_min} menit`}
+          </div>
+          <div className="text-slate-400">
+            sumber: database lokal <code>rf_samples</code> (sampler tiap 5 menit), window{' '}
+            {(job.details?.history as any)?.window_min ?? 0} menit · kolom:{' '}
+            {(((job.details?.history as any)?.fields as string[]) || []).join(', ')}
           </div>
           {(roaming || []).map((r, i) => (
             <div key={`${r.mac}-${i}`} className="pl-3 border-l-2 border-amber-300">
@@ -325,6 +339,9 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
               {b.error && <span className="text-rose-500"> ({b.error})</span>}
             </div>
           ))}
+          <div className="text-slate-400">
+            sumber: <code>/interface/wireless/scan</code> live {scanS}s — beacon tetangga + freq usage
+          </div>
           {compute && (
             <div>
               {compute.actionable === false || compute.channel?.gain_pct === 0 ? (
@@ -343,6 +360,10 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
               )}
             </div>
           )}
+          <div className="text-slate-400">
+            sumber: <code>rrm_engine.py</code> — model biaya deterministik (bukan LLM): cost(f) = noise(f) + Σ
+            overlap×10^(RSSI/10)
+          </div>
           {deliver && !deliver.dry_run && !deliver.skipped && (
             <div>
               • Kirim: {deliver.applied_actions ?? 0} aksi, gain {deliver.gain_pct ?? 0}%
@@ -353,6 +374,11 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
           )}
           {deliver?.dry_run && <div>• Kirim: dry-run, tidak ada perubahan</div>}
           {deliver?.skipped && <div>• Kirim: dilewati — {deliver.reason}</div>}
+          <div className="text-slate-400">
+            sumber: <code>/interface/wireless set</code> (RRM) + diagnosa rule-based{' '}
+            <code>/system/resource, /ip/dns, /ip/firewall/filter</code> → whitelist auto-push. LLM hanya
+            dipakai di tab AI Chat, bukan di sini.
+          </div>
         </div>
       )}
 
