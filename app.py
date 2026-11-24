@@ -809,8 +809,10 @@ def build_wireless(mt):
             "ssid": w.get("ssid"),
             "band": w.get("band"),
             "frequency": w.get("frequency"),
+            "frequency_live": (str(m.get("channel") or "").split("/")[0]) or None,
             "disabled": w.get("disabled") == "true",
-            "running": w.get("running") == "true",
+            # field `running` basi (radio hidup tapi dilaporkan false) -> pakai status monitor
+            "running": str(m.get("status") or "").startswith("running") or w.get("running") == "true",
             "mode": w.get("mode"),
             "security_profile": w.get("security-profile"),
             "profile_mode": (prof.get(w.get("security-profile")) or {}).get("mode"),
@@ -4643,36 +4645,54 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
     unhealthy: list[dict] = []
 
     def gather(d):
-        got = _gather_ap(d, duration)
+        # monitor dibaca SEBELUM scan: /interface/wireless/scan mematikan radio
+        # sementara, jadi bacaan sesudahnya kosong (freq 0) dan radio sehat tampak mati.
+        wl: dict = {}
+        mon: dict = {}
         try:
             with get_device_lock(d["host"]), MT(d) as mt:
                 wl = {w["name"]: w for w in mt.resource("/interface/wireless").get()}
+                mon = _wl_monitor(mt.api, list(wl))
+        except Exception:
+            pass
+        got = _gather_ap(d, duration)
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
                 for a in got:
                     w = wl.get(a["interface"]) or {}
                     try:
                         a["tx_power"] = float(w.get("tx-power")) if w.get("tx-power") else None
                     except (TypeError, ValueError):
                         a["tx_power"] = None
-                # Radio mati / frequency 'auto' tak pernah masuk plan (scan-nya
-                # timeout), jadi dulu dilaporkan "sudah optimal". Deteksi di sini
-                # dan jadikan perbaikan channel eksplisit.
-                for name, w in wl.items():
-                    if str(w.get("disabled")).lower() == "true" or w.get("master-interface"):
-                        continue
-                    if str(w.get("mode") or "") != "ap-bridge":
-                        continue
+                # `/interface/wireless` melaporkan running/frequency BASI: radio
+                # hidup (running-ap di monitor) tapi field-nya bilang running=false
+                # / frequency=auto. Percaya monitor, bukan field.
+                names = [n for n, w in wl.items()
+                         if str(w.get("disabled")).lower() != "true"
+                         and not w.get("master-interface")
+                         and str(w.get("mode") or "") == "ap-bridge"]
+                for name in names:
+                    w, m = wl[name], mon.get(name) or {}
                     band = _band_of(w)
                     if band not in ("2g", "5g"):
                         continue
-                    running = str(w.get("running")).lower() == "true"
-                    freq_raw = str(w.get("frequency") or "").strip()
-                    if running and freq_raw and freq_raw.lower() != "auto":
+                    status = str(m.get("status") or "")
+                    width = str(w.get("channel-width") or "")
+                    if not status:
+                        # monitor gagal/timeout — jangan tuduh radio mati tanpa bukti
+                        if str(w.get("running")).lower() == "true":
+                            continue
+                        status = "monitor tak menjawab"
+                    if status.startswith("running") and m.get("freq"):
                         continue
+                    reason = (f"radio tidak running ({status or w.get('status') or 'tanpa status'})")
+                    fix_width = None
+                    if band == "2g" and width in ("5mhz", "10mhz", "5/10mhz"):
+                        reason = f"channel-width {width} tak didukung 2.4GHz — radio tak bisa start"
+                        fix_width = "20mhz"
                     unhealthy.append({
                         "device_id": d["id"], "interface": name, "band": band,
-                        "freq": int(float(freq_raw)) if freq_raw.replace(".", "", 1).isdigit() else 0,
-                        "reason": "frequency=auto" if freq_raw.lower() == "auto" else (
-                            f"radio tidak running ({w.get('status') or 'status tak dilaporkan'})"),
+                        "freq": int(m.get("freq") or 0), "reason": reason, "fix_width": fix_width,
                     })
                 n = collect_rf_samples(d, mt)
         except Exception:
@@ -4696,6 +4716,7 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
         dca["changes"].append({
             "device_id": u["device_id"], "interface": u["interface"], "band": u["band"],
             "from_freq": u["freq"], "to_freq": to_freq, "repair": True, "reason": u["reason"],
+            "fix_width": u.get("fix_width"),
             "interference_before_mw": 0.0, "interference_after_mw": 0.0, "relief_pct": 0.0,
         })
     tpc = rrm.plan_tpc(aps)
@@ -4771,6 +4792,25 @@ def _snapshot_wireless(dev: dict, mt) -> list[dict]:
     return snap
 
 
+def _wl_monitor(api, names: list[str]) -> dict:
+    """Sumber kebenaran radio. `/interface/wireless` sering basi (running=false /
+    frequency=auto padahal radio jalan), monitor yang benar-benar melapor."""
+    out = {}
+    for n in names:
+        try:
+            rows = api.get_binary_resource("/").call(
+                "interface/wireless/monitor", {"numbers": n.encode(), "once": b"yes"})
+            row = {k: (v.decode() if isinstance(v, bytes) else v)
+                   for k, v in (rows[0] if rows else {}).items()}
+        except Exception:
+            row = {}
+        m = re.match(r"(\d{4,5})", str(row.get("channel") or ""))
+        out[n] = {"status": row.get("status") or "", "freq": int(m.group(1)) if m else 0,
+                  "channel_raw": row.get("channel"), "noise": row.get("noise-floor"),
+                  "clients": row.get("registered-clients")}
+    return out
+
+
 def _apply_channel_changes(changes: list[dict]) -> list[dict]:
     done = []
     for ch in changes:
@@ -4781,8 +4821,15 @@ def _apply_channel_changes(changes: list[dict]) -> list[dict]:
                 target = wl.get(name=ch["interface"])
                 if not target:
                     continue
+                # width tak valid (mis. 5mhz di 2.4GHz) bikin radio "no supported
+                # channels" — set frequency saja tak akan pernah start.
+                if ch.get("fix_width"):
+                    wl.set(id=target[0]["id"], **{"channel-width": ch["fix_width"]})
                 wl.set(id=target[0]["id"], frequency=str(ch["to_freq"]))
-                done.append({**ch, "applied": True})
+                time.sleep(3)
+                mon = _wl_monitor(mt.api, [ch["interface"]]).get(ch["interface"]) or {}
+                done.append({**ch, "applied": True, "verified_freq": mon.get("freq"),
+                             "status": mon.get("status")})
         except Exception as e:
             done.append({**ch, "applied": False, "error": f"{type(e).__name__}: {e}"})
     return done
@@ -5791,9 +5838,17 @@ def _opt_worker(job_id: str, opts: dict):
             try:
                 with get_device_lock(d["host"]), MT(d) as mt:
                     for w in mt.resource("/interface/wireless").get():
-                        f = int(str(w.get("frequency") or 0) or 0)
+                        # frequency bisa 'auto' -> int() meledak dan tahap Scan mati.
+                        try:
+                            f = int(float(str(w.get("frequency") or 0)))
+                        except (TypeError, ValueError):
+                            f = 0
                         if f:
                             bands.add("2g" if f < 3000 else "5g")
+                        elif str(w.get("band") or "").startswith("2ghz"):
+                            bands.add("2g")
+                        elif str(w.get("band") or "").startswith("5ghz"):
+                            bands.add("5g")
             except Exception as e:
                 scans.append({"device": d["id"], "error": f"{type(e).__name__}: {e}"})
                 continue
@@ -5971,13 +6026,17 @@ def _live_channels(dev: dict, ttl: float = 30.0) -> dict:
     out: dict = {}
     try:
         with get_device_lock(dev["host"]), MT(dev) as mt:
-            for w in mt.resource("/interface/wireless").get():
-                f = int(str(w.get("frequency") or 0) or 0)
+            wl = {w["name"]: w for w in mt.resource("/interface/wireless").get()}
+            mon = _wl_monitor(mt.api, list(wl))
+            for name, w in wl.items():
+                band = _band_of(w)
+                if band not in ("2g", "5g"):
+                    continue
+                f = int((mon.get(name) or {}).get("freq") or 0)
                 if not f:
                     continue
-                band = "2g" if f < 3000 else "5g"
                 out[band] = {"freq": f, "channel": (round((f - 2407) / 5) if band == "2g" else (f - 5000) // 5),
-                             "interface": w.get("name")}
+                             "interface": name}
     except Exception as e:
         out = {"error": f"{type(e).__name__}: {e}"}
     _LIVE_CH_CACHE[key] = (time.time(), out)
