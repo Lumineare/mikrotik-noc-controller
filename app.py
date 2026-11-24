@@ -5987,6 +5987,20 @@ def _opt_worker(job_id: str, opts: dict):
                 "ai_run_id": ai.get("run_id"),
             }
 
+        # Scan jalan SEBELUM push, jadi snapshot channel di details masih keadaan
+        # pra-perbaikan (sering freq=auto → "ch ?" di UI). Segarkan dari monitor
+        # setelah push supaya yang tampil = kondisi radio sebenarnya.
+        for b in ((job["details"].get("scan") or {}).get("bands") or []):
+            if b.get("error"):
+                continue
+            d2 = get_device(b.get("device"))
+            lv = (_live_channels(d2, ttl=0) if d2 else {}).get(b.get("band"))
+            if lv:
+                b["current_channel"] = {**(b.get("current_channel") or {}),
+                                        "channel": lv["channel"], "freq": lv["freq"],
+                                        "channel_known": True,
+                                        "interface": lv.get("interface")}
+
         job["status"] = "done"
         job["finished"] = time.time()
         _opt_job_save(job)

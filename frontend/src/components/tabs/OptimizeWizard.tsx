@@ -116,7 +116,7 @@ export const OptimizeWizard: React.FC<{
       !window.confirm(
         fleet
           ? 'Optimalkan SEMUA AP dan kirim perubahan?\n\nChannel dihitung bersama antar-AP. Push dilakukan satu AP per satu AP; kalau klien di sebuah AP turun melebihi batas, push berhenti dan AP itu dikembalikan otomatis. Radio bisa restart singkat (klien terputus 10–30 detik per AP).'
-          : 'Optimalkan AP ini dan kirim perubahan ke AP?\n\nChannel TIDAK diubah di sini (dikelola global). Hanya TX power & steering. Radio bisa restart singkat (klien terputus 10–30 detik).'
+          : 'Optimalkan AP ini dan kirim perbaikan ke AP?\n\nOptimasi channel tetap dikelola global (fleet), tetapi PERBAIKAN (radio mati, frequency=auto, channel di luar rencana) tetap dikirim. TX power & steering ikut. Radio bisa restart singkat (klien terputus 10–30 detik).'
       )
     )
       return;
