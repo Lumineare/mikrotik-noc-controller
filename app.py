@@ -4915,6 +4915,27 @@ def _bucket_pct(values: list[float], buckets: list[tuple]) -> list[dict]:
     return out
 
 
+def _fleet_ap_coverage(cutoff: float) -> list[dict]:
+    """Satu titik per AP terdaftar: median RSSI klien yang dilayaninya (proksi kualitas cakupan)."""
+    out = []
+    for d in load_devices():
+        vals, macs = [], set()
+        for s in db_rf_samples(d.get("id"), limit=40000):
+            if (s.get("ts") or 0) < cutoff or s.get("rssi") is None:
+                continue
+            vals.append(float(s["rssi"]))
+            if s.get("mac"):
+                macs.add(s["mac"])
+        vals.sort()
+        out.append({
+            "id": d.get("id"), "name": d.get("name") or d.get("host"), "host": d.get("host"),
+            "samples": len(vals), "clients": len(macs),
+            "median_dbm": round(vals[len(vals) // 2], 1) if vals else None,
+            "weak_pct": round(100.0 * sum(1 for v in vals if v < -70) / len(vals), 1) if vals else None,
+        })
+    return out
+
+
 @app.get("/api/wifi/diagnostics")
 def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1, le=168)):
     dev = get_device(device)
@@ -4985,6 +5006,11 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
     weak = sum(1 for v in series_rssi if v < -70)
     weak_pct = round(100.0 * weak / len(series_rssi), 1) if series_rssi else 0.0
     need_density = bool(series_rssi) and (median is not None and median < -67 or weak_pct > 20)
+    aps = _fleet_ap_coverage(cutoff)
+    bad = [a for a in aps if a["median_dbm"] is not None and (a["median_dbm"] < -67 or (a["weak_pct"] or 0) > 20)]
+    need_density = bool(bad) or need_density
+    bad_names = ", ".join(a["name"] for a in bad)
+    bad_med = min([a["median_dbm"] for a in bad], default=None)
     return {
         "ok": True, "device_id": dev.get("id"), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "window_h": hours,
@@ -5018,11 +5044,12 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
             "samples": len(series_rssi),
             "source": "rf_samples (rssi) + registration-table live",
         },
+        "aps": aps,
         "density": {
             "need_improvement": need_density,
             "title": "Kerapatan AP perlu diperbaiki" if need_density else "Kerapatan AP memadai",
-            "detail": (f"median {median} dBm, {weak_pct}% sampel di bawah -70 dBm ({len(series_rssi)} sampel)"
-                       if series_rssi else "belum ada data sinyal"),
+            "detail": (f"{bad_names} median {bad_med} dBm — klien di AP ini mayoritas lemah"
+                       if bad_names else f"{len([a for a in aps if a['median_dbm'] is not None])} AP terukur, median klien terendah {min([a['median_dbm'] for a in aps if a['median_dbm'] is not None], default=None)} dBm"),
         },
     }
 

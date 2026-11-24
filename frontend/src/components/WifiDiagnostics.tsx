@@ -36,6 +36,7 @@ interface Diag {
     source: string;
   };
   density: { need_improvement: boolean; title: string; detail: string };
+  aps: { id: string; name: string; host: string; samples: number; clients: number; median_dbm: number | null; weak_pct: number | null }[];
 }
 
 const label = (b: Bucket, unit = '%') =>
@@ -94,12 +95,9 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
   ] as [string, number][];
   const overall = Math.round(stages.reduce((s, [, v]) => s + v, 0) / stages.length);
   const pos = (dbm: number) => Math.max(0, Math.min(100, ((dbm + 90) / 60) * 100));
-  const points = d.signal.live
-    .map((c) => {
-      const v = c.rssi_avg ?? c.rssi;
-      return v == null ? null : { mac: c.mac, label: (c.mac || '').slice(-5), rssi: Math.round(v) };
-    })
-    .filter((x): x is { mac: string; label: string; rssi: number } => x !== null);
+  const points = d.aps
+    .map((a) => (a.median_dbm == null ? null : { mac: a.id, label: a.name, rssi: Math.round(a.median_dbm), clients: a.clients }))
+    .filter((x): x is { mac: string; label: string; rssi: number; clients: number } => x !== null);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-3.5">
@@ -196,8 +194,8 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
           </span>
         </div>
         <p className="text-[10px] text-slate-500 mb-3">
-          Tiap lingkaran = satu klien pada skala kekuatan sinyal. Makin ke kanan makin kuat.
-          Hijau ≥ −65 dBm, kuning −65…−75, merah &lt; −75 dBm (area lemah).
+          Tiap lingkaran = satu <b>AP terdaftar</b>. Posisi = rata-rata sinyal klien yang dilayaninya
+          (makin ke kanan, cakupan makin baik). Hijau ≥ −65 dBm, kuning −65…−75, merah &lt; −75 dBm.
         </p>
 
         <div className="relative h-56 mx-4">
@@ -229,13 +227,14 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
                     : 'bg-rose-500 border-rose-600'
                 }`}
               />
-              <span className="text-[9px] font-mono text-slate-400 whitespace-nowrap">…{pt.label}</span>
+              <span className="text-[9px] font-mono text-slate-500 whitespace-nowrap">{pt.label}</span>
+              <span className="text-[8px] font-mono text-slate-400 whitespace-nowrap">{pt.clients} klien</span>
             </div>
           ))}
 
           {points.length === 0 && (
             <div className="absolute inset-0 flex items-center justify-center text-[11px] font-mono text-slate-400">
-              belum ada klien terhubung
+              belum ada AP terukur (tunggu sampel RF)
             </div>
           )}
 
@@ -272,6 +271,11 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
             {d.density.detail}
           </div>
         </div>
+        {d.aps.some((a) => a.median_dbm == null) && (
+          <div className="mt-2 text-[10px] font-mono text-slate-400">
+            tanpa data RF: {d.aps.filter((a) => a.median_dbm == null).map((a) => a.name).join(', ')}
+          </div>
+        )}
       </div>
     </div>
   );
