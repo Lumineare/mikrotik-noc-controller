@@ -30,7 +30,6 @@ import {
 } from '../../types';
 import { api } from '../../api/client';
 import { ConfirmModal } from '../ConfirmModal';
-import { RrmPanel } from './RrmPanel';
 import { OptimizeWizard } from './OptimizeWizard';
 
 interface TabAiOptimizerProps {
@@ -288,102 +287,6 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
       {/* FULL PIPELINE: identify → history → scan → compute → deliver (background) */}
       <OptimizeWizard deviceId={deviceId} onApplied={onRefreshParent} />
 
-      {/* AI AUTO-PUSH: rekomendasi dieksekusi backend, bukan klik manual */}
-      <div className="bg-white border border-slate-200/90 rounded-2xl p-5 shadow-sm">
-        <div className="flex items-start justify-between gap-3 flex-wrap">
-          <div>
-            <div className="flex items-center gap-2 text-blue-700 font-bold">
-              <Zap className="w-4 h-4 text-amber-500" />
-              <span>AI Auto-Push Optimization</span>
-              <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold border border-amber-200">
-                DIRECT PUSH
-              </span>
-            </div>
-            <p className="text-slate-500 mt-1 text-[11px] max-w-2xl">
-              Diagnosa AI → eksekusi otomatis lewat MikroTik API :8728. Whitelist aman: lebar pita 5GHz,
-              FastTrack, cache/flash, DNS resolver. Kanal 2.4GHz &amp; pemutusan klien tetap manual (dikelola RRM).
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => handleAutoPush(true)}
-              disabled={autoPushing || !deviceId}
-              className="px-3 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 border border-slate-300 text-slate-700 text-[11px] font-semibold flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
-            >
-              <Info className="w-3.5 h-3.5" />
-              Preview
-            </button>
-            <button
-              onClick={() => handleAutoPush(false)}
-              disabled={autoPushing || !deviceId}
-              className="px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-bold flex items-center gap-1.5 disabled:opacity-50 shadow-sm cursor-pointer"
-            >
-              {autoPushing ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
-              {autoPushing ? 'Mengeksekusi…' : 'Push Semua Rekomendasi'}
-            </button>
-            {autoRunId && (
-              <button
-                onClick={handleAutoRollback}
-                disabled={autoPushing}
-                className="px-3 py-2 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[11px] font-semibold disabled:opacity-50 cursor-pointer"
-              >
-                Rollback {autoRunId}
-              </button>
-            )}
-          </div>
-        </div>
-
-        {autoResult && (
-          <div className="mt-4 space-y-2">
-            {autoResult.message && (
-              <div className="text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
-                {autoResult.message}
-              </div>
-            )}
-            {(autoResult.steps?.length || 0) > 0 && (
-              <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg overflow-hidden">
-                {autoResult.steps!.map((s, i) => (
-                  <div key={`${s.action_type}-${i}`} className="flex items-start gap-2 px-3 py-2 bg-slate-50/50">
-                    {s.ok ? (
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 mt-0.5 shrink-0" />
-                    ) : (
-                      <AlertCircle className="w-3.5 h-3.5 text-rose-600 mt-0.5 shrink-0" />
-                    )}
-                    <div className="min-w-0">
-                      <div className="font-semibold text-slate-800">{s.label}</div>
-                      <div className="text-slate-500 break-words">{s.message || s.error}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-            {(autoResult.would_apply?.length || 0) > 0 && (
-              <div className="border border-blue-200 bg-blue-50/60 rounded-lg px-3 py-2">
-                <div className="font-semibold text-blue-800 mb-1">
-                  Akan diterapkan ({autoResult.would_apply!.length}) — score sekarang {autoResult.score}
-                  {autoResult.grade ? ` (${autoResult.grade})` : ''}
-                </div>
-                {autoResult.would_apply!.map((w) => (
-                  <div key={w.action_type} className="text-blue-900/80">• {w.title}</div>
-                ))}
-              </div>
-            )}
-            {(autoResult.skipped?.length || 0) > 0 && (
-              <div className="border border-amber-200 bg-amber-50/60 rounded-lg px-3 py-2">
-                <div className="font-semibold text-amber-800 mb-1">Dilewati (butuh persetujuan manual)</div>
-                {autoResult.skipped!.map((s, i) => (
-                  <div key={`${s.action_type}-${i}`} className="text-amber-900/80">
-                    • {s.title} — {s.reason}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* DIRECT-PUSH RRM: DCA + TPC + steering, autonomous */}
-      <RrmPanel deviceId={deviceId} onApplied={onRefreshParent} />
 
       {/* HERO SECTION: AI HEALTH SCORE & TELEMETRY */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">

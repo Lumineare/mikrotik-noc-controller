@@ -5416,9 +5416,30 @@ def _opt_worker(job_id: str, opts: dict):
                               apply_steering=cfg.get("apply_steering"),
                               min_gain_pct=cfg.get("min_gain_pct"), plan=plan)
             res = api_rrm_apply(req)
+            if opts.get("ai_auto_push", True):
+                try:
+                    res["ai"] = api_ai_optimize_auto(
+                        AiAutoReq(device=dev_filter or dev["id"]))
+                except Exception as e:
+                    res["ai"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
             job["details"]["deliver"] = res
             job["run_id"] = res.get("run_id")
             _opt_set_stage(job, 4, "done" if res.get("ok") else "skipped")
+
+            ai = res.get("ai") or {}
+            job["details"]["summary"] = {
+                "channel_gain_pct": res.get("gain_pct"),
+                "channel_changes": len((res.get("result") or {}).get("channel") or []),
+                "txpower_changes": len((res.get("result") or {}).get("txpower") or []),
+                "ai_applied": ai.get("applied") or 0,
+                "ai_failed": ai.get("failed") or 0,
+                "score_before": ai.get("score_before"),
+                "score_after": ai.get("score_after"),
+                "roaming_issues": len(issues),
+                "run_id": res.get("run_id"),
+                "ai_run_id": ai.get("run_id"),
+            }
+
         job["status"] = "done"
         job["finished"] = time.time()
         _opt_job_save(job)
@@ -5435,6 +5456,7 @@ class OptStartReq(BaseModel):
     history_window_min: int | None = None
     scan_duration: int | None = None
     dry_run: bool = False
+    ai_auto_push: bool = True
 
 
 @app.post("/api/optimize/start")
@@ -5459,7 +5481,8 @@ def api_optimize_start(req: OptStartReq):
                      args=(job["id"], {"device": dev["id"],
                                        "history_window_min": req.history_window_min,
                                        "scan_duration": req.scan_duration,
-                                       "dry_run": req.dry_run})).start()
+                                       "dry_run": req.dry_run,
+                                       "ai_auto_push": req.ai_auto_push})).start()
     return {"ok": True, "job_id": job["id"], "status": "running",
             "message": "Optimasi berjalan di background — aman keluar dari halaman ini"}
 
