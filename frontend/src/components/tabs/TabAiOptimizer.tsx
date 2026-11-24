@@ -353,7 +353,8 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
                   )}
                 </div>
                 <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
-                  Evaluasi RF wireless, utilisasi radio 5GHz, keamanan service port, dan proteksi flash cAP ac.
+                  Skor kesehatan router: CPU, RAM, flash, lebar pita 5GHz, port service, DNS. Bukan
+                  interferensi RF — itu diukur terpisah oleh gain channel di kartu Optimize.
                 </p>
                 <div className="text-[10px] text-slate-400 mt-2 font-medium">
                   Diagnosa terakhir: {data?.diagnosed_at || '-'}

@@ -268,7 +268,7 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
           <div className="text-[12px] font-bold text-emerald-800">
             Selesai ·{' '}
             {s.channel_gain_pct != null
-              ? `jaringan ${s.channel_gain_pct}% lebih bersih`
+              ? `interferensi turun ${s.channel_gain_pct}%`
               : deliver?.skipped
               ? 'channel sudah optimal'
               : 'jaringan stabil'}
