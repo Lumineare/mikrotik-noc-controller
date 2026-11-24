@@ -31,6 +31,7 @@ import {
 import { api } from '../../api/client';
 import { ConfirmModal } from '../ConfirmModal';
 import { RrmPanel } from './RrmPanel';
+import { OptimizeWizard } from './OptimizeWizard';
 
 interface TabAiOptimizerProps {
   deviceId: string;
@@ -283,6 +284,9 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
           <span className="flex-1 font-semibold">{actionFeedback.text}</span>
         </div>
       )}
+
+      {/* FULL PIPELINE: identify → history → scan → compute → deliver (background) */}
+      <OptimizeWizard deviceId={deviceId} onApplied={onRefreshParent} />
 
       {/* AI AUTO-PUSH: rekomendasi dieksekusi backend, bukan klik manual */}
       <div className="bg-white border border-slate-200/90 rounded-2xl p-5 shadow-sm">

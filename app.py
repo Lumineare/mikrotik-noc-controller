@@ -5138,6 +5138,369 @@ def api_ai_optimize_rollback(req: RrmRollbackReq):
             "fasttrack_rules_removed": removed}
 
 
+# ---------- Optimization pipeline (Ruijie-style 5-phase wizard, runs in background) ----------
+# Stages: identify critical APs -> collect history -> scan WLAN -> compute -> deliver.
+# Job state lives in SQLite + a worker thread, so leaving the page does not stop it.
+OPT_JOBS: dict[str, dict] = {}
+OPT_LOCK = threading.Lock()
+
+
+def _opt_db_init():
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS optimize_jobs (
+                    id TEXT PRIMARY KEY, device TEXT, status TEXT, stage TEXT,
+                    stage_index INTEGER, stages_json TEXT, details_json TEXT,
+                    run_id TEXT, started REAL, updated REAL, error TEXT
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def _opt_job_save(job: dict):
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute("""
+                INSERT INTO optimize_jobs (id, device, status, stage, stage_index, stages_json,
+                                           details_json, run_id, started, updated, error)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET status=excluded.status, stage=excluded.stage,
+                    stage_index=excluded.stage_index, stages_json=excluded.stages_json,
+                    details_json=excluded.details_json, run_id=excluded.run_id,
+                    updated=excluded.updated, error=excluded.error
+            """, (job["id"], job.get("device"), job["status"], job.get("stage"),
+                  job.get("stage_index", 0), json.dumps(job["stages"]),
+                  json.dumps(job["details"], default=str), job.get("run_id"),
+                  job["started"], time.time(), job.get("error")))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def _opt_job_load(job_id: str) -> dict | None:
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM optimize_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                conn.close()
+                return None
+            out = dict(row)
+            out["stages"] = json.loads(out.pop("stages_json") or "[]")
+            out["details"] = json.loads(out.pop("details_json") or "{}")
+            conn.close()
+            return out
+        except Exception:
+            return None
+
+
+def _opt_latest(device: str | None = None) -> dict | None:
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            if device:
+                row = conn.execute(
+                    "SELECT * FROM optimize_jobs WHERE device=? ORDER BY started DESC LIMIT 1",
+                    (device,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM optimize_jobs ORDER BY started DESC LIMIT 1").fetchone()
+            if not row:
+                conn.close()
+                return None
+            out = dict(row)
+            out["stages"] = json.loads(out.pop("stages_json") or "[]")
+            out["details"] = json.loads(out.pop("details_json") or "{}")
+            conn.close()
+            return out
+        except Exception:
+            return None
+
+
+def _opt_stages(history_min: int, scan_s: int) -> list[dict]:
+    return [
+        {"key": "identify", "name": "Identify critical APs", "eta": "~5 s",
+         "status": "pending", "started": None, "ended": None},
+        {"key": "history", "name": "Collect historical data", "eta": f"window {history_min} min",
+         "status": "pending", "started": None, "ended": None},
+        {"key": "scan", "name": "Scan the WLAN environment", "eta": f"~{scan_s} s per band",
+         "status": "pending", "started": None, "ended": None},
+        {"key": "compute", "name": "Compute the optimal configuration", "eta": "~10 s",
+         "status": "pending", "started": None, "ended": None},
+        {"key": "deliver", "name": "Deliver the configuration", "eta": "~15 s",
+         "status": "pending", "started": None, "ended": None},
+    ]
+
+
+def _opt_set_stage(job: dict, idx: int, status: str):
+    now = time.time()
+    if 0 <= idx < len(job["stages"]):
+        st = job["stages"][idx]
+        st["status"] = status
+        if status == "running":
+            st["started"] = now
+        elif status in ("done", "error", "skipped"):
+            st["ended"] = now
+        job["stage"] = st["key"]
+        job["stage_index"] = idx
+    job["updated"] = now
+    _opt_job_save(job)
+
+
+def _opt_roaming_issues(samples: list[dict]) -> list[dict]:
+    """Roaming problems derived from stored RF samples (no router I/O)."""
+    by_mac: dict[str, list[dict]] = {}
+    for s in samples:
+        if s.get("mac"):
+            by_mac.setdefault(s["mac"], []).append(s)
+    issues = []
+    for mac, rows in by_mac.items():
+        radios = sorted({r.get("interface") for r in rows if r.get("interface")})
+        devices = sorted({r.get("device_id") for r in rows if r.get("device_id")})
+        rssi = [r["rssi"] for r in rows if r.get("rssi") is not None]
+        weak = [v for v in rssi if v < -75]
+        if len(devices) > 1:
+            issues.append({
+                "mac": mac, "type": "roaming_flip",
+                "scope": "cross-AP", "devices": devices, "interfaces": radios,
+                "samples": len(rows),
+                "avg_rssi": round(sum(rssi) / len(rssi), 1) if rssi else None,
+                "note": "Klien berpindah antar-AP dalam window — roaming sensitivity terlalu longgar / coverage overlap kurang.",
+            })
+        elif len(radios) > 1:
+            issues.append({
+                "mac": mac, "type": "roaming_flip",
+                "scope": "intra-AP band", "devices": devices, "interfaces": radios,
+                "samples": len(rows),
+                "avg_rssi": round(sum(rssi) / len(rssi), 1) if rssi else None,
+                "note": "Klien bolak-balik 2.4/5GHz — band steering belum menahan klien capable di 5GHz.",
+            })
+        elif weak and len(weak) >= max(3, len(rows) // 2):
+            issues.append({
+                "mac": mac, "type": "sticky_weak",
+                "scope": "sticky client", "devices": devices, "interfaces": radios,
+                "samples": len(rows), "weak_samples": len(weak),
+                "avg_rssi": round(sum(weak) / len(weak), 1),
+                "note": "Klien menempel di RSSI < -75 dBm — kandidat kick / steering threshold.",
+            })
+    return issues
+
+
+def _opt_worker(job_id: str, opts: dict):
+    job = OPT_JOBS.get(job_id)
+    if not job:
+        return
+    dev_filter = opts.get("device")
+    history_min = int(opts.get("history_window_min") or 1440)
+    scan_s = int(opts.get("scan_duration") or 8)
+    dry_run = bool(opts.get("dry_run"))
+    try:
+        # --- 1. identify critical APs ---
+        _opt_set_stage(job, 0, "running")
+        devs = load_devices()
+        if dev_filter:
+            devs = [d for d in devs if d["id"] == dev_filter]
+        critical = []
+        for d in devs:
+            entry = {"device": d["id"], "name": d.get("name")}
+            try:
+                with get_device_lock(d["host"]), MT(d) as mt:
+                    regs = mt.resource("/interface/wireless/registration-table").get()
+                    res = mt.resource("/system/resource").get()
+                    cpu = float((res[0] if res else {}).get("cpu-load") or 0)
+                entry.update({"clients": len(regs), "cpu_load": cpu,
+                              "critical": bool(len(regs) >= 8 or cpu >= 60)})
+            except Exception as e:
+                entry.update({"clients": None, "cpu_load": None, "critical": False,
+                              "error": f"{type(e).__name__}: {e}"})
+            critical.append(entry)
+        job["details"]["critical_aps"] = critical
+        _opt_set_stage(job, 0, "done")
+
+        # --- 2. collect historical data + roaming analysis ---
+        _opt_set_stage(job, 1, "running")
+        cutoff = time.time() - history_min * 60
+        rows = db_rf_samples(limit=60000)
+        if dev_filter:
+            rows = [r for r in rows if r.get("device_id") == dev_filter]
+        window = [r for r in rows if (r.get("ts") or 0) >= cutoff]
+        issues = _opt_roaming_issues(window)
+        job["details"]["history"] = {
+            "window_min": history_min, "samples": len(window),
+            "clients_seen": len({r.get("mac") for r in window if r.get("mac")}),
+            "roaming_issues_count": len(issues), "roaming_issues": issues[:50],
+        }
+        _opt_set_stage(job, 1, "done")
+
+        # --- 3. scan the WLAN environment ---
+        _opt_set_stage(job, 2, "running")
+        scans = []
+        for d in devs:
+            bands = set()
+            try:
+                with get_device_lock(d["host"]), MT(d) as mt:
+                    for w in mt.resource("/interface/wireless").get():
+                        f = int(str(w.get("frequency") or 0) or 0)
+                        if f:
+                            bands.add("2g" if f < 3000 else "5g")
+            except Exception as e:
+                scans.append({"device": d["id"], "error": f"{type(e).__name__}: {e}"})
+                continue
+            for band in sorted(bands):
+                try:
+                    sc = api_rf_scan(device=d["id"], band=band, duration=scan_s)
+                    chans = sc.get("channels") or []
+                    best = chans[0] if chans else {}
+                    known = sc.get("bss_list") or []
+                    noisy = [c for c in chans
+                             if float(c.get("utilization_pct") or 0) >= 50
+                             and not any(b.get("channel") in (c.get("channel"), c.get("frequency"))
+                                         for b in known)]
+                    scans.append({
+                        "device": d["id"], "band": band,
+                        "current_channel": sc.get("current_channel"),
+                        "best_channel": best.get("channel"),
+                        "best_score": best.get("score"),
+                        "neighbours": len(known),
+                        "external_interference": noisy[:6],
+                        "interference_level": ("high" if noisy else "low"),
+                    })
+                except Exception as e:
+                    scans.append({"device": d["id"], "band": band,
+                                  "error": f"{type(e).__name__}: {e}"})
+        job["details"]["scan"] = {"bands": scans,
+                                  "neighbour_links": sum(s.get("neighbours") or 0 for s in scans),
+                                  "external_interference_hits": sum(
+                                      len(s.get("external_interference") or []) for s in scans)}
+        _opt_set_stage(job, 2, "done")
+
+        # --- 4. compute optimal configuration ---
+        _opt_set_stage(job, 3, "running")
+        cfg = load_rrm_cfg()
+        plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"), duration=scan_s)
+        rssi_all = [r["rssi"] for r in window if r.get("rssi") is not None]
+        weak_rssi = sorted(v for v in rssi_all if v < -70)
+        sensitivity = -72.0
+        if weak_rssi:
+            mid = weak_rssi[len(weak_rssi) // 2]
+            sensitivity = float(max(-80.0, min(-65.0, round(mid + 3))))
+        job["details"]["compute"] = {
+            "channel": {"changes": plan.get("dca", {}).get("changes", []),
+                        "gain_pct": plan.get("dca", {}).get("gain_pct"),
+                        "iterations": plan.get("dca", {}).get("iterations")},
+            "tx_power": plan.get("tpc") or [],
+            "roaming_sensitivity_dbm": sensitivity,
+            "roaming_rationale": f"median RSSI klien lemah {weak_rssi[len(weak_rssi)//2] if weak_rssi else 'n/a'} dBm → "
+                                 f"steering threshold {sensitivity} dBm",
+        }
+        job["details"]["plan"] = plan
+        _opt_set_stage(job, 3, "done")
+
+        # --- 5. deliver the configuration ---
+        _opt_set_stage(job, 4, "running")
+        if dry_run:
+            job["details"]["deliver"] = {"dry_run": True, "applied": False}
+            _opt_set_stage(job, 4, "skipped")
+        else:
+            req = RrmApplyReq(apply_channel=cfg.get("apply_channel"),
+                              apply_txpower=cfg.get("apply_txpower"),
+                              apply_steering=cfg.get("apply_steering"),
+                              min_gain_pct=cfg.get("min_gain_pct"), plan=plan)
+            res = api_rrm_apply(req)
+            job["details"]["deliver"] = res
+            job["run_id"] = res.get("run_id")
+            _opt_set_stage(job, 4, "done" if res.get("ok") else "skipped")
+        job["status"] = "done"
+        job["finished"] = time.time()
+        _opt_job_save(job)
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = f"{type(e).__name__}: {e}"
+        idx = int(job.get("stage_index") or 0)
+        _opt_set_stage(job, idx, "error")
+        _opt_job_save(job)
+
+
+class OptStartReq(BaseModel):
+    device: str | None = None
+    history_window_min: int | None = None
+    scan_duration: int | None = None
+    dry_run: bool = False
+
+
+@app.post("/api/optimize/start")
+def api_optimize_start(req: OptStartReq):
+    dev = get_device(req.device)
+    with OPT_LOCK:
+        for j in OPT_JOBS.values():
+            if j["status"] == "running" and j.get("device") == dev["id"]:
+                return {"ok": False, "running": True, "job_id": j["id"],
+                        "message": "Optimasi untuk device ini masih berjalan"}
+        cfg = load_rrm_cfg()
+        job = {
+            "id": f"opt_{secrets.token_hex(4)}", "device": dev["id"], "status": "running",
+            "stage": "identify", "stage_index": 0,
+            "stages": _opt_stages(int(req.history_window_min or 1440),
+                                  int(req.scan_duration or cfg.get("scan_duration", 8))),
+            "details": {}, "started": time.time(), "updated": time.time(), "run_id": None,
+        }
+        OPT_JOBS[job["id"]] = job
+        _opt_job_save(job)
+    threading.Thread(target=_opt_worker, daemon=True,
+                     args=(job["id"], {"device": dev["id"],
+                                       "history_window_min": req.history_window_min,
+                                       "scan_duration": req.scan_duration,
+                                       "dry_run": req.dry_run})).start()
+    return {"ok": True, "job_id": job["id"], "status": "running",
+            "message": "Optimasi berjalan di background — aman keluar dari halaman ini"}
+
+
+@app.get("/api/optimize/current")
+def api_optimize_current(device: str | None = None, job_id: str | None = None):
+    if job_id:
+        job = OPT_JOBS.get(job_id) or _opt_job_load(job_id)
+    else:
+        dev_id = get_device(device)["id"] if device else None
+        live = [j for j in OPT_JOBS.values() if j["status"] == "running"
+                and (dev_id is None or j.get("device") == dev_id)]
+        job = (max(live, key=lambda j: j["started"]) if live else None) \
+            or _opt_latest(dev_id or (get_device(None)["id"]))
+    if not job:
+        return {"ok": False, "message": "Belum ada job optimasi"}
+    total = len(job["stages"]) or 1
+    done = sum(1 for s in job["stages"] if s["status"] in ("done", "skipped", "error"))
+    return {"ok": True, "job_id": job["id"], "device": job.get("device"),
+            "status": job["status"], "stage": job.get("stage"),
+            "stage_index": job.get("stage_index"), "progress_pct": round(100 * done / total),
+            "stages": job["stages"], "details": job.get("details") or {},
+            "run_id": job.get("run_id"), "started": job.get("started"),
+            "error": job.get("error")}
+
+
+@app.post("/api/optimize/cancel")
+def api_optimize_cancel(req: dict):
+    job_id = (req or {}).get("job_id")
+    job = OPT_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job tidak ditemukan")
+    job["status"] = "cancelled"
+    job["error"] = "dibatalkan oleh user"
+    _opt_job_save(job)
+    return {"ok": True, "job_id": job_id, "status": "cancelled"}
+
+
+_opt_db_init()
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8090")), log_level="info")

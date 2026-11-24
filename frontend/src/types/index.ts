@@ -426,6 +426,31 @@ export interface AiAutoResult {
   rollback_hint?: string;
 }
 
+export interface OptimizeStage {
+  key: string;
+  name: string;
+  eta: string;
+  status: string;
+  started?: number | null;
+  ended?: number | null;
+}
+
+export interface OptimizeJob {
+  ok: boolean;
+  job_id: string;
+  device?: string;
+  status: string;
+  stage: string;
+  stage_index?: number;
+  progress_pct: number;
+  stages: OptimizeStage[];
+  details: Record<string, any>;
+  run_id?: string | null;
+  started?: number;
+  error?: string | null;
+  message?: string;
+}
+
 export interface AiChatResult {
   reply: string;
   timestamp: string;
