@@ -631,6 +631,7 @@ export interface ClientPresence {
   last_seen: number;
   status: 'online' | 'offline';
   roam_count: number;
+  is_randomized?: boolean;
   floor_id?: string;
   floor_name?: string;
   floor_x?: number;

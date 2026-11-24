@@ -20,6 +20,7 @@ import traceback
 import urllib.request
 import urllib.error
 import hashlib
+import gzip
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import secrets
@@ -546,6 +547,7 @@ def build_interfaces(mt, with_traffic=True):
 
 
 CLIENT_ALIASES_FILE = BASE / "client_aliases.json"
+CLIENT_HOSTNAMES_FILE = BASE / "client_hostnames.json"
 
 def load_client_aliases() -> dict:
     if not CLIENT_ALIASES_FILE.exists():
@@ -559,6 +561,137 @@ def load_client_aliases() -> dict:
 def save_client_aliases(data: dict):
     with open(CLIENT_ALIASES_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+# ---- Real hostname discovery (reverse DNS / NetBIOS / mDNS) ----------------
+# The MAC can never identify a randomised-MAC phone, but the *hostname* the
+# device announces on the network is a real identity. We cache discovered
+# hostnames so names survive between polls and do not depend on DNS uptime.
+_hostname_cache: dict[str, str] = {}
+_hostname_cache_loaded = False
+
+
+def load_hostname_cache() -> dict:
+    global _hostname_cache, _hostname_cache_loaded
+    if _hostname_cache_loaded:
+        return _hostname_cache
+    try:
+        if CLIENT_HOSTNAMES_FILE.exists():
+            with open(CLIENT_HOSTNAMES_FILE, "r", encoding="utf-8") as f:
+                _hostname_cache = json.load(f) or {}
+    except Exception:
+        _hostname_cache = {}
+    _hostname_cache_loaded = True
+    return _hostname_cache
+
+
+def save_hostname_cache():
+    try:
+        with open(CLIENT_HOSTNAMES_FILE, "w", encoding="utf-8") as f:
+            json.dump(_hostname_cache, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+def _clean_hostname(raw: str) -> str:
+    """Normalise a discovered hostname into a display-friendly label."""
+    if not raw:
+        return ""
+    h = raw.strip().strip(".").split(".")[0]
+    h = re.sub(r"[^A-Za-z0-9_\-]", "", h)
+    if not h or len(h) < 2:
+        return ""
+    # Reject auto-generated / meaningless names
+    up = h.upper()
+    if up.startswith("MAC-") or up.startswith("ANDROID-") or re.fullmatch(r"[0-9A-F]{8,}", up):
+        return ""
+    if up in {"LOCALHOST", "UNKNOWN", "NONE"}:
+        return ""
+    return h.upper() if len(h) <= 20 else h[:20].upper()
+
+
+def discover_hostname(ip: str, timeout: float = 0.7) -> str:
+    """Ask the network who lives at `ip`: reverse DNS first, then NetBIOS."""
+    if not ip:
+        return ""
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+        cleaned = _clean_hostname(name)
+        if cleaned:
+            return cleaned
+    except Exception:
+        pass
+    # NetBIOS node status (Windows file-sharing name)
+    try:
+        query = b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01"
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(query, (ip, 137))
+        data, _ = s.recvfrom(1024)
+        s.close()
+        n = data[56]
+        for i in range(n):
+            off = 57 + i * 18
+            nm = data[off:off + 15].split(b"\x00")[0].decode("ascii", "ignore").strip()
+            flags = int.from_bytes(data[off + 16:off + 18], "big")
+            if nm and not (flags & 0x8000) and nm != "\x01\x02__MSBROWSE__\x02":
+                cleaned = _clean_hostname(nm)
+                if cleaned:
+                    return cleaned
+    except Exception:
+        pass
+    return ""
+
+
+def hostname_for(mac: str, ip: str | None, probe: bool = False) -> str:
+    """Hostname for a client. Cache-only by default; `probe=True` asks the network.
+
+    resolve_client_device() runs inside per-client loops, so it must never block
+    on DNS. The background sweeper fills the cache with probe=True.
+    """
+    cache = load_hostname_cache()
+    mac_norm = (mac or "").strip().upper()
+    if mac_norm and mac_norm in cache:
+        return cache[mac_norm]
+    if not probe or not ip:
+        return ""
+    found = discover_hostname(ip)
+    if found and mac_norm:
+        cache[mac_norm] = found
+        save_hostname_cache()
+    return found
+
+
+def sweep_client_hostnames(limit: int = 400) -> int:
+    """Probe reverse DNS / NetBIOS for clients lacking a hostname (background)."""
+    cache = load_hostname_cache()
+    try:
+        conn = sqlite3.connect(str(NOC_DB_FILE))
+        c = conn.cursor()
+        c.execute("SELECT mac, ip FROM client_presence WHERE ip IS NOT NULL AND ip != ''")
+        rows = c.fetchall()
+        conn.close()
+    except Exception:
+        return 0
+
+    todo = [(m.upper(), i) for m, i in rows if m.upper() not in cache][:limit]
+    if not todo:
+        return 0
+
+    def _one(pair):
+        mac, ip = pair
+        return mac, discover_hostname(ip)
+
+    found = 0
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        for mac, name in ex.map(_one, todo):
+            if name:
+                cache[mac] = name
+                found += 1
+    if found:
+        save_hostname_cache()
+    return found
+
 
 # OUI Prefix Database (First 3 hex octets) for device vendor identification
 OUI_DATABASE = {
@@ -628,74 +761,152 @@ OUI_DATABASE = {
 }
 
 # Detailed mapping for specific Brand, Series/Model, and Type
-OUI_INFO_MAP = {
-    # Infinix & Tecno (Transsion)
-    "BC:91:B5": ("Infinix", "Hot 30 / Note Series", "mobile"),
-    "34:2E:B6": ("Infinix", "Smart / Hot Series", "mobile"),
-    "64:A2:F9": ("Tecno", "Spark / Pova Series", "mobile"),
-    "F0:1D:BC": ("Infinix", "Zero / Note Series", "mobile"),
-    "5C:E9:1E": ("Infinix", "Hot Series", "mobile"),
+# Curated OUI -> model-series hints. IMPORTANT: this table used to contain
+# hand-written entries whose brand disagreed with the IEEE registry (e.g. 5C:E9:1E
+# labelled "Infinix" when IEEE says Apple, B8:78:26 "Apple MacBook" when IEEE says
+# Nintendo). That is exactly why device names did not match their real brand.
+# The table is now only trusted when it AGREES with the bundled IEEE registry, and
+# the brand always comes from IEEE. Entries are kept only for a nicer series hint.
+OUI_SERIES_HINTS = {
     # Apple
-    "AC:BC:32": ("Apple", "iPhone 14 / 13 Series", "mobile"),
-    "F4:F1:5A": ("Apple", "iPhone / iPad (iOS)", "mobile"),
-    "DC:A9:04": ("Apple", "iPhone 15 / 14 Pro", "mobile"),
-    "F0:18:98": ("Apple", "iPad Air / Pro", "tablet"),
-    "B8:78:26": ("Apple", "MacBook Air / Pro", "laptop"),
+    "AC:BC:32": "iPhone Series",
+    "F4:F1:5A": "iPhone / iPad",
+    "DC:A9:04": "iPhone Series",
+    "F0:18:98": "iPad",
     # Samsung
-    "50:01:D9": ("Samsung", "Galaxy A Series (A54/A34)", "mobile"),
-    "B0:C4:E7": ("Samsung", "Galaxy S Series (S23/S22)", "mobile"),
-    "30:07:4D": ("Samsung", "Galaxy Tab Series", "tablet"),
-    "84:25:DB": ("Samsung", "Galaxy A / M Series", "mobile"),
-    "F4:7B:5E": ("Samsung", "Galaxy Z / S Series", "mobile"),
-    # Xiaomi & POCO & Redmi
-    "28:6C:07": ("Xiaomi", "Redmi Note 12 / 13 Pro", "mobile"),
-    "18:59:36": ("Xiaomi", "Redmi 12 / 10C", "mobile"),
-    "64:09:80": ("Xiaomi", "POCO X5 / F5 Pro", "mobile"),
-    "AC:F7:F3": ("Xiaomi", "Xiaomi 13T / 12 Series", "mobile"),
-    # OPPO
-    "08:EA:44": ("OPPO", "Reno / A Series", "mobile"),
-    "14:7D:C5": ("OPPO", "A-Series (A78 / A57)", "mobile"),
-    "AC:C1:EE": ("OPPO", "Reno8 / Reno10 5G", "mobile"),
-    # vivo
-    "2C:57:31": ("vivo", "Y-Series (Y36 / Y22)", "mobile"),
-    "74:5A:AA": ("vivo", "V-Series (V29 / V27)", "mobile"),
-    "C4:EB:67": ("vivo", "Y / V Series", "mobile"),
-    # Realme
-    "D8:16:47": ("Realme", "C-Series (C55 / C33)", "mobile"),
-    "34:7E:5C": ("Realme", "Number Series (11 / 10)", "mobile"),
+    "B0:C4:E7": "Galaxy S Series",
+    "30:07:4D": "Galaxy Tab",
+    "84:25:DB": "Galaxy A / M Series",
+    "F4:7B:5E": "Galaxy Z / S Series",
+    # Xiaomi
+    "28:6C:07": "Redmi Note Series",
+    "18:59:36": "Redmi Series",
+    "64:09:80": "POCO Series",
+    "AC:F7:F3": "Xiaomi Series",
     # Huawei
-    "00:1E:10": ("Huawei", "Nova / Mate Series", "mobile"),
-    "88:28:B3": ("Huawei", "P-Series / MatePad", "mobile"),
-    # PC / Laptop
-    "00:1F:16": ("Lenovo", "ThinkPad L14 / E14", "laptop"),
-    "04:76:6E": ("Lenovo", "IdeaPad / Yoga", "laptop"),
-    "00:14:22": ("Dell", "Latitude 3420 / Inspiron", "laptop"),
-    "34:17:EB": ("Dell", "Vostro / Latitude", "laptop"),
-    "00:1E:0B": ("HP", "ProBook / 240 G8", "laptop"),
-    "00:25:B3": ("HP", "EliteBook / Pavilion", "laptop"),
-    "00:1A:92": ("ASUS", "VivoBook / ExpertBook", "laptop"),
-    "00:24:8C": ("ASUS", "ROG Phone / ZenFone", "mobile"),
-    "00:1E:67": ("Intel", "Wi-Fi (Laptop PC)", "laptop"),
-    "DC:53:60": ("Intel", "Wi-Fi 6 AX200/AX201", "laptop"),
+    "00:1E:10": "Nova / Mate Series",
+    "88:28:B3": "P Series / MatePad",
+    # PC / laptop
+    "00:14:22": "Latitude / Inspiron",
+    "34:17:EB": "Vostro / Latitude",
+    "00:1A:92": "VivoBook / ExpertBook",
+    "00:24:8C": "ROG Phone / ZenFone",
+    "00:1E:67": "Intel Wi-Fi",
+    "DC:53:60": "Intel Wi-Fi 6",
 }
 
-# Deterministic representative mobile device profiles for Indonesian hospital network
-RANDOM_PROFILES = [
-    {"brand": "Samsung", "series": "Galaxy A54 5G", "device_type": "mobile", "vendor": "Samsung Electronics"},
-    {"brand": "Xiaomi", "series": "Redmi Note 12", "device_type": "mobile", "vendor": "Xiaomi Communications"},
-    {"brand": "Apple", "series": "iPhone 14 (iOS)", "device_type": "mobile", "vendor": "Apple, Inc."},
-    {"brand": "OPPO", "series": "Reno8 5G", "device_type": "mobile", "vendor": "OPPO Mobile"},
-    {"brand": "vivo", "series": "Y36 5G", "device_type": "mobile", "vendor": "vivo Mobile"},
-    {"brand": "Infinix", "series": "Hot 30", "device_type": "mobile", "vendor": "Infinix Mobility"},
-    {"brand": "Samsung", "series": "Galaxy S23 5G", "device_type": "mobile", "vendor": "Samsung Electronics"},
-    {"brand": "Apple", "series": "iPhone 13 (iOS)", "device_type": "mobile", "vendor": "Apple, Inc."},
-    {"brand": "Xiaomi", "series": "POCO X5 Pro 5G", "device_type": "mobile", "vendor": "Xiaomi Communications"},
-    {"brand": "Realme", "series": "C55 NFC", "device_type": "mobile", "vendor": "Realme Chongqing"},
-    {"brand": "OPPO", "series": "A78 5G", "device_type": "mobile", "vendor": "OPPO Mobile"},
-    {"brand": "Infinix", "series": "Note 30 Pro", "device_type": "mobile", "vendor": "Infinix Mobility"},
-    {"brand": "Samsung", "series": "Galaxy Tab A8", "device_type": "tablet", "vendor": "Samsung Electronics"},
-    {"brand": "Apple", "series": "iPad Air (iOS)", "device_type": "tablet", "vendor": "Apple, Inc."},
+# ---- IEEE OUI master database (bundled, offline) ---------------------------
+# data/oui_prefixes.tsv.gz : "AABBCC\tVendor Name" per line, ~40.5k entries
+OUI_FILE = BASE / "data" / "oui_prefixes.tsv.gz"
+_IEEE_OUI: dict[str, str] | None = None
+_IEEE_OUI_LOCK = threading.Lock()
+
+
+def load_ieee_oui() -> dict[str, str]:
+    global _IEEE_OUI
+    if _IEEE_OUI is not None:
+        return _IEEE_OUI
+    with _IEEE_OUI_LOCK:
+        if _IEEE_OUI is not None:
+            return _IEEE_OUI
+        table: dict[str, str] = {}
+        try:
+            with gzip.open(OUI_FILE, "rt", encoding="utf-8", errors="replace", newline="") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t", 1)
+                    if len(parts) == 2 and parts[0]:
+                        table[parts[0].strip().upper()] = parts[1].strip()
+        except Exception:
+            table = {}
+        _IEEE_OUI = table
+        return table
+
+
+# Vendor-name normalisation: raw IEEE org name -> (display brand, device type hint)
+VENDOR_BRAND_RULES: list[tuple[tuple[str, ...], str | None, str | None]] = [
+    (("SAMSUNG",), "Samsung", "mobile"),
+    (("APPLE",), "Apple", "mobile"),
+    (("XIAOMI", "BEIJING XIAOMI"), "Xiaomi", "mobile"),
+    (("GUANGDONG OPPO", "OPPO MOBILE"), "OPPO", "mobile"),
+    (("VIVO MOBILE", "VIVO COMMUNICATION"), "vivo", "mobile"),
+    (("REALME",), "Realme", "mobile"),
+    (("HONOR",), "Honor", "mobile"),
+    (("HUAWEI",), "Huawei", "mobile"),
+    (("INFINIX", "TRANSSION"), "Infinix", "mobile"),
+    (("TECNO",), "Tecno", "mobile"),
+    (("INTEL",), "Intel", "laptop"),
+    (("LENOVO",), "Lenovo", "laptop"),
+    (("DELL",), "Dell", "laptop"),
+    (("HEWLETT PACKARD", "HP INC"), "HP", "laptop"),
+    (("ASUSTEK", "ASUS"), "ASUS", "laptop"),
+    (("ACER",), "Acer", "laptop"),
+    (("MICROSOFT",), "Microsoft", "laptop"),
+    (("MICRO-STAR", "MSI"), "MSI", "laptop"),
+    (("TOSHIBA",), "Toshiba", "laptop"),
+    (("MURATA", "ALPS", "AZUREWAVE", "LITEON", "LITE-ON", "FOXCONN", "WISTRON", "QUANTA",
+      "COMPAL", "CHICONY", "HON HAI", "PEGATRON", "CYBERTAN", "CLOUD NETWORK"), None, "unknown"),
+    (("GRANDSTREAM",), "Grandstream", "voip"),
+    (("YEALINK",), "Yealink", "voip"),
+    (("TP-LINK", "TP LINK"), "TP-Link", "network"),
+    (("MIKROTIK",), "MikroTik", "network"),
+    (("UBIQUITI",), "Ubiquiti", "network"),
+    (("CISCO",), "Cisco", "network"),
+    (("ZTE",), "ZTE", "mobile"),
+    (("ONE PLUS", "ONEPLUS"), "OnePlus", "mobile"),
+    (("GOOGLE",), "Google", "mobile"),
+    (("MOTOROLA", "MOTOROLA MOBILITY"), "Motorola", "mobile"),
+    (("NOKIA",), "Nokia", "mobile"),
+    (("SONY",), "Sony", "mobile"),
+    (("LG ELECTRONICS", "LG INNOTEK"), "LG", "mobile"),
+    (("ESPRESSIF",), "Espressif", "iot"),
+    (("RASPBERRY PI",), "Raspberry Pi", "iot"),
+    (("GSA", "GAOSHENGDA"), "Gaoshengda", "unknown"),
+    (("ALTOBEAM",), "AltoBeam", "unknown"),
+    (("EASY3CALL",), "Easy3Call", "voip"),
+    (("HUI ZHOU",), "HuiZhou", "unknown"),
+    (("ALLWINNER", "ROCKCHIP", "AMLOGIC"), "Generic SoC", "iot"),
 ]
+
+
+def normalise_vendor(org: str) -> tuple[str, str]:
+    """Map a raw IEEE organisation name to (display brand, device_type hint)."""
+    if not org:
+        return "", "unknown"
+    up = org.upper()
+    for needles, brand, dtype in VENDOR_BRAND_RULES:
+        if any(n in up for n in needles):
+            if brand is None:
+                # Unknown OEM/ODM module maker: keep a readable short name
+                short = re.split(r"[,\s]+", org.strip())[0]
+                short = short[:18].title()
+                return short, dtype or "unknown"
+            return brand, dtype or "unknown"
+    short = re.sub(r"\b(CO\.?,?\s*LTD\.?|INC\.?|CORP\.?|CORPORATION|LIMITED|TECHNOLOGY|TECHNOLOGIES|"
+                   r"COMMUNICATION|COMMUNICATIONS|ELECTRONICS|COMPANY|GROUP|HOLDINGS?)\b",
+                   "", org, flags=re.IGNORECASE)
+    short = re.sub(r"\s+", " ", short).strip(" ,.")
+    return (short or org)[:22], "unknown"
+
+
+def lookup_oui_vendor(mac: str) -> str:
+    """Raw IEEE organisation name for a MAC's 24-bit prefix, or \"\"."""
+    prefix = "".join(mac.replace(":", "").replace("-", "").upper().split())[:6]
+    if len(prefix) < 6:
+        return ""
+    return load_ieee_oui().get(prefix, "")
+
+
+def is_locally_administered(mac_norm: str) -> bool:
+    try:
+        return (int(mac_norm.split(":")[0], 16) & 0x02) != 0
+    except Exception:
+        return False
+
+
+# NOTE: previous versions carried a "RANDOM_PROFILES" table that guessed a brand
+# (Samsung/Xiaomi/Apple/...) from a hash of the MAC. That produced confident but
+# entirely fabricated device names. It was removed: a randomised MAC genuinely
+# carries no vendor information, so it is now reported as "MAC Acak".
 
 def resolve_client_device(mac: str, ip: str | None = None) -> dict:
     if not mac:
@@ -751,21 +962,72 @@ def resolve_client_device(mac: str, ip: str | None = None) -> dict:
                 "device_type": "custom"
             }
     
+    # 2. Real hostname discovered on the network (reverse DNS / NetBIOS).
+    #    This is a genuine identity and beats any OUI guess — especially for
+    #    randomised-MAC phones where the OUI carries no information at all.
+    real_host = hostname_for(mac_norm, ip)
+    if real_host:
+        oui_brand, oui_type = "", "unknown"
+        org = lookup_oui_vendor(mac_norm)
+        if org:
+            oui_brand, oui_type = normalise_vendor(org)
+        return {
+            "brand": oui_brand or "Jaringan",
+            "model_series": real_host,
+            "device_name": real_host,
+            "vendor": org or "Nama dari jaringan (DNS/NetBIOS)",
+            "is_custom_name": True,
+            "device_type": oui_type,
+            "is_randomized": is_locally_administered(mac_norm),
+            "oui_prefix": ":".join(mac_norm.split(":")[:3]).replace(":", ""),
+            "hostname_source": "network",
+        }
+
     prefix = ":".join(mac_norm.split(":")[:3])
-    
-    # 2. Check exact OUI info map
-    if prefix in OUI_INFO_MAP:
-        brand, model_series, dev_type = OUI_INFO_MAP[prefix]
+
+    # 3. Full IEEE OUI registry (bundled, ~40.5k prefixes) — the single source
+    #    of truth for the brand. A prefix registered with IEEE is by definition
+    #    a universal (burned-in) address, so this is checked before the
+    #    randomised-MAC test.
+    org = lookup_oui_vendor(mac_norm)
+    if org:
+        brand, dev_type = normalise_vendor(org)
+        series_map = {
+            "laptop": "PC / Laptop",
+            "mobile": "Smartphone",
+            "tablet": "Tablet",
+            "voip": "IP Phone",
+            "network": "Perangkat Jaringan",
+            "iot": "Perangkat IoT",
+        }
+        model_series = OUI_SERIES_HINTS.get(prefix) or series_map.get(dev_type, "Wi-Fi Device")
         return {
             "brand": brand,
             "model_series": model_series,
             "device_name": f"{brand} {model_series}",
-            "vendor": f"{brand} Electronics",
+            "vendor": org,
             "is_custom_name": False,
-            "device_type": dev_type
+            "device_type": dev_type,
+            "is_randomized": False,
+            "oui_prefix": prefix.replace(":", ""),
         }
-        
-    # Check general OUI database
+
+    # 4. Randomised MAC (locally administered bit set) with no IEEE registration
+    #    — the vendor genuinely cannot be derived from the MAC. Report that
+    #    honestly instead of inventing a brand.
+    if is_locally_administered(mac_norm):
+        return {
+            "brand": "Privat",
+            "model_series": "MAC Acak",
+            "device_name": f"Perangkat Privat ({mac_norm[-5:]})",
+            "vendor": "MAC diacak perangkat (Private Wi-Fi Address)",
+            "is_custom_name": False,
+            "device_type": "unknown",
+            "is_randomized": True,
+            "oui_prefix": prefix.replace(":", ""),
+        }
+
+    # 5. Legacy hand-written table (fallback for prefixes missing from IEEE file)
     vendor = OUI_DATABASE.get(prefix)
     if vendor:
         brand = vendor.split()[0]
@@ -789,35 +1051,22 @@ def resolve_client_device(mac: str, ip: str | None = None) -> dict:
             "device_name": f"{brand} {model_series}",
             "vendor": vendor,
             "is_custom_name": False,
-            "device_type": dev_type
+            "device_type": dev_type,
+            "is_randomized": False,
+            "oui_prefix": prefix.replace(":", ""),
         }
 
-    # 3. Randomized MAC (IEEE 802 Locally Administered bit)
-    try:
-        first_byte = int(mac_norm.split(":")[0], 16)
-        is_random = (first_byte & 0x02) != 0
-    except Exception:
-        is_random = False
-        
-    if is_random:
-        h = int(hashlib.md5(mac_norm.encode()).hexdigest(), 16)
-        profile = RANDOM_PROFILES[h % len(RANDOM_PROFILES)]
-        return {
-            "brand": profile["brand"],
-            "model_series": profile["series"],
-            "device_name": f"{profile['brand']} {profile['series']}",
-            "vendor": profile["vendor"],
-            "is_custom_name": False,
-            "device_type": profile["device_type"]
-        }
-        
+    # 6. Truly unknown vendor: label as "Vendor Tidak Dikenal", never a bare
+    #    "Perangkat xx:xx" that looks like a brand.
     return {
-        "brand": "Generic",
-        "model_series": f"Wi-Fi {mac_norm[-5:]}",
-        "device_name": f"Perangkat {mac_norm[-5:]}",
-        "vendor": "Generic Wi-Fi",
+        "brand": "Tidak Dikenal",
+        "model_series": "Vendor Belum Terdaftar IEEE",
+        "device_name": f"Vendor Tidak Dikenal ({mac_norm[-5:]})",
+        "vendor": "Tidak terdaftar di IEEE OUI",
         "is_custom_name": False,
-        "device_type": "unknown"
+        "device_type": "unknown",
+        "is_randomized": False,
+        "oui_prefix": prefix.replace(":", ""),
     }
 
 
@@ -840,6 +1089,7 @@ def build_wireless(mt):
             "device_name": dev_info["device_name"],
             "vendor": dev_info["vendor"],
             "is_custom_name": dev_info["is_custom_name"],
+            "is_randomized": dev_info.get("is_randomized", False),
             "device_type": dev_info["device_type"],
             "signal": c.get("signal-strength"),
             "signal_dbm": _parse_dbm(c.get("signal-strength")),
@@ -2049,6 +2299,38 @@ def enrich_client_floor_info(client: dict) -> dict:
     return {**client, "has_floor_map": False}
 
 
+def refresh_client_identities() -> int:
+    """Re-resolve identity for every stored client and update changed rows."""
+    try:
+        conn = sqlite3.connect(str(NOC_DB_FILE))
+        c = conn.cursor()
+        c.execute("SELECT mac, ip, device_name, brand, is_custom_name, is_randomized FROM client_presence")
+        rows = c.fetchall()
+        changed = 0
+        for mac, ip, old_name, old_brand, is_custom, _old_rnd in rows:
+            info = resolve_client_device(mac, ip)
+            if is_custom and old_name and not info.get("hostname_source"):
+                # Keep manual aliases untouched
+                continue
+            new_rnd = 1 if info.get("is_randomized") else 0
+            if (info["device_name"], info.get("brand", "")) != (old_name, old_brand):
+                c.execute(
+                    """UPDATE client_presence SET device_name=?, brand=?, model_series=?,
+                       device_type=?, vendor=?, is_randomized=? WHERE mac=?""",
+                    (info["device_name"], info.get("brand", ""), info.get("model_series", ""),
+                     info.get("device_type", "unknown"), info.get("vendor", ""), new_rnd, mac),
+                )
+                changed += 1
+            else:
+                c.execute("UPDATE client_presence SET is_randomized=? WHERE mac=?", (new_rnd, mac))
+        conn.commit()
+        conn.close()
+        return changed
+    except Exception as ex:
+        print(f"refresh_client_identities error: {ex}")
+        return 0
+
+
 def probe_fleet_clients_and_record():
     """Probe all APs for wireless clients and record presence / roaming events."""
     devs = load_devices()
@@ -2133,13 +2415,14 @@ def probe_fleet_clients_and_record():
                     c.execute("""
                         INSERT OR REPLACE INTO client_presence 
                         (mac, ip, device_name, brand, model_series, device_type, vendor, is_custom_name,
-                         ap_id, ap_name, ap_host, interface, band, ssid, signal_dbm, signal_raw,
+                         is_randomized, ap_id, ap_name, ap_host, interface, band, ssid, signal_dbm, signal_raw,
                          tx_rate, rx_rate, uptime, first_seen, last_seen, status, roam_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', 0)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', 0)
                     """, (
                         mac, ip, dev_info["device_name"], dev_info.get("brand", ""), dev_info.get("model_series", ""),
                         dev_info.get("device_type", "unknown"), dev_info.get("vendor", ""),
                         1 if dev_info.get("is_custom_name") else 0,
+                        1 if dev_info.get("is_randomized") else 0,
                         d["id"], d["name"], d["host"], iface, band, r.get("ssid", ""), sig_dbm, sig_raw,
                         r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""), now, now
                     ))
@@ -2160,14 +2443,26 @@ def probe_fleet_clients_and_record():
                         new_roam_count = (prev.get("roam_count") or 0) + 1
                         c.execute("""
                             UPDATE client_presence SET
-                            ip = ?, device_name = ?, brand = ?, model_series = ?, device_type = ?, vendor = ?,
+                            ip = ?, device_name = ?, brand = ?, model_series = ?, device_type = ?, vendor = ?, is_randomized = ?,
                             ap_id = ?, ap_name = ?, ap_host = ?, interface = ?, band = ?, ssid = ?,
                             signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
                             last_seen = ?, status = 'online', roam_count = ?
-                            WHERE mac = ?
+                            WHERE mac = ? AND (is_custom_name IS NULL OR is_custom_name = 0)
                         """, (
                             ip, dev_info["device_name"], dev_info.get("brand", ""), dev_info.get("model_series", ""),
                             dev_info.get("device_type", "unknown"), dev_info.get("vendor", ""),
+                            1 if dev_info.get("is_randomized") else 0,
+                            d["id"], d["name"], d["host"], iface, band, r.get("ssid", ""),
+                            sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
+                            now, new_roam_count, mac
+                        ))
+                        c.execute("""
+                            UPDATE client_presence SET
+                            ap_id = ?, ap_name = ?, ap_host = ?, interface = ?, band = ?, ssid = ?,
+                            signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
+                            last_seen = ?, status = 'online', roam_count = ?
+                            WHERE mac = ? AND is_custom_name = 1
+                        """, (
                             d["id"], d["name"], d["host"], iface, band, r.get("ssid", ""),
                             sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
                             now, new_roam_count, mac
@@ -2184,11 +2479,27 @@ def probe_fleet_clients_and_record():
                         ))
                         existing[mac] = {"ap_id": d["id"], "ap_name": d["name"], "signal_dbm": sig_dbm, "roam_count": new_roam_count, "first_seen": prev.get("first_seen", now)}
                     else:
+                        # Refresh identity fields too: a row first seen before the
+                        # IEEE OUI table existed must not keep a stale/generic name
+                        # forever just because the client never roamed.
+                        c.execute("""
+                            UPDATE client_presence SET
+                            ip = ?, device_name = ?, brand = ?, model_series = ?, device_type = ?, vendor = ?, is_randomized = ?,
+                            signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
+                            last_seen = ?, status = 'online'
+                            WHERE mac = ? AND (is_custom_name IS NULL OR is_custom_name = 0)
+                        """, (
+                            ip, dev_info["device_name"], dev_info.get("brand", ""), dev_info.get("model_series", ""),
+                            dev_info.get("device_type", "unknown"), dev_info.get("vendor", ""),
+                            1 if dev_info.get("is_randomized") else 0,
+                            sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
+                            now, mac
+                        ))
                         c.execute("""
                             UPDATE client_presence SET
                             ip = ?, signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
                             last_seen = ?, status = 'online'
-                            WHERE mac = ?
+                            WHERE mac = ? AND is_custom_name = 1
                         """, (
                             ip, sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
                             now, mac
@@ -2201,6 +2512,13 @@ def probe_fleet_clients_and_record():
             conn.close()
         except Exception as ex:
             print(f"Error in probe_fleet_clients_and_record: {ex}")
+
+    # Enrich identities from the network itself (reverse DNS / NetBIOS). Runs
+    # after the DB write so a slow DNS server never delays presence updates.
+    try:
+        sweep_client_hostnames()
+    except Exception as ex:
+        print(f"Hostname sweep error: {ex}")
 
     return {
         "status": "ok",
@@ -2466,6 +2784,21 @@ def api_client_trail(mac: str):
 def api_client_locator_poll_now():
     res = probe_fleet_clients_and_record()
     return res
+
+
+@app.post("/api/clients/hostnames/sweep")
+def api_client_hostnames_sweep(limit: int = 400):
+    """Probe reverse DNS / NetBIOS for client hostnames, then refresh the DB."""
+    found = sweep_client_hostnames(limit=limit)
+    refreshed = refresh_client_identities()
+    return {"status": "ok", "hostnames_found": found, "rows_refreshed": refreshed,
+            "cached_total": len(load_hostname_cache())}
+
+
+@app.get("/api/clients/hostnames")
+def api_client_hostnames():
+    cache = load_hostname_cache()
+    return {"status": "ok", "total": len(cache), "hostnames": cache}
 
 @app.post("/api/interfaces/toggle")
 def api_interface_toggle(req: InterfaceToggleReq):

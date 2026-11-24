@@ -433,6 +433,14 @@ export const ClientLocatorView: React.FC<ClientLocatorViewProps> = ({ onSelectFl
                                   Label
                                 </span>
                               )}
+                              {c.brand === 'Privat' && (
+                                <span
+                                  className="px-1.5 py-0.2 text-[9px] font-bold bg-slate-100 text-slate-600 border border-slate-200 rounded"
+                                  title="Perangkat mengacak MAC (fitur privasi iOS/Android/Windows 11). Identitas asli hanya bisa diketahui dengan memberi label manual."
+                                >
+                                  MAC Acak
+                                </span>
+                              )}
                             </div>
                             <p className="text-[11px] text-slate-400 truncate mt-0.5">
                               {c.vendor || c.brand || 'MikroTik Wi-Fi Client'}
