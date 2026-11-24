@@ -13,7 +13,7 @@
   "min_gain_pct": 15.0,
   "quiet_start": "01:00",
   "quiet_end": "05:00",
-  "max_client_drop": 0,
+  "max_client_drop": 2,
   "scan_duration": 8,
   "sample_interval_min": 5,
   "channels_2g": [

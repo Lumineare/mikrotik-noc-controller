@@ -4869,9 +4869,16 @@ def _apply_tpc_changes(changes: list[dict]) -> list[dict]:
                 target = wl.get(name=t["interface"])
                 if not target:
                     continue
-                wl.set(id=target[0]["id"], tx_power=str(int(t["to_dbm"])),
-                       tx_power_mode="all-rates-fixed")
-                done.append({**t, "applied": True})
+                # RouterOS wireless: tx-power hanya dipakai kalau tx-power-mode
+                # sudah all-rates-fixed. Dikirim satu paket, tx-power diabaikan
+                # (mode belum aktif saat parameter dibaca) -> dua langkah, lalu
+                # baca balik: tanpa readback "applied: True" cuma tebakan.
+                wl.set(id=target[0]["id"], tx_power_mode="all-rates-fixed")
+                wl.set(id=target[0]["id"], tx_power=str(int(t["to_dbm"])))
+                after = (wl.get(name=t["interface"]) or [{}])[0].get("tx-power")
+                ok = str(after) == str(int(t["to_dbm"]))
+                done.append({**t, "applied": ok, "verified_dbm": after,
+                             **({} if ok else {"error": f"tx-power tetap {after}"})})
         except Exception as e:
             done.append({**t, "applied": False, "error": f"{type(e).__name__}: {e}"})
     return done
@@ -4884,8 +4891,10 @@ def _apply_steering_rules(rules: list[dict]) -> list[dict]:
         try:
             with get_device_lock(dev["host"]), MT(dev) as mt:
                 acl = mt.resource("/interface/wireless/access-list")
-                acl.add(interface=r["interface"], signal_range=r["signal_range"],
-                        authentication="no", forwarding="no", comment=r["comment"])
+                # ACL RouterOS tidak punya unique-key: add berulang = entri ganda.
+                if not acl.get(comment=r["comment"]):
+                    acl.add(interface=r["interface"], signal_range=r["signal_range"],
+                            authentication="no", forwarding="no", comment=r["comment"])
                 created = acl.get(comment=r["comment"])
                 done.append({**r, "applied": True, "acl_ids": [x["id"] for x in created]})
         except Exception as e:
@@ -5069,23 +5078,33 @@ def api_rrm_apply(req: RrmApplyReq):
                         cur = wl.get(name=entry["interface"])
                         if not cur:
                             continue
-                        attrs = {}
-                        if entry.get("frequency"):
-                            attrs["frequency"] = str(entry["frequency"])
-                        if entry.get("channel_width"):
-                            attrs["channel_width"] = entry["channel_width"]
-                        if entry.get("tx_power"):
-                            attrs["tx_power"] = str(entry["tx_power"])
-                        attrs = {k: v for k, v in attrs.items()
-                                 if str(cur[0].get(k.replace("_", "-")) or "") != str(v)}
-                        if attrs:
-                            wl.set(id=cur[0]["id"], **attrs)
+                        # urutan penting: channel-width dulu, baru frequency
+                        # (set frequency ke kanal yang tak mendukung width lama
+                        #  ditolak 'bad band or frequency'), tx-power butuh mode
+                        # all-rates-fixed lebih dulu. Tiap langkah diverifikasi.
+                        if entry.get("channel_width") and \
+                                str(cur[0].get("channel-width") or "") != str(entry["channel_width"]):
+                            wl.set(id=cur[0]["id"], channel_width=entry["channel_width"])
+                        if entry.get("frequency") and \
+                                str(cur[0].get("frequency") or "") != str(entry["frequency"]):
+                            wl.set(id=cur[0]["id"], frequency=str(entry["frequency"]))
+                        if entry.get("tx_power") and \
+                                str(cur[0].get("tx-power") or "") != str(entry["tx_power"]):
+                            wl.set(id=cur[0]["id"], tx_power_mode="all-rates-fixed")
+                            wl.set(id=cur[0]["id"], tx_power=str(entry["tx_power"]))
+                        now = (wl.get(name=entry["interface"]) or [{}])[0]
+                        if entry.get("frequency") and \
+                                str(now.get("frequency") or "") != str(entry["frequency"]):
+                            aborted.setdefault("rollback_errors", []).append(
+                                f"{did}/{entry['interface']}: frequency tetap {now.get('frequency')}")
                         acl = mt.resource("/interface/wireless/access-list")
                         for r in acl.get():
                             if r.get("comment") == "RRM-steer-5g" or \
                                     str(r.get("comment") or "").startswith(ROAM_PREFIX):
                                 acl.remove(id=r["id"])
-                except Exception:
+                except Exception as e:
+                    aborted.setdefault("rollback_errors", []).append(
+                        f"{did}/{entry.get('interface')}: {type(e).__name__}: {e}")
                     continue
             break
 
@@ -5170,32 +5189,6 @@ def api_rrm_config(req: dict):
 RETRY_BUCKETS = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 35), (35, 1001)]
 RSSI_BUCKETS = [(-50, 0), (-60, -50), (-70, -60), (-80, -70), (-200, -80)]
 
-# disconnect reasons RouterOS logs that mean the link actually failed (vs. client left on purpose)
-FAIL_REASONS = ("extensive data loss", "no beacons", "4-way handshake", "invalid mic",
-                "unauthorized", "key exchange", "connection lost")
-LEAVE_REASONS = ("disabling", "registered to other interface", "sending station leaving",
-                 "received deauth", "not in bridge", "unknown")
-
-
-def _log_wireless_stats(logs: list[dict]) -> dict:
-    connected, reasons = 0, {}
-    for l in logs:
-        msg = (l.get("message") or "").lower()
-        if "wireless" not in (l.get("topics") or "") and "@wlan" not in msg:
-            continue
-        if "disconnected," in msg:
-            r = msg.split("disconnected,", 1)[1]
-            r = r.split(", signal strength")[0].strip() or "unknown"
-            reasons[r] = reasons.get(r, 0) + 1
-        elif "connected," in msg:
-            connected += 1
-    failed = sum(n for r, n in reasons.items() if any(k in r for k in FAIL_REASONS))
-    left = sum(n for r, n in reasons.items() if any(k in r for k in LEAVE_REASONS))
-    auth_fail = sum(n for r, n in reasons.items()
-                    if any(k in r for k in ("4-way handshake", "invalid mic", "unauthorized", "key exchange")))
-    return {"connected": connected, "failed": failed, "left": left,
-            "auth_fail": auth_fail, "reasons": reasons}
-
 
 def _bucket_pct(values: list[float], buckets: list[tuple]) -> list[dict]:
     n = len(values)
@@ -5263,8 +5256,6 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
             bands[bkey] = _quality(sub)
 
     clients: list[dict] = []
-    logstats = {"connected": 0, "failed": 0, "left": 0, "auth_fail": 0, "reasons": {}}
-    dns_ms = None
     try:
         with get_device_lock(dev["host"]), MT(dev) as mt:
             reg = mt.resource("/interface/wireless/registration-table").get()
@@ -5277,25 +5268,9 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
                 clients.append({"mac": c.get("mac-address"), "interface": c.get("interface"),
                                 "rssi": rssi, "ccq_pct": ccq_pct,
                                 "has_ip": bool(c.get("last-ip")), "uptime": c.get("uptime")})
-            try:
-                logstats = _log_wireless_stats(mt.resource("/log").get())
-            except Exception:
-                pass
-            t0 = time.time()
-            try:
-                res = mt.resource("/").call("ping", {"address": "cloud.mikrotik.com", "count": "3"})
-                if res and int(str(res[-1].get("received", "0")) or 0) > 0:
-                    dns_ms = int((time.time() - t0) * 1000)
-            except Exception:
-                dns_ms = None
     except Exception as e:
         return {"ok": False, "error": str(e), "device_id": dev.get("id")}
 
-    conn, authf = logstats["connected"], logstats["auth_fail"]
-    association = round(100.0 * conn / (conn + logstats["failed"]), 1) if (conn + logstats["failed"]) else 100.0
-    authentication = round(100.0 * conn / (conn + authf), 1) if (conn + authf) else 100.0
-    with_ip = sum(1 for c in clients if c["has_ip"])
-    dhcp = round(100.0 * with_ip / len(clients), 1) if clients else 100.0
     per_mac: dict[str, list[float]] = {}
     for s in samples:
         if s.get("rssi") is not None:
@@ -5326,18 +5301,6 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
             "live": [{"mac": c["mac"], "interface": c["interface"], "ccq_pct": c["ccq_pct"]} for c in clients],
             "bands": bands,
             "source": "sampler 5 menit — 100 − tx-ccq; driver legacy cAP ac tak melaporkan tx-frames-timed-out",
-        },
-        "connectivity": {
-            "association": association, "authentication": authentication,
-            "dhcp": dhcp, "dns": 100.0 if dns_ms is not None else 0.0,
-            "dns_ms": dns_ms,
-            "counts": logstats,
-            "basis": {
-                "association": f"log wireless: {conn} connected vs {logstats['failed']} gagal (data loss/no beacon)",
-                "authentication": f"log wireless: {authf} kegagalan handshake/MIC/unauthorized",
-                "dhcp": f"{with_ip}/{len(clients)} klien punya IP (last-ip, live)",
-                "dns": "probe DNS+ICMP dari router (ping cloud.mikrotik.com)" + (f" — ok {dns_ms} ms" if dns_ms else " — gagal"),
-            },
         },
         "signal": {
             "buckets": _bucket_pct(rssi_vals, RSSI_BUCKETS),

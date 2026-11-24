@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, Wifi, SignalHigh, RefreshCw, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { Activity, SignalHigh, RefreshCw, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { api } from '../api/client';
 
 type Bucket = { lo: number; hi: number | null; count: number; pct: number };
@@ -18,14 +18,6 @@ interface Diag {
     live: { mac: string; interface: string; ccq_pct: number | null }[];
     bands?: Record<string, { samples: number; buckets: Bucket[]; avg_pct: number }>;
     source: string;
-  };
-  connectivity: {
-    association: number;
-    authentication: number;
-    dhcp: number;
-    dns: number;
-    dns_ms: number | null;
-    basis: Record<string, string>;
   };
   signal: {
     buckets: Bucket[];
@@ -47,8 +39,6 @@ const barColor = (b: Bucket) => {
   if (b.lo >= 10) return 'bg-amber-400';
   return 'bg-emerald-500';
 };
-
-const stageColor = (v: number) => (v >= 97 ? 'bg-emerald-500' : v >= 90 ? 'bg-amber-400' : 'bg-rose-500');
 
 export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string }> = ({ deviceId, deviceName }) => {
   const [d, setD] = useState<Diag | null>(null);
@@ -86,13 +76,6 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
   const bars = series ? series.buckets : d.quality.buckets;
   const samples = series ? series.samples : d.quality.samples;
   const maxPct = Math.max(...bars.map((b) => b.pct), 1);
-  const stages = [
-    ['Association', d.connectivity.association],
-    ['Authentication', d.connectivity.authentication],
-    ['DHCP', d.connectivity.dhcp],
-    ['DNS', d.connectivity.dns],
-  ] as [string, number][];
-  const overall = Math.round(stages.reduce((s, [, v]) => s + v, 0) / stages.length);
   const pos = (dbm: number) => Math.max(0, Math.min(100, ((dbm + 90) / 60) * 100));
   const points = d.aps
     .map((a) => (a.median_dbm == null ? null : { mac: a.id, label: a.name, rssi: Math.round(a.median_dbm), clients: a.clients }))
@@ -101,7 +84,7 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-3.5">
       {/* TX retries */}
-      <div className="lg:col-span-2 bg-white border border-slate-200/90 rounded-2xl p-4 shadow-sm">
+      <div className="lg:col-span-3 bg-white border border-slate-200/90 rounded-2xl p-4 shadow-sm">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2 text-xs font-mono text-blue-700 uppercase font-bold">
             <Activity className="w-4 h-4 text-blue-600" />
@@ -168,36 +151,6 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string 
           tx-frames-timed-out). Rata-rata {series ? series.avg_pct : d.quality.avg_pct}%.
           <br />
           {d.quality.source}
-        </p>
-      </div>
-
-      {/* Connectivity funnel */}
-      <div className="bg-white border border-slate-200/90 rounded-2xl p-4 shadow-sm">
-        <div className="flex items-center gap-2 text-xs font-mono text-blue-700 uppercase font-bold mb-3">
-          <Wifi className="w-4 h-4 text-blue-600" />
-          <span>WiFi Connectivity</span>
-        </div>
-        <div className="flex items-baseline gap-2 mb-3">
-          <span className={`text-3xl font-bold font-mono ${overall >= 97 ? 'text-emerald-600' : overall >= 90 ? 'text-amber-600' : 'text-rose-600'}`}>
-            {overall}%
-          </span>
-          <span className="text-[10px] font-mono text-slate-400">rata-rata 4 tahap</span>
-        </div>
-        <div className="space-y-2">
-          {stages.map(([name, v]) => (
-            <div key={name} title={d.connectivity.basis[name.toLowerCase()]}>
-              <div className="flex justify-between text-[10px] font-mono mb-0.5">
-                <span className="text-slate-500">{name}</span>
-                <span className="text-slate-700 font-bold">{v}%</span>
-              </div>
-              <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div className={`h-full ${stageColor(v)}`} style={{ width: `${v}%` }} />
-              </div>
-            </div>
-          ))}
-        </div>
-        <p className="mt-2 text-[10px] font-mono text-slate-400 leading-relaxed">
-          {d.connectivity.basis.association} · {d.connectivity.basis.dhcp}
         </p>
       </div>
 
