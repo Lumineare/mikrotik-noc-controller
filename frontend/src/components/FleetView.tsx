@@ -16,6 +16,7 @@ import {
 import { FleetDevice, Device } from '../types';
 import { DeviceCard } from './DeviceCard';
 import { WifiDiagnostics } from './WifiDiagnostics';
+import { OptimizeWizard } from './tabs/OptimizeWizard';
 
 interface FleetViewProps {
   fleet: FleetDevice[];
@@ -150,6 +151,8 @@ export const FleetView: React.FC<FleetViewProps> = ({
           </div>
         </div>
       </div>
+
+      <OptimizeWizard fleet />
 
       <WifiDiagnostics deviceId={primaryDevice?.id} deviceName={primaryDevice?.name} />
 

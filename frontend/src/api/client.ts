@@ -458,8 +458,8 @@ export const api = {
   },
 
   async startOptimize(
-    device: string,
-    opts?: { history_window_min?: number; scan_duration?: number; dry_run?: boolean }
+    device: string | undefined,
+    opts?: { history_window_min?: number; scan_duration?: number; dry_run?: boolean; fleet?: boolean }
   ): Promise<{ ok: boolean; job_id?: string; status?: string; message?: string; running?: boolean }> {
     const res = await fetch(`${BASE_URL}/api/optimize/start`, {
       method: 'POST',
@@ -473,7 +473,6 @@ export const api = {
     const res = await fetch(`${BASE_URL}/api/optimize/current?device=${encodeURIComponent(device)}`);
     return handleResponse<OptimizeJob>(res);
   },
-
   async cancelOptimize(job_id: string): Promise<{ ok: boolean; status: string }> {
     const res = await fetch(`${BASE_URL}/api/optimize/cancel`, {
       method: 'POST',

@@ -4753,6 +4753,7 @@ class RrmApplyReq(BaseModel):
     apply_steering: bool | None = None
     include_dfs: bool | None = None
     min_gain_pct: float | None = None
+    device: str | None = None   # batasi push ke satu AP (channel dikunci: milik plan fleet)
     plan: dict | None = None
 
 
@@ -4775,46 +4776,110 @@ def api_rrm_apply(req: RrmApplyReq):
     min_gain = cfg["min_gain_pct"] if req.min_gain_pct is None else req.min_gain_pct
 
     dca = plan.get("dca") or {}
+    only = req.device
     ch_skip = None
+    if only and do_ch:
+        ch_skip = f"channel dikelola global (fleet) — AP {only} hanya dikirimi TX power/steering"
+        do_ch = False
     if do_ch and dca.get("gain_pct", 0) < float(min_gain):
         ch_skip = f"gain {dca.get('gain_pct', 0)}% < min_gain {min_gain}% — channel tidak diubah"
         do_ch = False
-    if not do_ch and not (do_tpc and plan.get("tpc")) and not (do_steer and plan.get("steering")):
+    changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
+    tpc = [t for t in (plan.get("tpc") or []) if not only or t.get("device_id") == only]
+    steer = [s for s in (plan.get("steering") or []) if not only or s.get("device_id") == only]
+    if not (do_ch and changes) and not (do_tpc and tpc) and not (do_steer and steer):
         return {"ok": False, "skipped": True,
                 "reason": ch_skip or "tidak ada aksi yang lolos guard — jaringan tidak disentuh",
                 "channel_skipped": ch_skip}
 
     devs = {d["id"]: d for d in load_devices()}
-    clients_before = {}
-    snapshot = []
-    for did in devs:
+    if only:
+        devs = {k: v for k, v in devs.items() if k == only}
+    max_drop = int(cfg.get("max_client_drop") or 0)
+    clients_before: dict = {}
+    snapshot: list = []
+    result = {"channel": [], "txpower": [], "steering": []}
+    aborted = None
+
+    def _clients(dev: dict) -> int:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            return len(mt.resource("/interface/wireless/registration-table").get())
+
+    # push sekuensial per AP — satu-satunya blast radius; abort kalau klien hilang melebihi batas
+    for did, dev in devs.items():
+        slice_ch = [c for c in changes if c.get("device_id") == did]
+        slice_tp = [t for t in tpc if t.get("device_id") == did]
+        slice_st = [s for s in steer if s.get("device_id") == did]
+        if not ((do_ch and slice_ch) or (do_tpc and slice_tp) or (do_steer and slice_st)):
+            continue
         try:
-            dev = devs[did]
             with get_device_lock(dev["host"]), MT(dev) as mt:
                 snapshot.extend(_snapshot_wireless(dev, mt))
-                clients_before[did] = len(mt.resource(
-                    "/interface/wireless/registration-table").get())
-        except Exception:
+            before = _clients(dev)
+        except Exception as e:
+            aborted = {"device": did, "reason": f"tidak bisa dihubungi: {type(e).__name__}: {e}"}
+            break
+        clients_before[did] = before
+        applied_now = 0
+        if do_ch and slice_ch:
+            got = _apply_channel_changes(slice_ch)
+            result["channel"] += got
+            applied_now += sum(1 for x in got if x.get("applied"))
+        if do_tpc and slice_tp:
+            got = _apply_tpc_changes(slice_tp)
+            result["txpower"] += got
+            applied_now += sum(1 for x in got if x.get("applied"))
+        if do_steer and slice_st:
+            got = _apply_steering_rules(slice_st)
+            result["steering"] += got
+            applied_now += sum(1 for x in got if x.get("applied"))
+        if not applied_now:
             continue
-
-    result = {"channel": [], "txpower": [], "steering": []}
-    if do_ch and dca.get("changes"):
-        result["channel"] = _apply_channel_changes(dca["changes"])
-    if do_tpc and plan.get("tpc"):
-        result["txpower"] = _apply_tpc_changes(plan["tpc"])
-    if do_steer and plan.get("steering"):
-        result["steering"] = _apply_steering_rules(plan["steering"])
+        time.sleep(8)   # beri waktu klien re-associate sebelum menilai dampak
+        try:
+            after = _clients(dev)
+        except Exception:
+            after = before
+        if before - after > max_drop:
+            aborted = {"device": did, "clients_before": before, "clients_after": after,
+                       "reason": f"klien turun {before - after} > batas {max_drop} — push dihentikan"}
+            # rollback AP ini saja dari snapshot
+            for entry in [e for e in snapshot if e.get("device_id") == did]:
+                try:
+                    with get_device_lock(dev["host"]), MT(dev) as mt:
+                        wl = mt.resource("/interface/wireless")
+                        cur = wl.get(name=entry["interface"])
+                        if not cur:
+                            continue
+                        attrs = {}
+                        if entry.get("frequency"):
+                            attrs["frequency"] = str(entry["frequency"])
+                        if entry.get("channel_width"):
+                            attrs["channel_width"] = entry["channel_width"]
+                        if entry.get("tx_power"):
+                            attrs["tx_power"] = str(entry["tx_power"])
+                        attrs = {k: v for k, v in attrs.items()
+                                 if str(cur[0].get(k.replace("_", "-")) or "") != str(v)}
+                        if attrs:
+                            wl.set(id=cur[0]["id"], **attrs)
+                        acl = mt.resource("/interface/wireless/access-list")
+                        for r in acl.get(comment="RRM-steer-5g"):
+                            acl.remove(id=r["id"])
+                except Exception:
+                    continue
+            break
 
     run = {
         "id": f"rrm_{secrets.token_hex(4)}", "ts": time.time(), "mode": "manual",
-        "status": "applied", "gain_pct": dca.get("gain_pct", 0.0),
+        "status": "aborted" if aborted else "applied", "gain_pct": dca.get("gain_pct", 0.0),
         "plan": plan, "snapshot": {"wireless": snapshot, "clients_before": clients_before},
-        "result": result,
+        "result": result, "aborted": aborted,
     }
     db_rrm_run_save(run)
     applied = sum(1 for k in result for x in result[k] if x.get("applied"))
     return {"ok": True, "run_id": run["id"], "applied_actions": applied,
             "gain_pct": run["gain_pct"], "result": result, "channel_skipped": ch_skip,
+            "aborted": aborted, "clients_before": clients_before,
             "rollback_hint": f"POST /api/rrm/rollback {{'run_id': '{run['id']}'}}"}
 
 
@@ -5634,14 +5699,29 @@ def _opt_worker(job_id: str, opts: dict):
             req = RrmApplyReq(apply_channel=cfg.get("apply_channel"),
                               apply_txpower=cfg.get("apply_txpower"),
                               apply_steering=cfg.get("apply_steering"),
-                              min_gain_pct=cfg.get("min_gain_pct"), plan=plan)
+                              min_gain_pct=cfg.get("min_gain_pct"),
+                              device=dev_filter, plan=plan)
             res = api_rrm_apply(req)
             if opts.get("ai_auto_push", True):
-                try:
-                    res["ai"] = api_ai_optimize_auto(
-                        AiAutoReq(device=dev_filter or dev["id"]))
-                except Exception as e:
-                    res["ai"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                targets = [dev_filter] if dev_filter else [d["id"] for d in devs]
+                ai_runs = []
+                for t in targets:
+                    try:
+                        ai_runs.append(api_ai_optimize_auto(AiAutoReq(device=t)))
+                    except Exception as e:
+                        ai_runs.append({"ok": False, "device": t,
+                                        "error": f"{type(e).__name__}: {e}"})
+                res["ai"] = ai_runs[0] if len(ai_runs) == 1 else {
+                    "ok": all(r.get("ok") for r in ai_runs),
+                    "applied": sum(r.get("applied") or 0 for r in ai_runs),
+                    "failed": sum(r.get("failed") or 0 for r in ai_runs),
+                    "per_device": ai_runs,
+                    "score_before": min((r.get("score_before") for r in ai_runs
+                                         if r.get("score_before") is not None), default=None),
+                    "score_after": min((r.get("score_after") for r in ai_runs
+                                        if r.get("score_after") is not None), default=None),
+                    "run_id": ", ".join(r.get("run_id") for r in ai_runs if r.get("run_id")) or None,
+                }
             job["details"]["deliver"] = res
             job["run_id"] = res.get("run_id")
             _opt_set_stage(job, 4, "done" if res.get("ok") else "skipped")
@@ -5656,6 +5736,7 @@ def _opt_worker(job_id: str, opts: dict):
                 "score_before": ai.get("score_before"),
                 "score_after": ai.get("score_after"),
                 "roaming_issues": len(issues),
+                "aborted": res.get("aborted"),
                 "run_id": res.get("run_id"),
                 "ai_run_id": ai.get("run_id"),
             }
@@ -5673,6 +5754,7 @@ def _opt_worker(job_id: str, opts: dict):
 
 class OptStartReq(BaseModel):
     device: str | None = None
+    fleet: bool = False        # true = optimalkan semua AP sekaligus (channel joint)
     history_window_min: int | None = None
     scan_duration: int | None = None
     dry_run: bool = False
@@ -5681,15 +5763,22 @@ class OptStartReq(BaseModel):
 
 @app.post("/api/optimize/start")
 def api_optimize_start(req: OptStartReq):
-    dev = get_device(req.device)
+    if req.fleet:
+        dev = {"id": "fleet"}
+        dev_filter = None
+        lock_key = "fleet"
+    else:
+        dev = get_device(req.device)
+        dev_filter = dev["id"]
+        lock_key = dev["id"]
     with OPT_LOCK:
         for j in OPT_JOBS.values():
-            if j["status"] == "running" and j.get("device") == dev["id"]:
+            if j["status"] == "running" and j.get("device") == lock_key:
                 return {"ok": False, "running": True, "job_id": j["id"],
                         "message": "Optimasi untuk device ini masih berjalan"}
         cfg = load_rrm_cfg()
         job = {
-            "id": f"opt_{secrets.token_hex(4)}", "device": dev["id"], "status": "running",
+            "id": f"opt_{secrets.token_hex(4)}", "device": lock_key, "status": "running",
             "stage": "identify", "stage_index": 0,
             "stages": _opt_stages(int(req.history_window_min or 1440),
                                   int(req.scan_duration or cfg.get("scan_duration", 8))),
@@ -5698,7 +5787,8 @@ def api_optimize_start(req: OptStartReq):
         OPT_JOBS[job["id"]] = job
         _opt_job_save(job)
     threading.Thread(target=_opt_worker, daemon=True,
-                     args=(job["id"], {"device": dev["id"],
+                     args=(job["id"], {"device": dev_filter,
+                                       "fleet": bool(req.fleet),
                                        "history_window_min": req.history_window_min,
                                        "scan_duration": req.scan_duration,
                                        "dry_run": req.dry_run,
@@ -5737,7 +5827,7 @@ def api_optimize_current(device: str | None = None, job_id: str | None = None):
     if job_id:
         job = OPT_JOBS.get(job_id) or _opt_job_load(job_id)
     else:
-        dev_id = get_device(device)["id"] if device else None
+        dev_id = ("fleet" if device == "fleet" else get_device(device)["id"]) if device else None
         live = [j for j in OPT_JOBS.values() if j["status"] == "running"
                 and (dev_id is None or j.get("device") == dev_id)]
         job = (max(live, key=lambda j: j["started"]) if live else None) \
@@ -5746,12 +5836,13 @@ def api_optimize_current(device: str | None = None, job_id: str | None = None):
         return {"ok": False, "message": "Belum ada job optimasi"}
     total = len(job["stages"]) or 1
     done = sum(1 for s in job["stages"] if s["status"] in ("done", "skipped", "error"))
-    return {"ok": True, "job_id": job["id"], "device": job.get("device"),
+    jdev = job.get("device")
+    return {"ok": True, "job_id": job["id"], "device": jdev,
             "status": job["status"], "stage": job.get("stage"),
             "stage_index": job.get("stage_index"), "progress_pct": round(100 * done / total),
             "stages": job["stages"], "details": job.get("details") or {},
             "run_id": job.get("run_id"), "started": job.get("started"),
-            "live_channels": _live_channels(get_device(job.get("device"))),
+            "live_channels": _live_channels(get_device(jdev)) if jdev and jdev != "fleet" else {},
             "error": job.get("error")}
 
 
