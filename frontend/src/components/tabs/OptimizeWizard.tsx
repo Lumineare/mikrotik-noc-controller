@@ -30,6 +30,7 @@ interface RrmConfig {
   apply_channel: boolean;
   apply_txpower: boolean;
   apply_steering: boolean;
+  apply_roam: boolean;
   min_gain_pct: number;
   channels_2g?: number[];
   channels_5g?: number[];
@@ -287,7 +288,12 @@ export const OptimizeWizard: React.FC<{
               .map((b: any) => `${b.band} ch ${b.current_channel?.channel ?? '?'}`)
               .join(' · ');
             const acts = deliver?.result
-              ? [...(deliver.result.channel || []), ...(deliver.result.txpower || []), ...(deliver.result.steering || [])]
+              ? [
+                  ...(deliver.result.channel || []),
+                  ...(deliver.result.txpower || []),
+                  ...(deliver.result.steering || []),
+                  ...(deliver.result.roam || []),
+                ]
               : [];
             const applied = acts.filter((x: any) => x.device_id === ap.device && x.applied).length;
             const aborted = deliver?.aborted?.device === ap.device;
@@ -464,6 +470,17 @@ export const OptimizeWizard: React.FC<{
           )}
           {deliver?.dry_run && <div>• Kirim: dry-run, tidak ada perubahan</div>}
           {deliver?.skipped && <div>• Kirim: dilewati — {deliver.reason}</div>}
+          {((deliver?.result?.roam as any[]) || []).length > 0 && (
+            <div>
+              {((deliver.result.roam as any[]) || []).map((r: any, i: number) => (
+                <div key={`roam-${i}`} className={r.applied ? 'text-slate-600' : 'text-rose-600'}>
+                  • Roam {r.mac} di {r.device_id}: {r.current_dbm} dBm → blokir ≤ {r.signal_range?.split('..')[1]} dBm
+                  {r.best_device ? `, arahkan ke ${r.best_device} (${r.best_dbm} dBm)` : ''}
+                  {r.applied ? '' : ` — gagal: ${r.error}`}
+                </div>
+              ))}
+            </div>
+          )}
           <div className="text-slate-400">
             sumber: <code>/interface/wireless set</code> (RRM) + diagnosa rule-based{' '}
             <code>/system/resource, /ip/dns, /ip/firewall/filter</code> → whitelist auto-push. LLM hanya
@@ -552,6 +569,12 @@ export const OptimizeWizard: React.FC<{
                 'Roaming/steering',
                 cfg?.apply_steering ?? false,
                 (v: boolean) => saveCfg({ apply_steering: v }),
+              ],
+              [
+                'rm',
+                'Paksa roaming (blokir MAC di AP salah)',
+                cfg?.apply_roam ?? false,
+                (v: boolean) => saveCfg({ apply_roam: v }),
               ],
               ['dfs', 'Pakai channel DFS', cfg?.include_dfs ?? false, (v: boolean) => saveCfg({ include_dfs: v })],
               ['auto', 'Auto tiap 15 menit', cfg?.enabled ?? false, (v: boolean) => saveCfg({ enabled: v })],

@@ -4332,6 +4332,11 @@ RRM_DEFAULT = {
     "apply_channel": True,
     "apply_txpower": False,
     "apply_steering": False,
+    "apply_roam": False,       # blokir MAC di AP yang salah (pengganti 802.11k/v)
+    "roam_thr_dbm": -74.0,     # blokir hanya saat sinyal klien di AP itu <= ini
+    "roam_alt_min_dbm": -67.0, # AP alternatif minimal sekuat ini, kalau tidak klien yatim
+    "roam_margin_db": 7.0,     # histeresis: selisih minimal agar layak dipaksa pindah
+    "roam_expire_min": 10,     # entry ACL dicabut otomatis setelah ini
     "min_gain_pct": 15.0,      # do not touch a working network for less than this
     "quiet_start": "01:00",    # auto-push only inside this window unless no clients attached
     "quiet_end": "05:00",
@@ -4647,6 +4652,9 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
     dca = rrm.plan_dca(aps, include_dfs=include_dfs, allowed=rrm_allowed_freqs(cfg))
     tpc = rrm.plan_tpc(aps)
     steering = []
+    seen: dict[str, dict[str, list[float]]] = {}
+    current: dict[str, dict] = {}
+    roam_cutoff = time.time() - 3600
     for d in devs:
         try:
             with get_device_lock(d["host"]), MT(d) as mt:
@@ -4662,6 +4670,22 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
         for r in rules:
             r["device_id"] = d["id"]
         steering.extend(rules)
+        for c in clients:
+            mac = c.get("mac-address")
+            if not mac:
+                continue
+            iface = c.get("interface")
+            current[mac] = {"device": d["id"], "interface": iface,
+                            "band": "2g" if iface == i2 else ("5g" if iface == i5 else "?")}
+        for s in db_rf_samples(d["id"], limit=20000):
+            if (s.get("ts") or 0) < roam_cutoff or s.get("rssi") is None or not s.get("mac"):
+                continue
+            seen.setdefault(s["mac"], {}).setdefault(d["id"], []).append(float(s["rssi"]))
+
+    roam = rrm.plan_roam(seen, current,
+                         thr_dbm=float(cfg.get("roam_thr_dbm", -74.0)),
+                         alt_min_dbm=float(cfg.get("roam_alt_min_dbm", -67.0)),
+                         margin_db=float(cfg.get("roam_margin_db", 7.0)))
 
     return {
         "ok": True,
@@ -4673,12 +4697,14 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
         "dca": dca,
         "tpc": tpc,
         "steering": steering,
+        "roam": roam,
         "summary": {
             "channel_changes": len(dca["changes"]),
             "txpower_changes": len(tpc),
             "steering_rules": len(steering),
+            "roam_rules": len(roam),
             "expected_gain_pct": dca["gain_pct"],
-            "actionable": bool(dca["changes"] or tpc or steering),
+            "actionable": bool(dca["changes"] or tpc or steering or roam),
         },
     }
 
@@ -4747,10 +4773,62 @@ def _apply_steering_rules(rules: list[dict]) -> list[dict]:
     return done
 
 
+ROAM_PREFIX = "RRM-roam-"
+
+
+def _apply_roam_rules(rules: list[dict], expire_min: int = 10) -> list[dict]:
+    """Blokir MAC di AP yang salah, hanya selama sinyalnya lemah (mac-address + signal-range).
+
+    Entry dicabut otomatis oleh `_roam_expire()` setelah `expire_min` menit, dan klien
+    otomatis boleh asosiasi lagi begitu sinyalnya di AP itu kembali di atas ambang.
+    """
+    done = []
+    exp = int(time.time() + max(1, int(expire_min)) * 60)
+    for r in rules:
+        dev = get_device(r["device_id"])
+        comment = f"{ROAM_PREFIX}{exp}-{r['mac']}"
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                acl = mt.resource("/interface/wireless/access-list")
+                acl.add(**{"mac-address": r["mac"], "signal-range": r["signal_range"],
+                           "authentication": "no", "forwarding": "no",
+                           "interface": r.get("interface") or "", "comment": comment})
+                created = acl.get(comment=comment)
+                done.append({**r, "applied": True, "comment": comment, "expires_ts": exp,
+                             "acl_ids": [x["id"] for x in created]})
+        except Exception as e:
+            done.append({**r, "applied": False, "error": f"{type(e).__name__}: {e}"})
+    return done
+
+
+def _roam_expire() -> int:
+    """Cabut entry RRM-roam-* yang lewat masa berlaku (jaring pengaman kalau sampel basi)."""
+    removed, now = 0, time.time()
+    for d in load_devices():
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                acl = mt.resource("/interface/wireless/access-list")
+                for x in acl.get():
+                    c = str(x.get("comment") or "")
+                    if not c.startswith(ROAM_PREFIX):
+                        continue
+                    try:
+                        exp = int(c[len(ROAM_PREFIX):].split("-", 1)[0])
+                    except (ValueError, IndexError):
+                        continue
+                    if exp <= now:
+                        acl.remove(id=x["id"])
+                        removed += 1
+        except Exception:
+            continue
+    return removed
+
+
 class RrmApplyReq(BaseModel):
     apply_channel: bool | None = None
     apply_txpower: bool | None = None
     apply_steering: bool | None = None
+    apply_roam: bool | None = None
     include_dfs: bool | None = None
     min_gain_pct: float | None = None
     device: str | None = None   # batasi push ke satu AP (channel dikunci: milik plan fleet)
@@ -4773,6 +4851,7 @@ def api_rrm_apply(req: RrmApplyReq):
     do_ch = cfg["apply_channel"] if req.apply_channel is None else req.apply_channel
     do_tpc = cfg["apply_txpower"] if req.apply_txpower is None else req.apply_txpower
     do_steer = cfg["apply_steering"] if req.apply_steering is None else req.apply_steering
+    do_roam = cfg.get("apply_roam", False) if req.apply_roam is None else req.apply_roam
     min_gain = cfg["min_gain_pct"] if req.min_gain_pct is None else req.min_gain_pct
 
     dca = plan.get("dca") or {}
@@ -4787,7 +4866,9 @@ def api_rrm_apply(req: RrmApplyReq):
     changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
     tpc = [t for t in (plan.get("tpc") or []) if not only or t.get("device_id") == only]
     steer = [s for s in (plan.get("steering") or []) if not only or s.get("device_id") == only]
-    if not (do_ch and changes) and not (do_tpc and tpc) and not (do_steer and steer):
+    roam = [r for r in (plan.get("roam") or []) if not only or r.get("device_id") == only]
+    if not (do_ch and changes) and not (do_tpc and tpc) and not (do_steer and steer) \
+            and not (do_roam and roam):
         return {"ok": False, "skipped": True,
                 "reason": ch_skip or "tidak ada aksi yang lolos guard — jaringan tidak disentuh",
                 "channel_skipped": ch_skip}
@@ -4796,9 +4877,10 @@ def api_rrm_apply(req: RrmApplyReq):
     if only:
         devs = {k: v for k, v in devs.items() if k == only}
     max_drop = int(cfg.get("max_client_drop") or 0)
+    roam_expire = int(cfg.get("roam_expire_min") or 10)
     clients_before: dict = {}
     snapshot: list = []
-    result = {"channel": [], "txpower": [], "steering": []}
+    result = {"channel": [], "txpower": [], "steering": [], "roam": []}
     aborted = None
 
     def _clients(dev: dict) -> int:
@@ -4810,7 +4892,9 @@ def api_rrm_apply(req: RrmApplyReq):
         slice_ch = [c for c in changes if c.get("device_id") == did]
         slice_tp = [t for t in tpc if t.get("device_id") == did]
         slice_st = [s for s in steer if s.get("device_id") == did]
-        if not ((do_ch and slice_ch) or (do_tpc and slice_tp) or (do_steer and slice_st)):
+        slice_rm = [r for r in roam if r.get("device_id") == did]
+        if not ((do_ch and slice_ch) or (do_tpc and slice_tp) or (do_steer and slice_st)
+                or (do_roam and slice_rm)):
             continue
         try:
             with get_device_lock(dev["host"]), MT(dev) as mt:
@@ -4832,6 +4916,10 @@ def api_rrm_apply(req: RrmApplyReq):
         if do_steer and slice_st:
             got = _apply_steering_rules(slice_st)
             result["steering"] += got
+            applied_now += sum(1 for x in got if x.get("applied"))
+        if do_roam and slice_rm:
+            got = _apply_roam_rules(slice_rm, roam_expire)
+            result["roam"] += got
             applied_now += sum(1 for x in got if x.get("applied"))
         if not applied_now:
             continue
@@ -4863,8 +4951,10 @@ def api_rrm_apply(req: RrmApplyReq):
                         if attrs:
                             wl.set(id=cur[0]["id"], **attrs)
                         acl = mt.resource("/interface/wireless/access-list")
-                        for r in acl.get(comment="RRM-steer-5g"):
-                            acl.remove(id=r["id"])
+                        for r in acl.get():
+                            if r.get("comment") == "RRM-steer-5g" or \
+                                    str(r.get("comment") or "").startswith(ROAM_PREFIX):
+                                acl.remove(id=r["id"])
                 except Exception:
                     continue
             break
@@ -4914,9 +5004,11 @@ def api_rrm_rollback(req: RrmRollbackReq):
                     wl.set(id=cur["id"], **attrs)
                     restored += 1
                 acl = mt.resource("/interface/wireless/access-list")
-                for r in acl.get(comment="RRM-steer-5g"):
-                    acl.remove(id=r["id"])
-                    acl_removed += 1
+                for r in acl.get():
+                    if r.get("comment") == "RRM-steer-5g" or \
+                            str(r.get("comment") or "").startswith(ROAM_PREFIX):
+                        acl.remove(id=r["id"])
+                        acl_removed += 1
         except Exception:
             continue
     db_rrm_run_mark_rolled_back(req.run_id)
@@ -5217,6 +5309,10 @@ def _rrm_auto_loop():
                             })
                 else:
                     save_rrm_cfg({"last_run_ts": time.time()})
+        except Exception:
+            pass
+        try:
+            _roam_expire()   # jaring pengaman: entry RRM-roam-* lewat masa berlaku dicabut
         except Exception:
             pass
         time.sleep(60)
@@ -5736,6 +5832,7 @@ def _opt_worker(job_id: str, opts: dict):
                 "score_before": ai.get("score_before"),
                 "score_after": ai.get("score_after"),
                 "roaming_issues": len(issues),
+                "roam_rules": len((res.get("result") or {}).get("roam") or []),
                 "aborted": res.get("aborted"),
                 "run_id": res.get("run_id"),
                 "ai_run_id": ai.get("run_id"),

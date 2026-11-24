@@ -278,6 +278,59 @@ def clients_5g_capable(iface_5g: str | None) -> bool:
     return bool(iface_5g)
 
 
+def plan_roam(seen: dict[str, dict[str, list[float]]],
+              current: dict[str, dict],
+              thr_dbm: float = -74.0, alt_min_dbm: float = -67.0,
+              margin_db: float = 7.0, min_samples: int = 3,
+              max_rules: int = 3) -> list[dict]:
+    """Roaming paksa tanpa 802.11k/v: blokir MAC di AP yang salah, hanya saat lemah.
+
+    `seen`    = {mac: {device_id: [rssi, ...]}}  sampel RF dari riwayat (bukan snapshot)
+    `current` = {mac: {"device": id, "interface": name, "band": "2g"|"5g"}}
+
+    Blokir memakai `mac-address` + `signal-range=-120..thr`, jadi klien otomatis boleh
+    asosiasi lagi begitu sinyalnya di AP itu kembali kuat (di luar range).
+    Guard: AP alternatif harus >= alt_min_dbm (kalau tidak, klien jadi yatim) dan
+    selisihnya harus >= margin_db (histeresis, cegah osilasi).
+    """
+    out = []
+    for mac, per_dev in seen.items():
+        cur = current.get(mac)
+        if not cur:
+            continue
+        cur_dev = cur.get("device")
+        med = {}
+        for dev, vals in per_dev.items():
+            v = sorted(float(x) for x in vals if x is not None)
+            if len(v) >= min_samples:
+                med[dev] = v[len(v) // 2]
+        if cur_dev not in med or len(med) < 2:
+            continue
+        cur_rssi = med[cur_dev]
+        if cur_rssi > thr_dbm:
+            continue
+        best_dev, best_rssi = max(((d, r) for d, r in med.items() if d != cur_dev),
+                                  key=lambda kv: kv[1])
+        if best_rssi < alt_min_dbm or (best_rssi - cur_rssi) < margin_db:
+            continue
+        out.append({
+            "device_id": cur_dev,
+            "interface": cur.get("interface"),
+            "mac": mac,
+            "band": cur.get("band"),
+            "signal_range": f"-120..{int(thr_dbm)}",
+            "current_dbm": round(cur_rssi, 1),
+            "best_device": best_dev,
+            "best_dbm": round(best_rssi, 1),
+            "gain_db": round(best_rssi - cur_rssi, 1),
+            "samples": len(per_dev.get(cur_dev) or []),
+            "rationale": (f"{round(cur_rssi)} dBm di {cur_dev} vs {round(best_rssi)} dBm di "
+                          f"{best_dev} — ditolak di {cur_dev} selama sinyal <= {int(thr_dbm)} dBm"),
+        })
+    out.sort(key=lambda r: -r["gain_db"])
+    return out[:max_rules]
+
+
 if __name__ == "__main__":
     # self-check: two APs co-channel on 1 → planner must split them 1/6/11
     aps = [
@@ -328,5 +381,21 @@ if __name__ == "__main__":
             assert ch["to_freq"] in CH_2G, f"2.4 GHz radio got {ch['to_freq']} MHz"
         assert ch["device_id"] == "d", ch
     assert dual_plan["iterations"] <= 5, f"did not converge: {dual_plan['iterations']} passes"
+
+    # roam: client weak on A (-78) but strong on B (-58) → block on A only while weak
+    seen = {"AA": {"a": [-78, -79, -77], "b": [-58, -57, -59]}}
+    cur = {"AA": {"device": "a", "interface": "wlan1", "band": "2g"}}
+    roam = plan_roam(seen, cur)
+    assert len(roam) == 1 and roam[0]["device_id"] == "a", roam
+    assert roam[0]["signal_range"] == "-120..-74", roam
+    assert roam[0]["best_device"] == "b" and roam[0]["gain_db"] == 20.0, roam
+    # no alternative AP heard → must not strand the client
+    assert plan_roam({"AA": {"a": [-78, -79, -77]}}, cur) == []
+    # alternative too weak (-70) → still stranded, refuse
+    assert plan_roam({"AA": {"a": [-78, -79, -77], "b": [-70, -71, -70]}}, cur) == []
+    # hysteresis: 4 dB better is not worth a forced roam
+    assert plan_roam({"AA": {"a": [-75, -75, -75], "b": [-71, -71, -71]}}, cur) == []
+    # client already strong on its AP → nothing to do
+    assert plan_roam({"AA": {"a": [-55, -56, -54], "b": [-50, -50, -51]}}, cur) == []
 
     print("rrm_engine self-check OK")
