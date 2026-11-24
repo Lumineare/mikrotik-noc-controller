@@ -5578,6 +5578,7 @@ def _opt_worker(job_id: str, opts: dict):
                                          for b in known)]
                     scans.append({
                         "device": d["id"], "band": band,
+                        "scanned_at": sc.get("scanned_at") or time.strftime("%Y-%m-%d %H:%M:%S"),
                         "current_channel": sc.get("current_channel"),
                         "best_channel": best.get("channel"),
                         "best_score": best.get("score"),
@@ -5701,6 +5702,31 @@ def api_optimize_start(req: OptStartReq):
             "message": "Optimasi berjalan di background — aman keluar dari halaman ini"}
 
 
+_LIVE_CH_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _live_channels(dev: dict, ttl: float = 30.0) -> dict:
+    """Channel yang benar-benar aktif di radio saat ini (cache 30 s, hindari hammer router)."""
+    key = dev.get("id") or dev.get("host") or "?"
+    hit = _LIVE_CH_CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    out: dict = {}
+    try:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            for w in mt.resource("/interface/wireless").get():
+                f = int(str(w.get("frequency") or 0) or 0)
+                if not f:
+                    continue
+                band = "2g" if f < 3000 else "5g"
+                out[band] = {"freq": f, "channel": (round((f - 2407) / 5) if band == "2g" else (f - 5000) // 5),
+                             "interface": w.get("name")}
+    except Exception as e:
+        out = {"error": f"{type(e).__name__}: {e}"}
+    _LIVE_CH_CACHE[key] = (time.time(), out)
+    return out
+
+
 @app.get("/api/optimize/current")
 def api_optimize_current(device: str | None = None, job_id: str | None = None):
     if job_id:
@@ -5720,6 +5746,7 @@ def api_optimize_current(device: str | None = None, job_id: str | None = None):
             "stage_index": job.get("stage_index"), "progress_pct": round(100 * done / total),
             "stages": job["stages"], "details": job.get("details") or {},
             "run_id": job.get("run_id"), "started": job.get("started"),
+            "live_channels": _live_channels(get_device(job.get("device"))),
             "error": job.get("error")}
 
 

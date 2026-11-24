@@ -333,14 +333,44 @@ export const OptimizeWizard: React.FC<{ deviceId: string; onApplied?: () => void
               <div className="text-slate-500">{r.note}</div>
             </div>
           ))}
-          {((scan?.bands as any[]) || []).map((b, i) => (
-            <div key={`${b.device}-${b.band}-${i}`}>
-              • Scan {b.device} {b.band}: sekarang ch {b.current_channel?.channel ?? '?'}, kandidat udara
-              terbaik ch {b.best_channel ?? '?'}, tetangga {b.neighbours ?? 0}, interferensi{' '}
-              {b.interference_level ?? '?'}
-              {b.error && <span className="text-rose-500"> ({b.error})</span>}
-            </div>
-          ))}
+          {(() => {
+            const live = ((job as any).live_channels || {}) as any;
+            if (live.error) return null;
+            const parts = ['2g', '5g'].filter((k) => live[k]?.channel != null);
+            if (!parts.length) return null;
+            return (
+              <div className="font-bold text-slate-800">
+                • Channel radio sekarang (live dari router):{' '}
+                {parts.map((k) => `${k} ch ${live[k].channel} (${live[k].freq} MHz)`).join(' · ')}
+              </div>
+            );
+          })()}
+          {((scan?.bands as any[]) || []).map((b, i) => {
+            const scanAt = (b.scanned_at || '').replace(' ', 'T');
+            const ageMin = scanAt ? (Date.now() - Date.parse(scanAt)) / 60000 : null;
+            const stale = ageMin != null && ageMin > 10;
+            return (
+              <div key={`${b.device}-${b.band}-${i}`}>
+                • Scan {b.device} {b.band}: sekarang ch {b.current_channel?.channel ?? '?'}
+                {b.scanned_at && <span className="text-slate-400"> (scan {String(b.scanned_at).slice(11, 16)})</span>},
+                kandidat udara terbaik ch {b.best_channel ?? '?'}, tetangga {b.neighbours ?? 0}, interferensi{' '}
+                {b.interference_level ?? '?'}
+                {b.error && <span className="text-rose-500"> ({b.error})</span>}
+                {(() => {
+                  const lv = ((job as any).live_channels || {})[b.band];
+                  return lv && b.current_channel?.channel != null && lv.channel !== b.current_channel.channel ? (
+                    <span className="text-amber-600 font-bold"> — sekarang sudah ch {lv.channel}</span>
+                  ) : null;
+                })()}
+                {stale && (
+                  <span className="text-amber-600">
+                    {' '}— data scan {Math.round(ageMin!)} menit lalu; channel bisa sudah berubah setelah apply.
+                    Jalankan Optimize lagi untuk kondisi terkini.
+                  </span>
+                )}
+              </div>
+            );
+          })}
           <div className="text-slate-400">
             sumber: <code>/interface/wireless/scan</code> live {scanS}s — beacon tetangga + freq usage
           </div>
