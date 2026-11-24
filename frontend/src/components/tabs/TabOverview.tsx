@@ -33,7 +33,6 @@ export const TabOverview: React.FC<TabOverviewProps> = ({ system, deviceId }) =>
 
   return (
     <div className="space-y-4">
-      <WifiDiagnostics deviceId={deviceId} />
       {/* Hardware & Spec Overview Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
         {/* Device Information Card */}

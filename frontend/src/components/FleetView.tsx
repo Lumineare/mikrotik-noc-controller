@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { FleetDevice, Device } from '../types';
 import { DeviceCard } from './DeviceCard';
+import { WifiDiagnostics } from './WifiDiagnostics';
 
 interface FleetViewProps {
   fleet: FleetDevice[];
@@ -97,6 +98,8 @@ export const FleetView: React.FC<FleetViewProps> = ({
     setSelectedIds(new Set());
   };
 
+  const primaryDevice = fleet.find((d) => d.is_default) || fleet[0];
+
   return (
     <div className="space-y-4 pb-24">
       {/* Top Banner KPI */}
@@ -147,6 +150,8 @@ export const FleetView: React.FC<FleetViewProps> = ({
           </div>
         </div>
       </div>
+
+      <WifiDiagnostics deviceId={primaryDevice?.id} deviceName={primaryDevice?.name} />
 
       {/* Filter & Search Bar */}
       <div className="bg-white border border-slate-200/90 rounded-2xl p-4 space-y-3 shadow-sm">

@@ -4922,6 +4922,17 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
     samples = [s for s in db_rf_samples(dev.get("id"), limit=40000) if (s.get("ts") or 0) >= cutoff]
     retry_vals = [float(s.get("retry_pct") or 0) for s in samples]
     rssi_vals = [float(s.get("rssi")) for s in samples if s.get("rssi") is not None]
+    bands = {}
+    for bkey in ("2g", "5g"):
+        sub = [s for s in samples if (s.get("band") or "").lower().startswith(bkey)]
+        if sub:
+            rv = [float(s.get("retry_pct") or 0) for s in sub]
+            bands[bkey] = {
+                "samples": len(sub),
+                "buckets": _bucket_pct(rv, RETRY_BUCKETS),
+                "ccq_est": _bucket_pct([100.0 - float(s.get("tx_ccq") or 0) for s in sub], RETRY_BUCKETS),
+                "ccq_est_used": not any(rv),
+            }
 
     clients: list[dict] = []
     logstats = {"connected": 0, "failed": 0, "left": 0, "auth_fail": 0, "reasons": {}}
@@ -4960,11 +4971,12 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
     with_ip = sum(1 for c in clients if c["has_ip"])
     dhcp = round(100.0 * with_ip / len(clients), 1) if clients else 100.0
     live_rssi = [c["rssi"] for c in clients if c["rssi"] is not None]
-    live = sorted(live_rssi)
+    series_rssi = rssi_vals or live_rssi
+    live = sorted(series_rssi)
     median = live[len(live) // 2] if live else None
-    weak = sum(1 for v in live_rssi if v < -70)
-    weak_pct = round(100.0 * weak / len(live_rssi), 1) if live_rssi else 0.0
-    need_density = bool(live_rssi) and (median is not None and median < -67 or weak_pct > 20)
+    weak = sum(1 for v in series_rssi if v < -70)
+    weak_pct = round(100.0 * weak / len(series_rssi), 1) if series_rssi else 0.0
+    need_density = bool(series_rssi) and (median is not None and median < -67 or weak_pct > 20)
     return {
         "ok": True, "device_id": dev.get("id"), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "window_h": hours,
@@ -4975,6 +4987,7 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
             "ccq_est": _bucket_pct([100.0 - float(s.get("tx_ccq") or 0) for s in samples], RETRY_BUCKETS),
             "ccq_est_used": not any(retry_vals),
             "live": [{"mac": c["mac"], "interface": c["interface"], "retry_pct": c["retry_pct"]} for c in clients],
+            "bands": bands,
             "source": "/interface/wireless/registration-table — tx-frames-timed-out / tx frames (sampler 5 menit)",
         },
         "connectivity": {
@@ -4993,13 +5006,14 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
             "buckets": _bucket_pct(rssi_vals, RSSI_BUCKETS),
             "live": [{"mac": c["mac"], "interface": c["interface"], "rssi": c["rssi"]} for c in clients],
             "median_dbm": median, "weak_pct": weak_pct, "clients": len(live_rssi),
+            "samples": len(series_rssi),
             "source": "rf_samples (rssi) + registration-table live",
         },
         "density": {
             "need_improvement": need_density,
             "title": "Kerapatan AP perlu diperbaiki" if need_density else "Kerapatan AP memadai",
-            "detail": (f"median {median} dBm, {weak_pct}% klien di bawah -70 dBm"
-                       if live_rssi else "belum ada klien terhubung"),
+            "detail": (f"median {median} dBm, {weak_pct}% sampel di bawah -70 dBm ({len(series_rssi)} sampel)"
+                       if series_rssi else "belum ada data sinyal"),
         },
     }
 

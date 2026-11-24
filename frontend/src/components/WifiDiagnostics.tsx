@@ -16,6 +16,7 @@ interface Diag {
     ccq_est: Bucket[];
     ccq_est_used: boolean;
     live: { mac: string; interface: string; retry_pct: number }[];
+    bands?: Record<string, { samples: number; buckets: Bucket[]; ccq_est: Bucket[]; ccq_est_used: boolean }>;
     source: string;
   };
   connectivity: {
@@ -40,7 +41,8 @@ interface Diag {
 const label = (b: Bucket, unit = '%') =>
   b.hi === null ? `${b.lo}${unit}+` : `${b.lo}–${b.hi}${unit}`;
 
-const rssiLabel = (b: Bucket) => (b.hi === null ? `< ${b.lo}` : b.lo === -50 ? `≥ -50` : `${b.hi} … ${b.lo}`);
+const rssiLabel = (b: Bucket) =>
+  b.lo === -50 ? '≥ -50' : b.lo <= -200 ? '< -80' : `${b.lo} … ${b.hi}`;
 
 const barColor = (b: Bucket) => {
   if (b.lo >= 20) return 'bg-rose-500';
@@ -50,9 +52,10 @@ const barColor = (b: Bucket) => {
 
 const stageColor = (v: number) => (v >= 97 ? 'bg-emerald-500' : v >= 90 ? 'bg-amber-400' : 'bg-rose-500');
 
-export const WifiDiagnostics: React.FC<{ deviceId?: string }> = ({ deviceId }) => {
+export const WifiDiagnostics: React.FC<{ deviceId?: string; deviceName?: string }> = ({ deviceId, deviceName }) => {
   const [d, setD] = useState<Diag | null>(null);
   const [busy, setBusy] = useState(false);
+  const [band, setBand] = useState<'all' | '2g' | '5g'>('all');
 
   const load = async () => {
     setBusy(true);
@@ -81,7 +84,10 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string }> = ({ deviceId }) =
     );
   }
 
-  const bars = d.retries.ccq_est_used ? d.retries.ccq_est : d.retries.buckets;
+  const series = band === 'all' ? null : d.retries.bands?.[band];
+  const useCcq = series ? series.ccq_est_used : d.retries.ccq_est_used;
+  const bars = series ? (useCcq ? series.ccq_est : series.buckets) : d.retries.ccq_est_used ? d.retries.ccq_est : d.retries.buckets;
+  const samples = series ? series.samples : d.retries.samples;
   const maxPct = Math.max(...bars.map((b) => b.pct), 1);
   const stages = [
     ['Association', d.connectivity.association],
@@ -100,9 +106,23 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string }> = ({ deviceId }) =
           <div className="flex items-center gap-2 text-xs font-mono text-blue-700 uppercase font-bold">
             <Activity className="w-4 h-4 text-blue-600" />
             <span>AP Radio TX Retries</span>
+            {deviceName && <span className="text-[10px] normal-case font-normal text-slate-400">· {deviceName}</span>}
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[10px] font-mono text-slate-400">{d.retries.samples} sampel / {d.window_h}j</span>
+            <div className="flex items-center gap-0.5 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+              {(['2g', '5g', 'all'] as const).map((k) => (
+                <button
+                  key={k}
+                  onClick={() => setBand(k)}
+                  className={`px-2 py-0.5 rounded-md text-[10px] font-mono transition-colors ${
+                    band === k ? 'bg-white text-slate-900 font-bold shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  {k === 'all' ? 'Semua' : k === '2g' ? '2.4 GHz' : '5 GHz'}
+                </button>
+              ))}
+            </div>
+            <span className="text-[10px] font-mono text-slate-400">{samples} sampel / {d.window_h}j</span>
             <button onClick={load} className="p-1 rounded-md hover:bg-slate-100" title="Muat ulang">
               <RefreshCw className={`w-3.5 h-3.5 text-slate-400 ${busy ? 'animate-spin' : ''}`} />
             </button>
@@ -169,7 +189,7 @@ export const WifiDiagnostics: React.FC<{ deviceId?: string }> = ({ deviceId }) =
             <span>Sebaran Sinyal Klien</span>
           </div>
           <span className="text-[10px] font-mono text-slate-400">
-            median {d.signal.median_dbm ?? '-'} dBm · {d.signal.clients} klien live
+            median {d.signal.median_dbm ?? '-'} dBm / {d.window_h}j · {d.signal.clients} klien live
           </span>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-center">
