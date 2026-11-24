@@ -4366,11 +4366,11 @@ def ch_to_freq(band: str, ch: int) -> int:
     if str(band).startswith("2"):
         return 2484 if ch == 14 else 2412 + 5 * (ch - 1)
     if 36 <= ch <= 64:
-        return 5180 + 20 * (ch - 36)
+        return 5180 + 5 * (ch - 36)
     if 100 <= ch <= 144:
-        return 5500 + 20 * (ch - 100)
+        return 5500 + 5 * (ch - 100)
     if 149 <= ch <= 177:
-        return 5745 + 20 * (ch - 149)
+        return 5745 + 5 * (ch - 149)
     return 0
 
 
@@ -4643,6 +4643,7 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
     aps: list[dict] = []
     samples = 0
     unhealthy: list[dict] = []
+    sup: dict[str, dict[str, set]] = {}
 
     def gather(d):
         # monitor dibaca SEBELUM scan: /interface/wireless/scan mematikan radio
@@ -4658,6 +4659,16 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
         got = _gather_ap(d, duration)
         try:
             with get_device_lock(d["host"]), MT(d) as mt:
+                for w in wl.values():
+                    band = _band_of(w)
+                    if band not in ("2g", "5g") or w.get("master-interface") \
+                            or str(w.get("disabled")).lower() == "true":
+                        continue
+                    try:
+                        chans = get_supported_channels(mt, w)["channels"]
+                        sup.setdefault(d["id"], {})[band] = {int(c["freq"]) for c in chans}
+                    except Exception:
+                        pass
                 for a in got:
                     w = wl.get(a["interface"]) or {}
                     try:
@@ -4705,6 +4716,14 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
             samples += n
 
     allowed = rrm_allowed_freqs(cfg)
+    # Whitelist config masih bisa memuat kanal yang ditolak regulatory-domain
+    # router ini (mis. ch 149-165 di etsi) -> "bad band or frequency" saat apply.
+    # Saring dengan kanal yang benar-benar didukung SEMUA AP.
+    for band, freqs in list(allowed.items()):
+        ok = [f for f in freqs
+              if all(f in s.get(band, set()) for s in sup.values() if s.get(band))]
+        if ok:
+            allowed[band] = ok
     dca = rrm.plan_dca(aps, include_dfs=include_dfs, allowed=allowed)
     for u in unhealthy:
         if any(c.get("device_id") == u["device_id"] and c.get("interface") == u["interface"]
@@ -4838,10 +4857,21 @@ def _apply_channel_changes(changes: list[dict]) -> list[dict]:
                     wl.set(id=target[0]["id"], **{"channel-width": "20mhz",
                                                   "frequency": str(ch["to_freq"])})
                     extra["width_fallback"] = "20mhz"
-                time.sleep(3)
-                mon = _wl_monitor(mt.api, [ch["interface"]]).get(ch["interface"]) or {}
-                return {**ch, "applied": True, "verified_freq": mon.get("freq"),
-                        "status": mon.get("status"), **extra}
+                # Radio butuh ~10-20 s untuk benar-benar pindah kanal; sekali baca
+                # setelah 3 s masih menangkap frekuensi transisi ("searching-for-
+                # frequency") -> poll sampai running atau timeout, baru vonis.
+                deadline = time.time() + 22
+                mon = {}
+                while time.time() < deadline:
+                    time.sleep(3)
+                    mon = _wl_monitor(mt.api, [ch["interface"]]).get(ch["interface"]) or {}
+                    if str(mon.get("freq")) == str(ch["to_freq"]) \
+                            and "running" in str(mon.get("status") or ""):
+                        break
+                ok = str(mon.get("freq")) == str(ch["to_freq"])
+                return {**ch, "applied": ok, "verified_freq": mon.get("freq"),
+                        "status": mon.get("status"), **extra,
+                        **({} if ok else {"error": f"freq tetap {mon.get('freq')} ({mon.get('status')})"})}
 
         row = None
         for attempt in (1, 2):
