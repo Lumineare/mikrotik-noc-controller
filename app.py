@@ -5118,6 +5118,7 @@ def api_rrm_apply(req: RrmApplyReq):
         with get_device_lock(dev["host"]), MT(dev) as mt:
             return len(mt.resource("/interface/wireless/registration-table").get())
 
+
     # push sekuensial per AP — satu-satunya blast radius; abort kalau klien hilang melebihi batas
     for did, dev in devs.items():
         slice_ch = [c for c in changes if c.get("device_id") == did]
@@ -5154,11 +5155,7 @@ def api_rrm_apply(req: RrmApplyReq):
             applied_now += sum(1 for x in got if x.get("applied"))
         if not applied_now:
             continue
-        time.sleep(8)   # beri waktu klien re-associate sebelum menilai dampak
-        try:
-            after = _clients(dev)
-        except Exception:
-            after = before
+        after = _settle_clients(before, lambda: _clients(dev), max_drop)
         if before - after > max_drop:
             aborted = {"device": did, "clients_before": before, "clients_after": after,
                        "reason": f"klien turun {before - after} > batas {max_drop} — push dihentikan"}
@@ -5475,6 +5472,27 @@ def _rf_sampler_loop():
         except Exception:
             pass
         time.sleep(max(60, int(cfg.get("sample_interval_min", 5)) * 60))
+
+
+def _mean(vals):
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+def _settle_clients(before, sample, max_drop, timeout=45.0, step=3.0):
+    """Tunggu klien re-associate (radio restart 10-30 s), kembalikan hitungan
+    terakhir. Berhenti cepat begitu pulih; timeout -> nilai terakhir (drop nyata
+    tetap terdeteksi). Semua sample gagal -> before (tak ada bukti drop)."""
+    last = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(step)
+        try:
+            last = sample()
+        except Exception:
+            continue
+        if last >= before - max_drop:
+            return last
+    return before if last is None else last
 
 
 def _rrm_auto_loop():
@@ -6034,10 +6052,10 @@ def _opt_worker(job_id: str, opts: dict):
                     "applied": sum(r.get("applied") or 0 for r in ai_runs),
                     "failed": sum(r.get("failed") or 0 for r in ai_runs),
                     "per_device": ai_runs,
-                    "score_before": min((r.get("score_before") for r in ai_runs
-                                         if r.get("score_before") is not None), default=None),
-                    "score_after": min((r.get("score_after") for r in ai_runs
-                                        if r.get("score_after") is not None), default=None),
+                    "score_before": _mean([r.get("score_before") for r in ai_runs
+                                           if r.get("score_before") is not None]),
+                    "score_after": _mean([r.get("score_after") for r in ai_runs
+                                          if r.get("score_after") is not None]),
                     "run_id": ", ".join(r.get("run_id") for r in ai_runs if r.get("run_id")) or None,
                 }
             job["details"]["deliver"] = res
