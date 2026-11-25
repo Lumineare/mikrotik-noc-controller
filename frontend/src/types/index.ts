@@ -44,6 +44,7 @@ export interface FleetDevice {
   version: string;
   uptime: string;
   cpu_load: number;
+  clients_count?: number | null;
   error?: string;
 }
 

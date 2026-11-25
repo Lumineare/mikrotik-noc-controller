@@ -1,4 +1,4 @@
-# MikroTik NOC Fleet Controller
+# MikroTik Controller
 
 Dashboard manajemen armada Access Point MikroTik untuk NOC rumah sakit / kampus.
 Semua komunikasi ke router lewat **native RouterOS API socket port 8728** — tanpa
@@ -13,39 +13,46 @@ REST API router, tanpa SSH, tanpa Telnet.
 
 ## Fitur
 
-### Monitoring & Telemetri
-- **Probe armada paralel** — 80+ AP diprobe serentak (30 worker, timeout 1.2 s) dan
-  membaca data nyata dari `/system/resource`: `cpu-load`, `board-name`, `version`, `uptime`.
-- **Riwayat SQLite** — `noc_history.db` menyimpan `alert_history` dan `fleet_telemetry`
-  sehingga tren CPU/uptime dan riwayat alert tetap ada setelah restart.
-- **Alert Telegram** — notifikasi down / recovery / CPU tinggi / RF conflict, dengan
-  bot token yang **tidak pernah dikirim ke browser** (hanya versi masked).
+### Monitoring, Telemetri & Manajemen Armada
+- **Probe armada paralel** — 80+ AP diprobe serentak (30 worker, timeout 1.8 s) dan membaca data nyata dari `/system/resource` (`cpu-load`, `board-name`, `version`, `uptime`) sekaligus **jumlah klien Wi-Fi live** dari `/interface/wireless/registration-table` (dengan fallback `/interface/wifi/registration-table`).
+- **Tampilan Grid & Tabel Padat** — kartu perangkat ringkas (klik kartu langsung buka dashboard router) atau mode tabel padat dengan preferensi tersimpan lokal.
+- **Filter & Pengurutan Cepat** — filter **Semua / Online / High CPU / 0 Klien / Offline**, filter ruangan/grup, serta pengurutan **Bermasalah dulu**, **Klien terbanyak**, **Klien tersedikit (0 dulu)**, **CPU tertinggi**, **Nama A-Z**, dan **IP Address**.
+- **Riwayat SQLite** — `noc_history.db` menyimpan `alert_history`, `fleet_telemetry`, dan `rf_samples` sehingga tren CPU, uptime, kualitas sinyal, dan riwayat alert tetap ada setelah restart.
+- **Alert Telegram** — notifikasi down / recovery / CPU tinggi / RF conflict, dengan bot token yang **tidak pernah dikirim ke browser** (hanya versi masked).
 
-### Wireless
-- Kelola SSID & Virtual AP: tambah, edit, hapus, enable/disable.
-- **Daftar channel real dari router** — dibaca via
-  `/interface/wireless/info/country-info` sehingga dropdown hanya menampilkan
-  frekuensi yang benar-benar diterima regulatory domain perangkat
-  (contoh `country=indonesia` → Ch 149/153/157/161/165 untuk 5 GHz).
-- Validasi frekuensi sebelum menulis ke router, dengan pesan error yang menyebut
-  channel mana saja yang tersedia — bukan `internal error`.
-- Security profile management (WPA2-PSK), kick client, VLAN tagging per SSID.
+### Fleet Wi-Fi Sync (Sinkronisasi SSID & Password Massal)
+- **Scan SSID Armada** — memindai paralel seluruh SSID aktif di semua AP lengkap dengan jumlah AP, band, dan profil keamanan.
+- **3 Mode Aksi Massal** — **Ganti Password Wi-Fi** (rotasi WPA2-PSK), **Tambah SSID Baru** (Virtual AP 2.4/5 GHz, Open/WPA2-PSK, Hide SSID, VLAN tagging, otomatis masuk bridge), dan **Ganti Nama SSID**.
+- **Proteksi Shared Profile** — jika SSID memakai profil `default` atau berbagi profil dengan SSID lain, backend otomatis membuat profil khusus (`sec-<ssid>`) agar SSID lain tidak ikut berubah.
+- **Mode Preview (Dry-Run)** — simulasi hasil per AP sebelum menulis ke router, dengan isolasi error per perangkat.
 
-### RF & Denah
-- **Scan spektrum RF** dengan skor kualitas per channel, rekomendasi channel
-  terbaik, dan daftar BSSID tetangga.
-- Fallback otomatis ke `frequency-monitor` (data identik dengan "Freq. Usage"
-  Winbox) saat radio sedang dipakai tool lain.
-- **Deteksi Rogue AP / Evil Twin** — BSSID hasil scan dicocokkan dengan cache
-  seluruh MAC radio resmi armada; SSID yang menyerupai jaringan internal tapi
-  BSSID-nya asing akan ditandai dan dicatat sebagai alert.
-- **Denah & heatmap interaktif** — penempatan AP per lantai, radius coverage,
-  sinkronisasi channel langsung ke hardware dari popover marker.
+### AI NOC Chatbot & Asisten Troubleshooting
+- **Chatbot NOC Berkonteks Telemetri Live** (`POST /api/ai/chat`) — terhubung ke **OmniRoute** / endpoint OpenAI-compatible dengan pilihan model langsung dari UI (`GET /api/ai/models`).
+- **Konteks Router Real-Time** — setiap pertanyaan otomatis dilengkapi data live router terpilih: CPU load, free RAM, free flash NAND storage, konfigurasi radio wireless (SSID, band, frekuensi, channel width), jumlah klien & klien sinyal lemah (`< -75 dBm`), status service (`telnet`/`ftp`), dan status FastTrack firewall.
+- **Rekomendasi Praktis + Sintaks CLI** — membantu analisis masalah jaringan rumah sakit secara cepat dalam bahasa Indonesia lengkap dengan perintah CLI MikroTik yang siap pakai.
+- **AI Diagnose & ML Anomaly** — pemindaian masalah otomatis + aksi perbaikan cepat (`/api/ai/diagnose`, `/api/ai/apply`) serta deteksi anomali berbasis `scikit-learn` (`/api/ai/ml/anomaly`).
 
-### Lainnya
-- Web terminal, ping diagnostik, firewall/NAT viewer, router logs, ARP/network.
-- AI Optimizer dengan endpoint OpenAI-compatible (model bisa dipilih).
-- Backup, export konfigurasi, batch script lintas perangkat.
+### AI Optimize & Auto-RRM (OmniRoute + DCA / TPC)
+- **Optimasi Radio Lintas Armada** — menggabungkan perhitungan channel/power bersama (**DCA / TPC / Band Steering**) dengan perencanaan **OmniRoute AI** (endpoint OpenAI-compatible).
+- **Validasi Regulatory Domain & Auto-Fallback** — setiap kandidat frekuensi diverifikasi terhadap `supported_freqs` per AP; jika router menolak frekuensi (`bad band or frequency`), sistem otomatis fallback ke channel valid terdekat dari router.
+- **Safety Guard & Rollback** — push dilakukan sekuensial per AP; jika jumlah klien turun melebihi batas (`max_client_drop`), proses berhenti dan konfigurasi AP dikembalikan otomatis.
+- **Detail Transparan** — modal **AI Optimize** menampilkan ringkasan hasil yang bisa dilipat, detail perubahan per radio, serta alasan mengapa AP tertentu tidak diubah.
+
+### Diagnostik Wi-Fi Armada
+- **Link Quality (`100 - CCQ`)** — mendukung mode **Semua AP (Armada)** maupun per-AP dengan filter band (`2.4 GHz`, `5 GHz`, `Semua`) dan daftar klien dengan tekanan link tertinggi.
+- **AP Deployment Density** — visualisasi distribusi rata-rata sinyal klien (RSSI) seluruh AP lengkap dengan filter zona (**Baik ≥ -65 dBm**, **Sedang -65…-75 dBm**, **Lemah < -75 dBm**), pencarian AP, dan daftar 3 kolom.
+
+### Pelacak Klien & Roaming
+- Pencarian klien real-time lintas seluruh armada AP berdasarkan MAC, IP, vendor OUI, atau nama perangkat kustom (`client_hostnames.json`), lengkap dengan pelacakan perpindahan AP (*roaming*).
+
+### Wireless, RF & Denah
+- Kelola SSID & Virtual AP per router: tambah, edit, hapus, enable/disable, kick client, VLAN tagging, dan security profile.
+- **Daftar channel real dari router** — dibaca via `/interface/wireless/info/country-info` sehingga dropdown hanya menampilkan frekuensi yang valid untuk regulatory domain perangkat (mis. `country=indonesia` → Ch 149/153/157/161/165 untuk 5 GHz).
+- **Scan spektrum RF** dengan skor kualitas per channel, fallback otomatis ke `frequency-monitor`, serta **Deteksi Rogue AP / Evil Twin**.
+- **Denah & heatmap interaktif** — penempatan AP per lantai, radius coverage, dan sinkronisasi channel langsung ke hardware dari popover marker.
+
+### Utilitas NOC Lainnya
+- Web terminal, ping diagnostik, firewall/NAT viewer, router logs, ARP/network, backup/export konfigurasi, dan **Batch Script** lintas perangkat terpilih.
 
 ---
 
@@ -53,7 +60,7 @@ REST API router, tanpa SSH, tanpa Telnet.
 
 | Lapisan | Teknologi |
 |---|---|
-| Backend | Python 3.14, FastAPI, Uvicorn, `routeros-api`, SQLite |
+| Backend | Python 3.14, FastAPI, Uvicorn, `routeros-api`, `scikit-learn`, `numpy`, SQLite |
 | Frontend | React 19, TypeScript, Vite 6, Tailwind CSS 3, lucide-react |
 | Aset | Font Inter & JetBrains Mono + ikon di-bundle lokal — **nol CDN**, aman untuk jaringan tertutup |
 
@@ -122,14 +129,15 @@ npm install
 npm run build      # hasil ke frontend/dist, disajikan otomatis oleh FastAPI
 ```
 
-### 4. Jalankan
+### 4. Verifikasi & Jalankan
 
 ```bash
+python selfcheck.py
 python app.py
 # atau: start.bat  (Windows)
 ```
 
-Buka http://127.0.0.1:8090
+Buka `http://127.0.0.1:8090`
 
 ---
 
@@ -162,10 +170,11 @@ Cek channel yang didukung:
 
 ```
 .
-├── app.py                     # FastAPI: seluruh endpoint + logika RouterOS
+├── app.py                     # FastAPI: seluruh endpoint, RRM/OmniRoute, Fleet Wi-Fi Sync & RouterOS
 ├── mt_client.py               # Helper koneksi RouterOS API
+├── selfcheck.py               # Verifikasi cepat integritas backend & modul
 ├── requirements.txt
-├── .env.example               # template kredensial
+├── .env.example               # template kredensial & profil NOC
 ├── devices.example.json       # template daftar perangkat
 ├── floors.example.json        # template denah & penempatan AP
 ├── templates/index.html       # UI legacy (single-file)
@@ -173,18 +182,26 @@ Cek channel yang didukung:
 └── frontend/
     └── src/
         ├── api/client.ts      # typed API client
-        ├── components/        # FleetView, DeviceWorkspace, tabs/, map/
+        ├── components/        # FleetView, DeviceCard, FleetWifiSyncModal, WifiDiagnostics, tabs/, map/
         └── types/index.ts
 ```
 
-### Endpoint penting
+### Endpoint Penting
 
 | Method | Path | Fungsi |
 |---|---|---|
 | GET | `/health` | Status backend & perangkat default |
-| POST | `/api/auth/login` | Login dashboard |
-| POST | `/api/fleet/probe` | Probe seluruh armada paralel |
-| GET | `/api/wireless/interfaces` | Daftar SSID / virtual AP |
+| POST | `/api/auth/login` | Login dashboard (kredensial dari `.env`) |
+| GET | `/api/fleet` | Status armada, CPU, uptime & jumlah klien Wi-Fi live |
+| POST | `/api/fleet/probe` | Paksa probe ulang seluruh armada paralel |
+| GET | `/api/fleet/wifi/ssids` | Pindai paralel seluruh SSID aktif lintas armada |
+| POST | `/api/fleet/wifi/sync` | Rotasi password, tambah SSID, atau rename SSID massal (+ `dry_run`) |
+| GET | `/api/wifi/diagnostics` | Link Quality (`100 - CCQ`) & AP Deployment Density (`device=all` atau per-AP) |
+| POST | `/api/ai/chat` | Chatbot AI NOC dengan konteks telemetri live router |
+| GET | `/api/ai/diagnose` | Diagnosa otomatis kesehatan & keamanan router |
+| GET | `/api/ai/models` | Daftar model LLM tersedia dari OmniRoute |
+| POST | `/api/optimize/fleet` | Jalankan AI Optimize / Auto-RRM lintas armada |
+| GET | `/api/wireless/interfaces` | Daftar SSID / virtual AP per router |
 | GET | `/api/wireless/supported-channels` | Channel valid menurut regulatory domain router |
 | POST | `/api/wireless/interfaces/update` | Simpan konfigurasi wireless |
 | GET | `/api/rf/scan` | Scan spektrum + skor channel + deteksi rogue |

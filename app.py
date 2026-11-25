@@ -1370,7 +1370,17 @@ def index():
 FLEET_CACHE = {
     "last_probe": 0.0,
     "devices": [],
-    "summary": {"total": 0, "online": 0, "offline": 0, "avg_cpu": 0, "max_cpu": 0, "high_cpu_count": 0},
+    "summary": {
+        "total": 0,
+        "online": 0,
+        "offline": 0,
+        "avg_cpu": 0,
+        "max_cpu": 0,
+        "high_cpu_count": 0,
+        "total_clients": 0,
+        "zero_client_aps": 0,
+        "overload_aps": 0,
+    },
 }
 FLEET_LOCK = threading.Lock()
 LAST_TELEMETRY_RECORD = 0.0
@@ -1393,8 +1403,10 @@ def probe_fleet() -> dict:
             board = "MikroTik"
             version = "ROS v7"
             uptime = "-"
+            clients_count: int | None = None
 
             # Fast probe via native routeros_api socket
+            pool = None
             try:
                 pool = routeros_api.RouterOsApiPool(
                     host,
@@ -1403,16 +1415,25 @@ def probe_fleet() -> dict:
                     port=port,
                     plaintext_login=True,
                 )
-                pool.set_timeout(1.2)
+                pool.set_timeout(1.8)
                 api = pool.get_api()
                 res = api.get_resource("/system/resource").get()
-                pool.disconnect()
                 if res:
                     online = True
                     cpu_load = int(res[0].get("cpu-load", 0))
                     board = res[0].get("board-name", "cAP ac")
                     version = res[0].get("version", "ROS v7")
                     uptime = res[0].get("uptime", "-")
+                    # Fetch live Wi-Fi client count on the same open API connection
+                    try:
+                        reg = api.get_resource("/interface/wireless/registration-table").get()
+                        clients_count = len(reg)
+                    except Exception:
+                        try:
+                            reg2 = api.get_resource("/interface/wifi/registration-table").get()
+                            clients_count = len(reg2)
+                        except Exception:
+                            clients_count = None
             except Exception:
                 # Fallback: simple TCP socket connect to confirm port is open even if auth failed
                 try:
@@ -1425,6 +1446,12 @@ def probe_fleet() -> dict:
                 except Exception:
                     online = False
                     uptime = "Offline"
+            finally:
+                if pool is not None:
+                    try:
+                        pool.disconnect()
+                    except Exception:
+                        pass
 
             return {
                 **sanitized,
@@ -1434,6 +1461,7 @@ def probe_fleet() -> dict:
                 "uptime": uptime,
                 "version": version,
                 "board": board,
+                "clients_count": clients_count,
             }
 
         with ThreadPoolExecutor(max_workers=30) as pool:
@@ -1446,6 +1474,10 @@ def probe_fleet() -> dict:
         avg_cpu = round(sum(cpus) / len(cpus), 1) if cpus else 0
         max_cpu = max(cpus) if cpus else 0
         high_cpu_count = sum(1 for c in cpus if c >= 70)
+        client_vals = [d["clients_count"] for d in online_devs if d.get("clients_count") is not None]
+        total_clients = sum(client_vals)
+        zero_client_aps = sum(1 for c in client_vals if c == 0)
+        overload_aps = sum(1 for c in client_vals if c >= 35)
 
         FLEET_CACHE["last_probe"] = time.time()
         FLEET_CACHE["devices"] = probed
@@ -1456,6 +1488,9 @@ def probe_fleet() -> dict:
             "avg_cpu": avg_cpu,
             "max_cpu": max_cpu,
             "high_cpu_count": high_cpu_count,
+            "total_clients": total_clients,
+            "zero_client_aps": zero_client_aps,
+            "overload_aps": overload_aps,
         }
 
         # Save snapshot to SQLite once every 60s
@@ -5657,6 +5692,24 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
         "devices_scanned": len(devs),
         "bands_seen": len(aps),
         "samples_collected": samples,
+        "engine": "rrm_engine.py",
+        "allowed": allowed,
+        "supported_freqs": {
+            did: {b: sorted(int(f) for f in fs) for b, fs in bm.items()}
+            for did, bm in sup.items()
+        },
+        "radios": [
+            {
+                "device_id": a.get("device_id"),
+                "interface": a.get("interface"),
+                "band": a.get("band"),
+                "freq": a.get("freq"),
+                "tx_power": a.get("tx_power"),
+                "supported_freqs": sorted(int(f) for f in (sup.get(a.get("device_id") or "", {}).get(a.get("band") or "", set()))),
+            }
+            for a in aps
+        ],
+        "unhealthy": unhealthy,
         "dca": dca,
         "tpc": tpc,
         "steering": steering,
@@ -5671,6 +5724,267 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
             "actionable": bool(dca["changes"] or tpc or steering or roam),
         },
     }
+
+
+def _extract_json_object(text: str) -> dict | None:
+    if not text:
+        return None
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        obj = json.loads(s[start:end + 1])
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def plan_rrm_via_omniroute(
+    base_plan: dict,
+    scans: list[dict],
+    critical: list[dict],
+    issues: list[dict],
+    dev_filter: str | None = None,
+) -> tuple[dict, dict]:
+    """Minta OmniRoute LLM menyusun rencana optimasi channel & TX power dari data scan real,
+    lalu validasi ketat terhadap daftar frekuensi legal perangkat agar aman di-push ke MikroTik."""
+    cfg = load_ai_config()
+    model_name = (cfg.get("model") or "auto/best-chat").strip()
+    base_url = cfg.get("base_url", "https://api.example.com/v1").rstrip("/")
+    api_key = cfg.get("api_key") or DEFAULT_AI_CONFIG["api_key"]
+    endpoint = f"{base_url}/chat/completions"
+
+    allowed = base_plan.get("allowed") or rrm_allowed_freqs(load_rrm_cfg())
+    radios = base_plan.get("radios") or []
+    if dev_filter:
+        radios = [r for r in radios if r.get("device_id") == dev_filter]
+    radio_map = {(r.get("device_id"), r.get("interface")): r for r in radios}
+
+    scan_summary = [
+        {
+            "device": s.get("device"),
+            "band": s.get("band"),
+            "cur_ch": (s.get("current_channel") or {}).get("channel"),
+            "cur_freq": (s.get("current_channel") or {}).get("freq"),
+            "best_ch": s.get("best_channel"),
+            "neighbours": s.get("neighbours"),
+            "interference": s.get("interference_level"),
+        }
+        for s in (scans or [])
+        if not s.get("error") and (not dev_filter or s.get("device") == dev_filter)
+    ]
+
+    prompt_data = {
+        "scope": dev_filter or "fleet",
+        "allowed_freqs_mhz": allowed,
+        "radios": radios[:60],
+        "scans": scan_summary[:80],
+        "critical_aps": [
+            {"device": c.get("device"), "clients": c.get("clients"), "cpu": c.get("cpu_load")}
+            for c in (critical or [])
+            if not c.get("error") and (not dev_filter or c.get("device") == dev_filter)
+        ][:60],
+        "roaming_issues_count": len(issues or []),
+    }
+
+    system_prompt = (
+        "Kamu adalah MikroTik Wireless RRM Engineer untuk jaringan rumah sakit. "
+        "Tugasmu menentukan penataan channel (frekuensi MHz) dan TX power (dBm) optimal dari data scan real. "
+        "ATURAN KETAT:\n"
+        "1. Balas HANYA dengan objek JSON valid tanpa teks lain.\n"
+        "2. Setiap to_freq WAJIB ada di dalam supported_freqs milik radio tersebut (jika tidak kosong) "
+        "DAN ada di allowed_freqs_mhz untuk band-nya (2g atau 5g). JANGAN pernah memilih frekuensi di luar supported_freqs AP.\n"
+        "3. Usulkan perubahan HANYA jika memang mengurangi interferensi / memperbaiki kanal; "
+        "jika AP sudah optimal, jangan masukkan ke channel_changes.\n"
+        "4. txpower_changes opsional (to_dbm antara 10 dan 22).\n"
+        "Format JSON:\n"
+        '{"rationale":"ringkasan singkat bahasa Indonesia","expected_gain_pct":15,'
+        '"channel_changes":[{"device_id":"...","interface":"wlan1","band":"2g","to_freq":2437,"reason":"..."}],'
+        '"txpower_changes":[{"device_id":"...","interface":"wlan1","band":"2g","to_dbm":16,"reason":"..."}]}'
+    )
+    user_msg = json.dumps(prompt_data, ensure_ascii=False)
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ],
+        "max_tokens": max(int(cfg.get("max_tokens", 750) or 750), 2200),
+        "temperature": 0.2,
+    }
+
+    parsed = None
+    last_err = None
+    for attempt in range(1, 3):
+        try:
+            req = urllib.request.Request(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Content-Type": "application/json",
+                },
+                data=json.dumps(payload).encode("utf-8"),
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                content = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                parsed = _extract_json_object(content)
+                if parsed is not None:
+                    break
+                last_err = "respons OmniRoute bukan JSON valid"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            print(f"[RRM-OmniRoute] attempt {attempt}/2 failed ({model_name}): {e}")
+
+    if parsed is None:
+        meta = {
+            "engine": f"rrm_engine.py (fallback OmniRoute: {last_err})",
+            "used_omniroute": False,
+            "model": model_name,
+            "error": last_err,
+            "rationale": None,
+            "rejected": [],
+        }
+        return base_plan, meta
+
+    rejected: list[str] = []
+    valid_ch: list[dict] = []
+    seen_ch: set[tuple[str, str]] = set()
+    for item in (parsed.get("channel_changes") or []):
+        if not isinstance(item, dict):
+            continue
+        did = str(item.get("device_id") or "").strip()
+        iface = str(item.get("interface") or "").strip()
+        radio = radio_map.get((did, iface))
+        if not radio:
+            rejected.append(f"{did}/{iface}: interface tidak ditemukan")
+            continue
+        band = str(item.get("band") or radio.get("band") or "").strip()
+        allowed_band = [int(f) for f in (allowed.get(band) or [])]
+        radio_sup = [int(f) for f in (radio.get("supported_freqs") or [])]
+        if radio_sup:
+            # Saring ke frekuensi yang benar-benar didukung regulatory domain AP ini
+            intersect = [f for f in allowed_band if f in radio_sup]
+            valid_pool = intersect if intersect else radio_sup
+        else:
+            valid_pool = allowed_band
+        raw_freq = item.get("to_freq")
+        try:
+            to_freq = int(raw_freq)
+        except (TypeError, ValueError):
+            to_freq = 0
+        if to_freq not in valid_pool:
+            # Jika LLM mengirim nomor channel (mis. 6 atau 149), konversi ke MHz
+            try:
+                conv = rrm.ch_to_freq(to_freq, band)
+                if conv in valid_pool:
+                    to_freq = conv
+            except Exception:
+                pass
+        if to_freq not in valid_pool:
+            rejected.append(f"{did}/{iface}: freq {raw_freq} tidak didukung regulatory domain AP ini ({valid_pool[:6]})")
+            continue
+        from_freq = int(radio.get("freq") or 0)
+        if to_freq == from_freq and from_freq > 0:
+            continue
+        if (did, iface) in seen_ch:
+            continue
+        seen_ch.add((did, iface))
+        valid_ch.append({
+            "device_id": did,
+            "interface": iface,
+            "band": band,
+            "from_freq": from_freq,
+            "to_freq": to_freq,
+            "reason": str(item.get("reason") or f"Rekomendasi OmniRoute ({model_name})"),
+            "omniroute": True,
+            "repair": from_freq == 0,
+            "interference_before_mw": 0.0,
+            "interference_after_mw": 0.0,
+            "relief_pct": 0.0,
+        })
+
+    # Pertahankan perbaikan wajib untuk radio unhealthy yang tidak running
+    for c in (base_plan.get("dca") or {}).get("changes") or []:
+        if c.get("repair") and (c.get("device_id"), c.get("interface")) not in seen_ch:
+            if not dev_filter or c.get("device_id") == dev_filter:
+                valid_ch.append(c)
+                seen_ch.add((c.get("device_id"), c.get("interface")))
+
+    valid_tpc: list[dict] = []
+    seen_tpc: set[tuple[str, str]] = set()
+    for item in (parsed.get("txpower_changes") or []):
+        if not isinstance(item, dict):
+            continue
+        did = str(item.get("device_id") or "").strip()
+        iface = str(item.get("interface") or "").strip()
+        radio = radio_map.get((did, iface))
+        if not radio:
+            continue
+        try:
+            to_dbm = int(round(float(item.get("to_dbm"))))
+        except (TypeError, ValueError):
+            continue
+        if not (8 <= to_dbm <= 24):
+            rejected.append(f"{did}/{iface}: tx-power {to_dbm} dBm di luar batas aman 8..24")
+            continue
+        from_dbm = radio.get("tx_power")
+        if from_dbm is not None and int(round(float(from_dbm))) == to_dbm:
+            continue
+        if (did, iface) in seen_tpc:
+            continue
+        seen_tpc.add((did, iface))
+        valid_tpc.append({
+            "device_id": did,
+            "interface": iface,
+            "band": str(item.get("band") or radio.get("band") or ""),
+            "from_dbm": from_dbm,
+            "to_dbm": to_dbm,
+            "reason": str(item.get("reason") or f"Rekomendasi OmniRoute ({model_name})"),
+            "omniroute": True,
+        })
+
+    try:
+        gain_pct = float(parsed.get("expected_gain_pct"))
+    except (TypeError, ValueError):
+        gain_pct = float((base_plan.get("dca") or {}).get("gain_pct") or 0.0)
+    if valid_ch and gain_pct <= 0:
+        gain_pct = max(float(load_rrm_cfg().get("min_gain_pct", 15)), 15.0)
+
+    new_plan = dict(base_plan)
+    new_plan["engine"] = f"OmniRoute ({model_name})"
+    new_plan["omniroute_rationale"] = str(parsed.get("rationale") or "").strip()
+    new_plan["dca"] = {
+        **(base_plan.get("dca") or {}),
+        "changes": valid_ch,
+        "gain_pct": round(gain_pct, 1),
+        "engine": f"OmniRoute ({model_name})",
+    }
+    new_plan["tpc"] = valid_tpc
+    new_plan["summary"] = {
+        **(base_plan.get("summary") or {}),
+        "channel_changes": len(valid_ch),
+        "repairs": len([c for c in valid_ch if c.get("repair")]),
+        "txpower_changes": len(valid_tpc),
+        "expected_gain_pct": round(gain_pct, 1),
+        "actionable": bool(valid_ch or valid_tpc or base_plan.get("steering") or base_plan.get("roam")),
+    }
+    meta = {
+        "engine": f"OmniRoute ({model_name})",
+        "used_omniroute": True,
+        "model": model_name,
+        "error": None,
+        "rationale": new_plan["omniroute_rationale"],
+        "rejected": rejected,
+    }
+    return new_plan, meta
 
 
 # ---------- apply / rollback ----------
@@ -5721,17 +6035,54 @@ def _apply_channel_changes(changes: list[dict]) -> list[dict]:
                 if ch.get("fix_width"):
                     wl.set(id=target[0]["id"], **{"channel-width": ch["fix_width"]})
                 extra = {}
+                actual_freq = int(ch["to_freq"])
                 try:
-                    wl.set(id=target[0]["id"], frequency=str(ch["to_freq"]))
+                    wl.set(id=target[0]["id"], frequency=str(actual_freq))
                 except Exception as e:
                     if "bad band or frequency" not in str(e):
                         raise
-                    # Lebar channel tak didukung di channel tujuan (country=etsi:
-                    # 80MHz hanya legal di 5470-5725, jadi ch36 ditolak). Sempitkan
-                    # ke 20MHz — lebih baik radio hidup 20MHz daripada gagal total.
-                    wl.set(id=target[0]["id"], **{"channel-width": "20mhz",
-                                                  "frequency": str(ch["to_freq"])})
-                    extra["width_fallback"] = "20mhz"
+                    # 1) Coba sempitkan ke 20MHz dulu pada frekuensi target
+                    try:
+                        wl.set(id=target[0]["id"], **{"channel-width": "20mhz",
+                                                      "frequency": str(actual_freq)})
+                        extra["width_fallback"] = "20mhz"
+                    except Exception as e2:
+                        if "bad band or frequency" not in str(e2):
+                            raise
+                        # 2) Frekuensi ditolak regulatory domain AP (mis. 5180 di country=indonesia):
+                        # baca daftar channel legal langsung dari router & fallback otomatis ke kanal legal terbaik.
+                        sup_info = get_supported_channels(mt, target[0])
+                        sup_list = sup_info.get("channels") or []
+                        non_dfs = [int(c["freq"]) for c in sup_list if not c.get("is_dfs") and c.get("freq")]
+                        all_sup = [int(c["freq"]) for c in sup_list if c.get("freq")]
+                        pool = non_dfs or all_sup
+                        band_cfg = rrm_allowed_freqs(load_rrm_cfg()).get(ch.get("band") or "") or []
+                        preferred = [f for f in pool if f in band_cfg] or pool
+                        from_f = int(ch.get("from_freq") or 0)
+                        # Utamakan kanal legal berbeda dari frekuensi lama agar tetap teroptimasi
+                        ordered = [f for f in preferred if f != from_f] + ([from_f] if from_f in preferred else [])
+                        switched = False
+                        for cand in ordered:
+                            try:
+                                wl.set(id=target[0]["id"], frequency=str(cand))
+                                actual_freq = cand
+                                switched = True
+                                break
+                            except Exception:
+                                try:
+                                    wl.set(id=target[0]["id"], **{"channel-width": "20mhz", "frequency": str(cand)})
+                                    actual_freq = cand
+                                    extra["width_fallback"] = "20mhz"
+                                    switched = True
+                                    break
+                                except Exception:
+                                    continue
+                        if not switched:
+                            raise
+                        extra["requested_freq"] = ch["to_freq"]
+                        extra["fallback_reason"] = (
+                            f"Fallback ke {actual_freq} MHz ({ch['to_freq']} MHz tidak didukung regulatory domain AP ini)"
+                        )
                 # Radio butuh ~10-20 s untuk benar-benar pindah kanal; sekali baca
                 # setelah 3 s masih menangkap frekuensi transisi ("searching-for-
                 # frequency") -> poll sampai running atau timeout, baru vonis.
@@ -5740,11 +6091,13 @@ def _apply_channel_changes(changes: list[dict]) -> list[dict]:
                 while time.time() < deadline:
                     time.sleep(3)
                     mon = _wl_monitor(mt.api, [ch["interface"]]).get(ch["interface"]) or {}
-                    if str(mon.get("freq")) == str(ch["to_freq"]) \
+                    if str(mon.get("freq")) == str(actual_freq) \
                             and "running" in str(mon.get("status") or ""):
                         break
-                ok = str(mon.get("freq")) == str(ch["to_freq"])
-                return {**ch, "applied": ok, "verified_freq": mon.get("freq"),
+                ok = str(mon.get("freq")) == str(actual_freq)
+                reason_out = extra.get("fallback_reason") or ch.get("reason")
+                return {**ch, "to_freq": actual_freq, "reason": reason_out,
+                        "applied": ok, "verified_freq": mon.get("freq"),
                         "status": mon.get("status"), **extra,
                         **({} if ok else {"error": f"freq tetap {mon.get('freq')} ({mon.get('status')})"})}
 
@@ -5904,13 +6257,15 @@ def api_rrm_apply(req: RrmApplyReq):
     ch_skip = None
     changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
     if only:
-        # Optimasi channel tetap fleet-only (joint coloring lintas AP), TAPI
-        # perbaikan (radio mati / channel di luar rencana) harus tetap dikirim
-        # walau user menekan "Optimize AP" untuk satu AP — kalau tidak, klik
-        # Optimize AP tidak pernah memperbaiki apa pun.
-        changes = [c for c in changes if c.get("repair") or not c.get("from_freq")]
-        ch_skip = (f"channel optimasi dikelola global (fleet) — AP {only} "
-                   f"hanya dikirimi perbaikan + TX power/steering")
+        # Optimasi channel default-nya fleet-only, kecuali perbaikan atau
+        # rekomendasi eksplisit dari OmniRoute untuk AP ini.
+        omni_ch = [c for c in changes if c.get("omniroute")]
+        if omni_ch:
+            changes = [c for c in changes if c.get("omniroute") or c.get("repair") or not c.get("from_freq")]
+        else:
+            changes = [c for c in changes if c.get("repair") or not c.get("from_freq")]
+            ch_skip = (f"channel optimasi dikelola global (fleet) — AP {only} "
+                       f"hanya dikirimi perbaikan + TX power/steering")
     # Radio tanpa channel eksplisit (from_freq 0) = perbaikan, bukan optimasi:
     # gate gain tidak berlaku, kalau tidak radio 'auto' selamanya dibiarkan.
     repairs = [c for c in changes if c.get("repair") or not c.get("from_freq")]
@@ -6151,9 +6506,13 @@ def _worst_link_clients(samples: list[dict], top: int = 5) -> list[dict]:
 
 @app.get("/api/wifi/diagnostics")
 def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1, le=168)):
-    dev = get_device(device)
+    is_fleet = not device or str(device).strip().lower() in ("all", "fleet")
+    dev = None if is_fleet else get_device(device)
     cutoff = time.time() - hours * 3600
-    samples = [s for s in db_rf_samples(dev.get("id"), limit=40000) if (s.get("ts") or 0) >= cutoff]
+    samples = [
+        s for s in db_rf_samples(None if is_fleet else dev.get("id"), limit=80000 if is_fleet else 40000)
+        if (s.get("ts") or 0) >= cutoff
+    ]
     def _quality(sub: list[dict]) -> dict:
         """Tekanan link = 100 - tx-ccq. Driver legacy cAP ac selalu melaporkan
         tx-frames-timed-out = 0, jadi retry hardware tak bisa diukur di sini."""
@@ -6169,20 +6528,21 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
             bands[bkey] = _quality(sub)
 
     clients: list[dict] = []
-    try:
-        with get_device_lock(dev["host"]), MT(dev) as mt:
-            reg = mt.resource("/interface/wireless/registration-table").get()
-            for c in reg:
-                rssi = _sig_dbm(c.get("signal-strength"))
-                try:
-                    ccq_pct = round(100.0 - float(c.get("tx-ccq") or 0), 1)
-                except (TypeError, ValueError):
-                    ccq_pct = None
-                clients.append({"mac": c.get("mac-address"), "interface": c.get("interface"),
-                                "rssi": rssi, "ccq_pct": ccq_pct,
-                                "has_ip": bool(c.get("last-ip")), "uptime": c.get("uptime")})
-    except Exception as e:
-        return {"ok": False, "error": str(e), "device_id": dev.get("id")}
+    if not is_fleet and dev:
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                reg = mt.resource("/interface/wireless/registration-table").get()
+                for c in reg:
+                    rssi = _sig_dbm(c.get("signal-strength"))
+                    try:
+                        ccq_pct = round(100.0 - float(c.get("tx-ccq") or 0), 1)
+                    except (TypeError, ValueError):
+                        ccq_pct = None
+                    clients.append({"mac": c.get("mac-address"), "interface": c.get("interface"),
+                                    "rssi": rssi, "ccq_pct": ccq_pct,
+                                    "has_ip": bool(c.get("last-ip")), "uptime": c.get("uptime")})
+        except Exception as e:
+            return {"ok": False, "error": str(e), "device_id": dev.get("id")}
 
     per_mac: dict[str, list[float]] = {}
     for s in samples:
@@ -6200,12 +6560,15 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
     weak_pct = round(100.0 * weak / len(series_rssi), 1) if series_rssi else 0.0
     need_density = bool(series_rssi) and (median is not None and median < -67 or weak_pct > 20)
     aps = _fleet_ap_coverage(cutoff)
+    total_clients = sum(a.get("clients") or 0 for a in aps) if is_fleet else len(live_rssi)
     bad = [a for a in aps if a["median_dbm"] is not None and (a["median_dbm"] < -67 or (a["weak_pct"] or 0) > 20)]
     need_density = bool(bad) or need_density
-    bad_names = ", ".join(a["name"] for a in bad)
     bad_med = min([a["median_dbm"] for a in bad], default=None)
+    measured_cnt = len([a for a in aps if a["median_dbm"] is not None])
     return {
-        "ok": True, "device_id": dev.get("id"), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ok": True, "device_id": "all" if is_fleet else dev.get("id"),
+        "scope": "fleet" if is_fleet else "device",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "window_h": hours,
         "quality": {
             **_quality(samples),
@@ -6219,16 +6582,16 @@ def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1,
             "buckets": _bucket_pct(rssi_vals, RSSI_BUCKETS),
             "live": [{"mac": c["mac"], "interface": c["interface"], "rssi": c["rssi"],
                       "rssi_avg": c.get("rssi_avg"), "samples": c.get("samples", 0)} for c in clients],
-            "median_dbm": median, "weak_pct": weak_pct, "clients": len(live_rssi),
+            "median_dbm": median, "weak_pct": weak_pct, "clients": total_clients,
             "samples": len(series_rssi),
-            "source": "rf_samples (rssi) + registration-table live",
+            "source": "rf_samples (rssi) seluruh armada" if is_fleet else "rf_samples (rssi) + registration-table live",
         },
         "aps": aps,
         "density": {
             "need_improvement": need_density,
             "title": "Kerapatan AP perlu diperbaiki" if need_density else "Kerapatan AP memadai",
-            "detail": (f"{bad_names} median {bad_med} dBm — klien di AP ini mayoritas lemah"
-                       if bad_names else f"{len([a for a in aps if a['median_dbm'] is not None])} AP terukur, median klien terendah {min([a['median_dbm'] for a in aps if a['median_dbm'] is not None], default=None)} dBm"),
+            "detail": (f"{len(bad)} dari {measured_cnt} AP terukur memiliki sinyal lemah (median terendah {bad_med} dBm)."
+                       if bad else f"{measured_cnt} AP terukur, median klien terendah {min([a['median_dbm'] for a in aps if a['median_dbm'] is not None], default=None)} dBm."),
         },
     }
 
@@ -6828,7 +7191,22 @@ def _opt_worker(job_id: str, opts: dict):
         # --- 4. compute optimal configuration ---
         _opt_set_stage(job, 3, "running")
         cfg = load_rrm_cfg()
-        plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"), duration=scan_s)
+        base_plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"), duration=scan_s)
+        use_omniroute = opts.get("use_omniroute", True)
+        if use_omniroute:
+            plan, omni_meta = plan_rrm_via_omniroute(
+                base_plan, scans, critical, issues, dev_filter=dev_filter
+            )
+        else:
+            plan = base_plan
+            omni_meta = {
+                "engine": "rrm_engine.py",
+                "used_omniroute": False,
+                "model": None,
+                "error": None,
+                "rationale": None,
+                "rejected": [],
+            }
         rssi_all = [r["rssi"] for r in window if r.get("rssi") is not None]
         weak_rssi = sorted(v for v in rssi_all if v < -70)
         sensitivity = -72.0
@@ -6836,6 +7214,12 @@ def _opt_worker(job_id: str, opts: dict):
             mid = weak_rssi[len(weak_rssi) // 2]
             sensitivity = float(max(-80.0, min(-65.0, round(mid + 3))))
         job["details"]["compute"] = {
+            "engine": omni_meta["engine"],
+            "used_omniroute": omni_meta["used_omniroute"],
+            "omniroute_model": omni_meta.get("model"),
+            "omniroute_rationale": omni_meta.get("rationale"),
+            "omniroute_error": omni_meta.get("error"),
+            "omniroute_rejected": omni_meta.get("rejected") or [],
             "channel": {"changes": plan.get("dca", {}).get("changes", []),
                         "gain_pct": plan.get("dca", {}).get("gain_pct"),
                         "iterations": plan.get("dca", {}).get("iterations")},
@@ -6888,7 +7272,9 @@ def _opt_worker(job_id: str, opts: dict):
 
             ai = res.get("ai") or {}
             job["details"]["summary"] = {
-                "channel_gain_pct": res.get("gain_pct"),
+                "engine": omni_meta["engine"],
+        "omniroute_rationale": omni_meta.get("rationale"),
+        "channel_gain_pct": res.get("gain_pct"),
                 "channel_changes": len((res.get("result") or {}).get("channel") or []),
                 "txpower_changes": len((res.get("result") or {}).get("txpower") or []),
                 "ai_applied": ai.get("applied") or 0,
@@ -6934,6 +7320,7 @@ class OptStartReq(BaseModel):
     scan_duration: int | None = None
     dry_run: bool = False
     ai_auto_push: bool = True
+    use_omniroute: bool = True
 
 
 @app.post("/api/optimize/start")
@@ -6972,7 +7359,8 @@ def api_optimize_start(req: OptStartReq):
                                        "history_window_min": req.history_window_min,
                                        "scan_duration": req.scan_duration,
                                        "dry_run": req.dry_run,
-                                       "ai_auto_push": req.ai_auto_push})).start()
+                                       "ai_auto_push": req.ai_auto_push,
+                                       "use_omniroute": bool(req.use_omniroute)})).start()
     return {"ok": True, "job_id": job["id"], "status": "running",
             "message": "Optimasi berjalan di background — aman keluar dari halaman ini"}
 
@@ -7054,6 +7442,351 @@ def api_optimize_cancel(req: dict):
 
 
 _opt_db_init()
+
+
+# ==============================================================================
+# FLEET WI-FI SYNC: SINKRONISASI SSID & GANTI PASSWORD MASSAL
+# ==============================================================================
+class FleetWifiSyncReq(BaseModel):
+    action: str = Field(..., description="rotate_password | create_ssid | rename_ssid")
+    device_ids: list[str] = Field(default_factory=list)
+    target_ssid: str
+    new_ssid: str | None = None
+    password: str | None = None
+    security_mode: str = "password"  # "password" | "open"
+    bands: list[str] = Field(default_factory=lambda: ["2g", "5g"])
+    vlan_mode: str = "no-tag"        # "no-tag" | "use-tag"
+    vlan_id: int | None = None
+    hide_ssid: bool = False
+    add_bridge: bool = True
+    bridge_name: str = "bridge1"
+    dry_run: bool = False
+
+
+def _slug_profile(ssid: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", (ssid or "").strip()).strip("-").lower()
+    return f"sec-{(slug or 'wifi')[:24]}"
+
+
+@app.get("/api/fleet/wifi/ssids")
+def api_fleet_wifi_ssids():
+    """Pindai paralel daftar SSID aktif di seluruh armada AP untuk pilihan sync/rotasi password."""
+    devs = load_devices()
+    ssid_map: dict[str, dict] = {}
+    scanned_ok = 0
+    scanned_err = 0
+
+    def _scan_one(d: dict):
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                wls = mt.resource("/interface/wireless").get()
+            found = []
+            for w in wls:
+                ssid = (w.get("ssid") or "").strip()
+                if not ssid:
+                    continue
+                found.append({
+                    "ssid": ssid,
+                    "band": _band_of(w) or "?",
+                    "profile": w.get("security-profile") or "default",
+                    "disabled": str(w.get("disabled") or "").lower() == "true",
+                })
+            return d["id"], True, found
+        except Exception:
+            return d["id"], False, []
+
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(devs)))) as ex:
+        for did, ok, items in ex.map(_scan_one, devs):
+            if ok:
+                scanned_ok += 1
+            else:
+                scanned_err += 1
+            for it in items:
+                entry = ssid_map.setdefault(it["ssid"], {
+                    "ssid": it["ssid"],
+                    "device_ids": set(),
+                    "bands": set(),
+                    "profiles": set(),
+                    "interfaces": 0,
+                })
+                entry["device_ids"].add(did)
+                if it["band"] in ("2g", "5g"):
+                    entry["bands"].add(it["band"])
+                entry["profiles"].add(it["profile"])
+                entry["interfaces"] += 1
+
+    ssids = []
+    for entry in ssid_map.values():
+        dev_list = sorted(entry["device_ids"])
+        ssids.append({
+            "ssid": entry["ssid"],
+            "ap_count": len(dev_list),
+            "interfaces": entry["interfaces"],
+            "bands": sorted(entry["bands"]),
+            "profiles": sorted(entry["profiles"]),
+            "device_ids": dev_list,
+        })
+    ssids.sort(key=lambda x: (-x["ap_count"], x["ssid"].lower()))
+    return {
+        "ok": True,
+        "scanned_ok": scanned_ok,
+        "scanned_err": scanned_err,
+        "total_devices": len(devs),
+        "ssids": ssids,
+    }
+
+
+def _sync_wifi_on_device(dev: dict, req: FleetWifiSyncReq) -> dict:
+    did = dev["id"]
+    dname = dev.get("name") or did
+    host = dev.get("host") or ""
+    target_ssid = (req.target_ssid or "").strip()
+    new_ssid = (req.new_ssid or "").strip()
+    pwd = (req.password or "").strip()
+    dry = bool(req.dry_run)
+    actions: list[str] = []
+
+    try:
+        with get_device_lock(host), MT(dev) as mt:
+            wl_res = mt.resource("/interface/wireless")
+            sec_res = mt.resource("/interface/wireless/security-profiles")
+            all_wl = wl_res.get()
+            all_sec = sec_res.get()
+            sec_by_name = {s.get("name"): s for s in all_sec}
+
+            def _ensure_wpa2_profile(prof_name: str, key: str) -> str:
+                existing = sec_by_name.get(prof_name)
+                if existing:
+                    if not dry:
+                        sec_res.set(id=existing["id"], **{
+                            "mode": "dynamic-keys",
+                            "authentication-types": "wpa2-psk",
+                            "wpa2-pre-shared-key": key,
+                        })
+                    return f"perbarui profile '{prof_name}'"
+                if not dry:
+                    sec_res.call("add", {
+                        "name": prof_name,
+                        "mode": "dynamic-keys",
+                        "authentication-types": "wpa2-psk",
+                        "wpa2-pre-shared-key": key,
+                        "unicast-ciphers": "aes-ccm",
+                        "group-ciphers": "aes-ccm",
+                    })
+                return f"buat profile '{prof_name}'"
+
+            if req.action == "rotate_password":
+                matched = [w for w in all_wl if (w.get("ssid") or "").strip() == target_ssid]
+                if not matched:
+                    return {
+                        "device_id": did, "device_name": dname, "host": host,
+                        "status": "skipped", "actions": [],
+                        "message": f"SSID '{target_ssid}' tidak ditemukan di AP ini",
+                    }
+                # Cek apakah security-profile dipakai juga oleh SSID lain agar tidak merusak SSID lain
+                other_profiles = {
+                    (w.get("security-profile") or "default")
+                    for w in all_wl
+                    if (w.get("ssid") or "").strip() != target_ssid
+                }
+                ded_name = _slug_profile(target_ssid)
+                updated_profs: set[str] = set()
+                for w in matched:
+                    cur_prof = w.get("security-profile") or "default"
+                    if cur_prof == "default" or cur_prof in other_profiles:
+                        if ded_name not in updated_profs:
+                            actions.append(_ensure_wpa2_profile(ded_name, pwd))
+                            updated_profs.add(ded_name)
+                        if cur_prof != ded_name:
+                            if not dry:
+                                wl_res.set(id=w["id"], **{"security-profile": ded_name})
+                            actions.append(f"{w.get('name')}: pindah ke profile '{ded_name}' (aman, tidak ubah SSID lain)")
+                    else:
+                        if cur_prof not in updated_profs:
+                            actions.append(_ensure_wpa2_profile(cur_prof, pwd))
+                            updated_profs.add(cur_prof)
+                prefix = "[Preview] " if dry else ""
+                return {
+                    "device_id": did, "device_name": dname, "host": host,
+                    "status": "ok", "actions": actions,
+                    "message": f"{prefix}Password SSID '{target_ssid}' diperbarui ({len(matched)} radio)",
+                }
+
+            elif req.action == "rename_ssid":
+                matched = [w for w in all_wl if (w.get("ssid") or "").strip() == target_ssid]
+                if not matched:
+                    return {
+                        "device_id": did, "device_name": dname, "host": host,
+                        "status": "skipped", "actions": [],
+                        "message": f"SSID '{target_ssid}' tidak ditemukan di AP ini",
+                    }
+                other_profiles = {
+                    (w.get("security-profile") or "default")
+                    for w in all_wl
+                    if (w.get("ssid") or "").strip() != target_ssid
+                }
+                ded_name = _slug_profile(new_ssid)
+                updated_profs: set[str] = set()
+                for w in matched:
+                    if not dry:
+                        wl_res.set(id=w["id"], ssid=new_ssid)
+                    actions.append(f"{w.get('name')}: SSID '{target_ssid}' -> '{new_ssid}'")
+                    if pwd:
+                        cur_prof = w.get("security-profile") or "default"
+                        if cur_prof == "default" or cur_prof in other_profiles:
+                            if ded_name not in updated_profs:
+                                actions.append(_ensure_wpa2_profile(ded_name, pwd))
+                                updated_profs.add(ded_name)
+                            if cur_prof != ded_name:
+                                if not dry:
+                                    wl_res.set(id=w["id"], **{"security-profile": ded_name})
+                                actions.append(f"{w.get('name')}: profile -> '{ded_name}'")
+                        elif cur_prof not in updated_profs:
+                            actions.append(_ensure_wpa2_profile(cur_prof, pwd))
+                            updated_profs.add(cur_prof)
+                prefix = "[Preview] " if dry else ""
+                return {
+                    "device_id": did, "device_name": dname, "host": host,
+                    "status": "ok", "actions": actions,
+                    "message": f"{prefix}SSID diubah ke '{new_ssid}' ({len(matched)} radio)",
+                }
+
+            elif req.action == "create_ssid":
+                masters = [w for w in all_wl if not w.get("master-interface")]
+                want_bands = set(req.bands or ["2g", "5g"])
+                target_masters = [w for w in masters if _band_of(w) in want_bands]
+                if not target_masters:
+                    return {
+                        "device_id": did, "device_name": dname, "host": host,
+                        "status": "skipped", "actions": [],
+                        "message": f"Tidak ada radio master untuk band {', '.join(sorted(want_bands))}",
+                    }
+
+                existing_names = {w.get("name") for w in all_wl}
+                sec_prof_name = "default"
+                if req.security_mode == "password":
+                    sec_prof_name = _slug_profile(target_ssid)
+                    actions.append(_ensure_wpa2_profile(sec_prof_name, pwd))
+
+                created = 0
+                for m in target_masters:
+                    m_name = m.get("name")
+                    m_band = _band_of(m)
+                    # Cek apakah SSID sudah ada di master radio ini
+                    already = any(
+                        (w.get("ssid") or "").strip() == target_ssid
+                        and (w.get("name") == m_name or w.get("master-interface") == m_name)
+                        for w in all_wl
+                    )
+                    if already:
+                        actions.append(f"{m_name} ({m_band}): dilewati, SSID '{target_ssid}' sudah ada")
+                        continue
+
+                    idx = 3
+                    while f"wlan{idx}" in existing_names:
+                        idx += 1
+                    vap_name = f"wlan{idx}"
+                    existing_names.add(vap_name)
+
+                    params = {
+                        "name": vap_name,
+                        "master-interface": m_name,
+                        "ssid": target_ssid,
+                        "security-profile": sec_prof_name,
+                        "disabled": "false",
+                        "hide-ssid": "true" if req.hide_ssid else "false",
+                    }
+                    if req.vlan_mode == "use-tag" and req.vlan_id:
+                        params["vlan-mode"] = "use-tag"
+                        params["vlan-id"] = str(req.vlan_id)
+
+                    if not dry:
+                        wl_res.call("add", params)
+                        if req.add_bridge:
+                            try:
+                                mt.resource("/interface/bridge/port").call("add", {
+                                    "bridge": req.bridge_name or "bridge1",
+                                    "interface": vap_name,
+                                })
+                            except Exception:
+                                pass
+                    created += 1
+                    vlan_info = f", VLAN {req.vlan_id}" if (req.vlan_mode == "use-tag" and req.vlan_id) else ""
+                    actions.append(f"buat {vap_name} di {m_name} ({m_band}) SSID '{target_ssid}'{vlan_info}")
+
+                if created == 0:
+                    return {
+                        "device_id": did, "device_name": dname, "host": host,
+                        "status": "skipped", "actions": actions,
+                        "message": f"SSID '{target_ssid}' sudah ada di seluruh band target",
+                    }
+                prefix = "[Preview] " if dry else ""
+                return {
+                    "device_id": did, "device_name": dname, "host": host,
+                    "status": "ok", "actions": actions,
+                    "message": f"{prefix}{created} Virtual AP '{target_ssid}' berhasil dibuat",
+                }
+
+            else:
+                return {
+                    "device_id": did, "device_name": dname, "host": host,
+                    "status": "error", "actions": [],
+                    "message": f"Aksi tidak dikenal: {req.action}",
+                }
+    except Exception as e:
+        return {
+            "device_id": did, "device_name": dname, "host": host,
+            "status": "error", "actions": actions,
+            "message": f"{type(e).__name__}: {e}",
+        }
+
+
+@app.post("/api/fleet/wifi/sync")
+def api_fleet_wifi_sync(req: FleetWifiSyncReq):
+    """Sinkronisasi SSID / ganti password Wi-Fi secara massal ke AP terpilih (mendukung dry-run preview)."""
+    if req.action not in ("rotate_password", "create_ssid", "rename_ssid"):
+        raise HTTPException(400, "Aksi harus rotate_password, create_ssid, atau rename_ssid")
+    if not (req.target_ssid or "").strip():
+        raise HTTPException(400, "Nama SSID target wajib diisi")
+    if req.action == "rename_ssid" and not (req.new_ssid or "").strip():
+        raise HTTPException(400, "Nama SSID baru wajib diisi")
+    if req.action == "rotate_password":
+        if not (req.password or "").strip() or len(req.password.strip()) < 8:
+            raise HTTPException(400, "Password WPA2-PSK minimal 8 karakter")
+    if req.action == "create_ssid" and req.security_mode == "password":
+        if not (req.password or "").strip() or len(req.password.strip()) < 8:
+            raise HTTPException(400, "Password WPA2-PSK minimal 8 karakter")
+    if req.action == "rename_ssid" and (req.password or "").strip() and len(req.password.strip()) < 8:
+        raise HTTPException(400, "Password WPA2-PSK minimal 8 karakter")
+    if not req.device_ids:
+        raise HTTPException(400, "Pilih minimal 1 perangkat AP target")
+
+    all_devs = {d["id"]: d for d in load_devices()}
+    targets = [all_devs[did] for did in req.device_ids if did in all_devs]
+    if not targets:
+        raise HTTPException(404, "Perangkat target tidak ditemukan")
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=min(10, len(targets))) as ex:
+        for r in ex.map(lambda d: _sync_wifi_on_device(d, req), targets):
+            results.append(r)
+
+    ok_cnt = sum(1 for r in results if r["status"] == "ok")
+    skip_cnt = sum(1 for r in results if r["status"] == "skipped")
+    err_cnt = sum(1 for r in results if r["status"] == "error")
+    return {
+        "ok": True,
+        "dry_run": req.dry_run,
+        "action": req.action,
+        "target_ssid": req.target_ssid.strip(),
+        "summary": {
+            "total": len(results),
+            "success": ok_cnt,
+            "skipped": skip_cnt,
+            "failed": err_cnt,
+        },
+        "results": results,
+    }
 
 
 if __name__ == "__main__":

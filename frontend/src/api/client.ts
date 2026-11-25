@@ -752,4 +752,62 @@ export const api = {
     });
     return handleResponse(res);
   },
+
+  // --- Fleet Wi-Fi Sync (Bulk SSID & Password Rotation) ---
+  async getFleetWifiSsids(): Promise<{
+    ok: boolean;
+    scanned_ok: number;
+    scanned_err: number;
+    total_devices: number;
+    ssids: {
+      ssid: string;
+      ap_count: number;
+      interfaces: number;
+      bands: string[];
+      profiles: string[];
+      device_ids: string[];
+    }[];
+  }> {
+    const res = await fetch(`${BASE_URL}/api/fleet/wifi/ssids`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async syncFleetWifi(payload: {
+    action: 'rotate_password' | 'create_ssid' | 'rename_ssid';
+    device_ids: string[];
+    target_ssid: string;
+    new_ssid?: string;
+    password?: string;
+    security_mode?: 'password' | 'open';
+    bands?: string[];
+    vlan_mode?: 'no-tag' | 'use-tag';
+    vlan_id?: number;
+    hide_ssid?: boolean;
+    add_bridge?: boolean;
+    bridge_name?: string;
+    dry_run?: boolean;
+  }): Promise<{
+    ok: boolean;
+    dry_run: boolean;
+    action: string;
+    target_ssid: string;
+    summary: { total: number; success: number; skipped: number; failed: number };
+    results: {
+      device_id: string;
+      device_name: string;
+      host: string;
+      status: 'ok' | 'skipped' | 'error';
+      actions: string[];
+      message: string;
+    }[];
+  }> {
+    const res = await fetch(`${BASE_URL}/api/fleet/wifi/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify(payload),
+    });
+    return handleResponse(res);
+  },
 };
