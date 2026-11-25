@@ -11,6 +11,12 @@ REST API router, tanpa SSH, tanpa Telnet.
 
 ---
 
+## Tampilan Dashboard
+
+![MikroTik NOC Fleet Controller Dashboard](frontend/src/assets/Contoh%20Web.png)
+
+---
+
 ## Fitur
 
 ### Monitoring, Telemetri & Manajemen Armada
