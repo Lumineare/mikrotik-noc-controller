@@ -25,7 +25,6 @@ import {
   Copy,
   Check,
   Sparkles,
-  Radar,
 } from 'lucide-react';
 import { DashboardData, WirelessClient } from '../types';
 import { Oscilloscope } from './Oscilloscope';
@@ -270,15 +269,6 @@ export const DeviceWorkspace: React.FC<DeviceWorkspaceProps> = ({
 
         {/* Action Buttons: Winbox Tools */}
         <div className="flex items-center gap-2 self-end md:self-auto">
-          {/* RF Spectrum Scan Quick Button */}
-          <button
-            onClick={() => { setRfScanBand('2g'); setShowRfScan(true); }}
-            className="p-2 text-cyan-700 bg-cyan-50 hover:bg-cyan-100 border border-cyan-200 rounded-xl text-xs transition-colors flex items-center gap-1.5 font-mono cursor-pointer shadow-xs"
-            title="Scan Okupansi Spektrum RF Langsung dari AP Ini"
-          >
-            <Radar className="w-3.5 h-3.5 text-cyan-600" />
-            <span className="hidden sm:inline font-bold">Scan Freq</span>
-          </button>
 
           {/* AI Optimizer Quick Button */}
           <button
@@ -469,7 +459,7 @@ export const DeviceWorkspace: React.FC<DeviceWorkspaceProps> = ({
 
       {/* Tab Panels */}
       <div>
-        {activeTab === 'overview' && <TabOverview system={system} />}
+        {activeTab === 'overview' && <TabOverview system={system} deviceId={data.device_id} />}
         {activeTab === 'ai' && (
           <TabAiOptimizer
             deviceId={data.device_id}

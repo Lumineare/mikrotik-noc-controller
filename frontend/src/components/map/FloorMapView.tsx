@@ -75,8 +75,8 @@ export const FloorMapView: React.FC<FloorMapViewProps> = ({ onSelectDevice }) =>
   const [imageSize, setImageSize] = useState({ width: 1200, height: 800 });
 
   // Load floors and devices
-  const loadData = async () => {
-    setLoading(true);
+  const loadData = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [mapRes, fleetRes] = await Promise.all([
         api.getMapFloors(),
@@ -99,6 +99,9 @@ export const FloorMapView: React.FC<FloorMapViewProps> = ({ onSelectDevice }) =>
 
   useEffect(() => {
     loadData();
+    // ponytail: poll 10 s; ganti SSE kalau AP > 10
+    const t = window.setInterval(() => loadData(true), 10000);
+    return () => window.clearInterval(t);
   }, []);
 
   // Current floor object
