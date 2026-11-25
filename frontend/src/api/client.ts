@@ -15,6 +15,8 @@ import {
   BackupResult,
   AiDiagnoseResult,
   AiApplyResult,
+  AiAutoResult,
+  OptimizeJob,
   AiChatResult,
   AiModelsResult,
   AiConfigResult,
@@ -62,6 +64,13 @@ async function handleResponse<T>(res: Response): Promise<T> {
 }
 
 export const api = {
+  async getWifiDiagnostics(qs = ''): Promise<any> {
+    const res = await fetch(`${BASE_URL}/api/wifi/diagnostics${qs}`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse<any>(res);
+  },
+
   // Authentication methods
   async login(username: string, password: string): Promise<LoginResult> {
     const res = await fetch(`${BASE_URL}/api/auth/login`, {
@@ -429,6 +438,52 @@ export const api = {
       body: JSON.stringify({ device, action_type, action_params }),
     });
     return handleResponse<AiApplyResult>(res);
+  },
+
+  async autoAiOptimize(
+    device: string,
+    opts?: { dry_run?: boolean; include_medium?: boolean; actions?: string[] }
+  ): Promise<AiAutoResult> {
+    const res = await fetch(`${BASE_URL}/api/ai/optimize/auto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device, ...(opts || {}) }),
+    });
+    return handleResponse<AiAutoResult>(res);
+  },
+
+  async rollbackAiOptimize(run_id: string): Promise<{ ok: boolean; interfaces_restored: number; fasttrack_rules_removed: number }> {
+    const res = await fetch(`${BASE_URL}/api/ai/optimize/rollback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id }),
+    });
+    return handleResponse<{ ok: boolean; interfaces_restored: number; fasttrack_rules_removed: number }>(res);
+  },
+
+  async startOptimize(
+    device: string | undefined,
+    opts?: { history_window_min?: number; scan_duration?: number; dry_run?: boolean; fleet?: boolean }
+  ): Promise<{ ok: boolean; job_id?: string; status?: string; message?: string; running?: boolean }> {
+    const res = await fetch(`${BASE_URL}/api/optimize/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device, ...(opts || {}) }),
+    });
+    return handleResponse<{ ok: boolean; job_id?: string; status?: string; message?: string; running?: boolean }>(res);
+  },
+
+  async getOptimizeCurrent(device: string): Promise<OptimizeJob> {
+    const res = await fetch(`${BASE_URL}/api/optimize/current?device=${encodeURIComponent(device)}`);
+    return handleResponse<OptimizeJob>(res);
+  },
+  async cancelOptimize(job_id: string): Promise<{ ok: boolean; status: string }> {
+    const res = await fetch(`${BASE_URL}/api/optimize/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id }),
+    });
+    return handleResponse<{ ok: boolean; status: string }>(res);
   },
 
   async sendAiChat(device: string, message: string, model?: string): Promise<AiChatResult> {

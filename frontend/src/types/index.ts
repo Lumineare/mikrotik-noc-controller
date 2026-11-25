@@ -392,6 +392,65 @@ export interface AiApplyResult {
   message: string;
 }
 
+export interface AiAutoStep {
+  action_type: string;
+  label: string;
+  title?: string;
+  ok: boolean;
+  message?: string;
+  error?: string;
+  command?: string;
+}
+
+export interface AiAutoSkipped {
+  id?: string;
+  action_type?: string;
+  title?: string;
+  reason: string;
+}
+
+export interface AiAutoResult {
+  ok: boolean;
+  dry_run?: boolean;
+  run_id?: string | null;
+  steps?: AiAutoStep[];
+  would_apply?: Array<{ action_type: string; title?: string; command?: string }>;
+  skipped?: AiAutoSkipped[];
+  applied?: number;
+  failed?: number;
+  score_before?: number;
+  score_after?: number | null;
+  score?: number;
+  grade?: string;
+  message?: string;
+  rollback_hint?: string;
+}
+
+export interface OptimizeStage {
+  key: string;
+  name: string;
+  eta: string;
+  status: string;
+  started?: number | null;
+  ended?: number | null;
+}
+
+export interface OptimizeJob {
+  ok: boolean;
+  job_id: string;
+  device?: string;
+  status: string;
+  stage: string;
+  stage_index?: number;
+  progress_pct: number;
+  stages: OptimizeStage[];
+  details: Record<string, any>;
+  run_id?: string | null;
+  started?: number;
+  error?: string | null;
+  message?: string;
+}
+
 export interface AiChatResult {
   reply: string;
   timestamp: string;
@@ -631,6 +690,7 @@ export interface ClientPresence {
   last_seen: number;
   status: 'online' | 'offline';
   roam_count: number;
+  is_randomized?: boolean;
   floor_id?: string;
   floor_name?: string;
   floor_x?: number;

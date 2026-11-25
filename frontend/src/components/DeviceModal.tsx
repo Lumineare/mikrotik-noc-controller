@@ -43,7 +43,7 @@ export const DeviceModal: React.FC<DeviceModalProps> = ({
       setHost('');
       setPort(8728);
       setUser('admin');
-      setPass('Mikrotik@rsam.33');
+      setPass('');
       setGroup('Default');
       setIsDefault(false);
     }

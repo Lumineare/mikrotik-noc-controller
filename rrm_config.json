@@ -1,0 +1,36 @@
+{
+  "enabled": false,
+  "interval_min": 15,
+  "include_dfs": true,
+  "apply_channel": true,
+  "apply_txpower": true,
+  "apply_steering": true,
+  "apply_roam": false,
+  "roam_thr_dbm": -74,
+  "roam_alt_min_dbm": -67.0,
+  "roam_margin_db": 7.0,
+  "roam_expire_min": 10,
+  "min_gain_pct": 15.0,
+  "quiet_start": "01:00",
+  "quiet_end": "05:00",
+  "max_client_drop": 2,
+  "scan_duration": 8,
+  "sample_interval_min": 5,
+  "channels_2g": [
+    1,
+    6,
+    11
+  ],
+  "channels_5g": [
+    36,
+    40,
+    44,
+    48,
+    149,
+    153,
+    157,
+    161,
+    165
+  ],
+  "last_run_ts": 0.0
+}

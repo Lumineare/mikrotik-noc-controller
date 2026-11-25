@@ -28,7 +28,8 @@ _load_env()
 
 class MikroTik:
     def __init__(self, host=None, username=None, password=None, port=8728,
-                 use_ssl=False, ssl_verify=False):
+                 use_ssl=False, ssl_verify=False, timeout=None):
+        self.timeout = float(timeout or os.getenv("MT_TIMEOUT", "5"))
         self.host = host or os.getenv("MT_HOST", "192.168.88.1")
         self.username = username or os.getenv("MT_USER", "API")
         self.password = password or os.getenv("MT_PASS", "")
@@ -51,6 +52,7 @@ class MikroTik:
             plaintext_login=True,
         )
         # get_api() performs the login handshake
+        self._pool.set_timeout(self.timeout)
         self.api = self._pool.get_api()
         return self
 

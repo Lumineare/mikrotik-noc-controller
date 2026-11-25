@@ -1,9 +1,11 @@
 import React from 'react';
 import { Server, Cpu, HardDrive, Database, Clock, Calendar, CheckCircle2, AlertCircle } from 'lucide-react';
 import { SystemInfo } from '../../types';
+import { WifiDiagnostics } from '../WifiDiagnostics';
 
 interface TabOverviewProps {
   system: SystemInfo;
+  deviceId?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -18,7 +20,7 @@ function formatBytes(bytes: number): string {
   return `${val.toFixed(1)} ${units[i]}`;
 }
 
-export const TabOverview: React.FC<TabOverviewProps> = ({ system }) => {
+export const TabOverview: React.FC<TabOverviewProps> = ({ system, deviceId }) => {
   const totalMem = system.total_memory || (system.memory_total_mb ? system.memory_total_mb * 1024 * 1024 : 0);
   const freeMem = system.free_memory || (system.memory_free_mb ? system.memory_free_mb * 1024 * 1024 : 0);
   const ramUsed = Math.max(0, totalMem - freeMem);

@@ -109,9 +109,10 @@ export const ApClientsModal: React.FC<ApClientsModalProps> = ({
   };
 
   useEffect(() => {
-    if (isOpen && placement) {
-      fetchClients();
-    }
+    if (!isOpen || !placement) return;
+    fetchClients();
+    const t = window.setInterval(fetchClients, 10000);
+    return () => window.clearInterval(t);
   }, [isOpen, placement?.device_id]);
 
   if (!isOpen || !placement) return null;

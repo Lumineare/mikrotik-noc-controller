@@ -26,9 +26,11 @@ import {
   AiDiagnoseResult,
   AiRecommendation,
   AiModelPreset,
+  AiAutoResult,
 } from '../../types';
 import { api } from '../../api/client';
 import { ConfirmModal } from '../ConfirmModal';
+import { OptimizeWizard } from './OptimizeWizard';
 
 interface TabAiOptimizerProps {
   deviceId: string;
@@ -49,6 +51,9 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
   const [copiedCmdId, setCopiedCmdId] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [confirmRec, setConfirmRec] = useState<AiRecommendation | null>(null);
+  const [autoPushing, setAutoPushing] = useState(false);
+  const [autoResult, setAutoResult] = useState<AiAutoResult | null>(null);
+  const [autoRunId, setAutoRunId] = useState<string | null>(null);
 
   // Chat AI State
   const [chatMessages, setChatMessages] = useState<
@@ -146,6 +151,61 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
     }
   };
 
+  const handleAutoPush = async (dryRun: boolean) => {
+    if (!deviceId || autoPushing) return;
+    if (
+      !dryRun &&
+      !window.confirm(
+        'Push SEMUA rekomendasi aman ke router SEKARANG?\n\nPerubahan langsung ke perangkat live (lebar pita radio, firewall FastTrack, DNS). Ada rollback otomatis bila gagal.'
+      )
+    ) {
+      return;
+    }
+    setAutoPushing(true);
+    setAutoResult(null);
+    try {
+      const res = await api.autoAiOptimize(deviceId, { dry_run: dryRun });
+      setAutoResult(res);
+      if (!dryRun) {
+        setAutoRunId(res.run_id || null);
+        setActionFeedback({
+          type: res.failed ? 'err' : 'ok',
+          text: `AI auto-push: ${res.applied ?? 0} diterapkan, ${res.failed ?? 0} gagal. Score ${res.score_before ?? '?'} → ${res.score_after ?? '?'}`,
+        });
+        setTimeout(() => setActionFeedback(null), 8000);
+        await fetchDiagnosis();
+        if (onRefreshParent) onRefreshParent();
+      }
+    } catch (err: any) {
+      setActionFeedback({ type: 'err', text: `Auto-push gagal: ${err.message}` });
+      setTimeout(() => setActionFeedback(null), 6000);
+    } finally {
+      setAutoPushing(false);
+    }
+  };
+
+  const handleAutoRollback = async () => {
+    if (!autoRunId || autoPushing) return;
+    setAutoPushing(true);
+    try {
+      const res = await api.rollbackAiOptimize(autoRunId);
+      setActionFeedback({
+        type: 'ok',
+        text: `Rollback: ${res.interfaces_restored} interface dipulihkan, ${res.fasttrack_rules_removed} rule FastTrack dibuang`,
+      });
+      setTimeout(() => setActionFeedback(null), 7000);
+      setAutoRunId(null);
+      setAutoResult(null);
+      await fetchDiagnosis();
+      if (onRefreshParent) onRefreshParent();
+    } catch (err: any) {
+      setActionFeedback({ type: 'err', text: `Rollback gagal: ${err.message}` });
+      setTimeout(() => setActionFeedback(null), 6000);
+    } finally {
+      setAutoPushing(false);
+    }
+  };
+
   const handleCopyCommand = (id: string, cmd: string) => {
     navigator.clipboard.writeText(cmd);
     setCopiedCmdId(id);
@@ -224,6 +284,16 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
         </div>
       )}
 
+      {/* FULL PIPELINE: identify → history → scan → compute → deliver (background) */}
+      <OptimizeWizard
+        deviceId={deviceId}
+        onApplied={() => {
+          fetchDiagnosis();
+          if (onRefreshParent) onRefreshParent();
+        }}
+      />
+
+
       {/* HERO SECTION: AI HEALTH SCORE & TELEMETRY */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Card 1: Score Radial Gauge */}
@@ -289,7 +359,8 @@ export const TabAiOptimizer: React.FC<TabAiOptimizerProps> = ({
                   )}
                 </div>
                 <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
-                  Evaluasi RF wireless, utilisasi radio 5GHz, keamanan service port, dan proteksi flash cAP ac.
+                  Skor kesehatan router: CPU, RAM, flash, lebar pita 5GHz, port service, DNS. Bukan
+                  interferensi RF — itu diukur terpisah oleh gain channel di kartu Optimize.
                 </p>
                 <div className="text-[10px] text-slate-400 mt-2 font-medium">
                   Diagnosa terakhir: {data?.diagnosed_at || '-'}

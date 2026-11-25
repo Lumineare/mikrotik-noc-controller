@@ -20,6 +20,7 @@ import traceback
 import urllib.request
 import urllib.error
 import hashlib
+import gzip
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import secrets
@@ -33,9 +34,40 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------- NOC Authentication
+# Kredensial login dibaca dari .env (NOC_ADMIN_USER / NOC_ADMIN_PASS) supaya
+# ganti user tidak perlu edit kode dan tidak ada password hardcoded di repo.
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_dotenv(Path(__file__).resolve().parent / ".env")
 NOC_ADMIN_USER = os.getenv("NOC_ADMIN_USER", "admin")
 NOC_ADMIN_PASS = os.getenv("NOC_ADMIN_PASS", "admin123")
+# Profil yang tampil di dashboard — bukan identitas hardcoded di kode.
+NOC_USER_NAME = os.getenv("NOC_USER_NAME", "Admin")
+NOC_USER_ROLE = os.getenv("NOC_USER_ROLE", "Administrator")
+NOC_USER_EMAIL = os.getenv("NOC_USER_EMAIL", "")
+NOC_USER_SITE = os.getenv("NOC_USER_SITE", "RS Anwar Medika")
 ACTIVE_SESSIONS: dict[str, dict] = {}
+SESSION_TTL = float(os.getenv("NOC_SESSION_TTL_H", "12")) * 3600
+
+
+def _sess_get(token: str):
+    """Sesi dengan masa berlaku — token lama dibuang supaya dict tidak bocor."""
+    s = ACTIVE_SESSIONS.get(token)
+    if not s:
+        return None
+    if time.time() - float(s.get("_ts") or 0) > SESSION_TTL:
+        ACTIVE_SESSIONS.pop(token, None)
+        return None
+    return s
 
 
 class LoginReq(BaseModel):
@@ -52,8 +84,10 @@ _DB_LOCK = threading.Lock()
 
 def init_noc_db():
     with _DB_LOCK:
-        conn = sqlite3.connect(str(NOC_DB_FILE))
+        conn = sqlite3.connect(str(NOC_DB_FILE), timeout=10)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=10000")
         c.execute("""
             CREATE TABLE IF NOT EXISTS alert_history (
                 id TEXT PRIMARY KEY,
@@ -132,6 +166,14 @@ def init_noc_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_presence_ap ON client_presence (ap_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_roam_mac ON client_roaming_events (mac, timestamp DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_roam_time ON client_roaming_events (timestamp DESC)")
+        # Job optimasi hidup di memori; yang tercatat "running" saat proses mati
+        # tidak akan pernah selesai dan bikin UI polling selamanya.
+        try:
+            c.execute("UPDATE optimize_jobs SET status='error', "
+                      "error=COALESCE(error,'server restart saat job berjalan') "
+                      "WHERE status='running'")
+        except sqlite3.OperationalError:
+            pass  # tabel belum ada pada instalasi baru
         conn.commit()
         conn.close()
 
@@ -266,7 +308,11 @@ def load_devices() -> list[dict]:
 
 
 def save_devices(devices: list[dict]):
-    DEVICES_FILE.write_text(json.dumps(devices, indent=2), encoding="utf-8")
+    # Tulis atomik: kalau proses mati di tengah write, devices.json lama tetap utuh.
+    # write_text langsung bisa meninggalkan file setengah jadi = semua AP hilang.
+    tmp = DEVICES_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(devices, indent=2), encoding="utf-8")
+    os.replace(tmp, DEVICES_FILE)
 
 
 def get_device(device_id: str | None = None) -> dict:
@@ -319,7 +365,7 @@ class DeviceCreate(BaseModel):
     host: str
     port: int = 8728
     user: str = "admin"
-    pass_: str = Field(default="Mikrotik@rsam.33", alias="pass")
+    pass_: str = Field(default="", alias="pass")
     group: str = "Default"
     is_default: bool = False
 
@@ -338,7 +384,7 @@ class DeviceTestReq(BaseModel):
     host: str
     port: int = 8728
     user: str = "admin"
-    pass_: str = Field(default="Mikrotik@rsam.33", alias="pass")
+    pass_: str = Field(default="", alias="pass")
 
 
 class BatchReq(BaseModel):
@@ -367,16 +413,17 @@ def api_auth_login(req: LoginReq):
     user = req.username.strip()
     pwd = req.password.strip()
     
-    if (user == NOC_ADMIN_USER and pwd == NOC_ADMIN_PASS) or (user == "admin" and pwd == NOC_ADMIN_PASS):
+    if user == NOC_ADMIN_USER and pwd == NOC_ADMIN_PASS:
         token = secrets.token_hex(24)
         session_data = {
             "username": user,
-            "name": "Ahmad Jibril Al Hamdani",
-            "role": "Super Admin NOC",
-            "email": "ahmadjibrilalhamdani@gmail.com",
-            "hospital": "RS Anwar Medika",
+            "name": NOC_USER_NAME,
+            "role": NOC_USER_ROLE,
+            "email": NOC_USER_EMAIL,
+            "hospital": NOC_USER_SITE,
             "login_time": time.strftime("%Y-%m-%d %H:%M:%S")
         }
+        session_data["_ts"] = time.time()
         ACTIVE_SESSIONS[token] = session_data
         return {
             "status": "ok",
@@ -390,8 +437,9 @@ def api_auth_login(req: LoginReq):
 def api_auth_me(authorization: str | None = Header(None)):
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split("Bearer ", 1)[1].strip()
-        if token in ACTIVE_SESSIONS:
-            return {"authenticated": True, "user": ACTIVE_SESSIONS[token]}
+        sess = _sess_get(token)
+        if sess:
+            return {"authenticated": True, "user": {k: v for k, v in sess.items() if not k.startswith("_")}}
     raise HTTPException(status_code=401, detail="Sesi telah kedaluwarsa atau belum login")
 
 
@@ -423,6 +471,7 @@ class MT:
             port=int(self.cfg.get("port", 8728)),
             plaintext_login=True,
         )
+        self.pool.set_timeout(float(os.getenv("MT_TIMEOUT", "5")))
         self.api = self.pool.get_api()
         return self
 
@@ -495,7 +544,7 @@ def build_system(mt):
         "cpu": res.get("cpu"),
         "cpu_count": _int(res.get("cpu-count")),
         "cpu_frequency": _int(res.get("cpu-frequency")),
-        "cpu_load": _int(res.get("cpu-load")),
+        "cpu_load": _cpu_pct(mt),
         "memory_total_mb": round(total_mem / 1048576, 1),
         "memory_free_mb": round(free_mem / 1048576, 1),
         "memory_used_pct": round((1 - free_mem / total_mem) * 100, 1) if total_mem else None,
@@ -546,6 +595,7 @@ def build_interfaces(mt, with_traffic=True):
 
 
 CLIENT_ALIASES_FILE = BASE / "client_aliases.json"
+CLIENT_HOSTNAMES_FILE = BASE / "client_hostnames.json"
 
 def load_client_aliases() -> dict:
     if not CLIENT_ALIASES_FILE.exists():
@@ -559,6 +609,137 @@ def load_client_aliases() -> dict:
 def save_client_aliases(data: dict):
     with open(CLIENT_ALIASES_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+# ---- Real hostname discovery (reverse DNS / NetBIOS / mDNS) ----------------
+# The MAC can never identify a randomised-MAC phone, but the *hostname* the
+# device announces on the network is a real identity. We cache discovered
+# hostnames so names survive between polls and do not depend on DNS uptime.
+_hostname_cache: dict[str, str] = {}
+_hostname_cache_loaded = False
+
+
+def load_hostname_cache() -> dict:
+    global _hostname_cache, _hostname_cache_loaded
+    if _hostname_cache_loaded:
+        return _hostname_cache
+    try:
+        if CLIENT_HOSTNAMES_FILE.exists():
+            with open(CLIENT_HOSTNAMES_FILE, "r", encoding="utf-8") as f:
+                _hostname_cache = json.load(f) or {}
+    except Exception:
+        _hostname_cache = {}
+    _hostname_cache_loaded = True
+    return _hostname_cache
+
+
+def save_hostname_cache():
+    try:
+        with open(CLIENT_HOSTNAMES_FILE, "w", encoding="utf-8") as f:
+            json.dump(_hostname_cache, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+def _clean_hostname(raw: str) -> str:
+    """Normalise a discovered hostname into a display-friendly label."""
+    if not raw:
+        return ""
+    h = raw.strip().strip(".").split(".")[0]
+    h = re.sub(r"[^A-Za-z0-9_\-]", "", h)
+    if not h or len(h) < 2:
+        return ""
+    # Reject auto-generated / meaningless names
+    up = h.upper()
+    if up.startswith("MAC-") or up.startswith("ANDROID-") or re.fullmatch(r"[0-9A-F]{8,}", up):
+        return ""
+    if up in {"LOCALHOST", "UNKNOWN", "NONE"}:
+        return ""
+    return h.upper() if len(h) <= 20 else h[:20].upper()
+
+
+def discover_hostname(ip: str, timeout: float = 0.7) -> str:
+    """Ask the network who lives at `ip`: reverse DNS first, then NetBIOS."""
+    if not ip:
+        return ""
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+        cleaned = _clean_hostname(name)
+        if cleaned:
+            return cleaned
+    except Exception:
+        pass
+    # NetBIOS node status (Windows file-sharing name)
+    try:
+        query = b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01"
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(query, (ip, 137))
+        data, _ = s.recvfrom(1024)
+        s.close()
+        n = data[56]
+        for i in range(n):
+            off = 57 + i * 18
+            nm = data[off:off + 15].split(b"\x00")[0].decode("ascii", "ignore").strip()
+            flags = int.from_bytes(data[off + 16:off + 18], "big")
+            if nm and not (flags & 0x8000) and nm != "\x01\x02__MSBROWSE__\x02":
+                cleaned = _clean_hostname(nm)
+                if cleaned:
+                    return cleaned
+    except Exception:
+        pass
+    return ""
+
+
+def hostname_for(mac: str, ip: str | None, probe: bool = False) -> str:
+    """Hostname for a client. Cache-only by default; `probe=True` asks the network.
+
+    resolve_client_device() runs inside per-client loops, so it must never block
+    on DNS. The background sweeper fills the cache with probe=True.
+    """
+    cache = load_hostname_cache()
+    mac_norm = (mac or "").strip().upper()
+    if mac_norm and mac_norm in cache:
+        return cache[mac_norm]
+    if not probe or not ip:
+        return ""
+    found = discover_hostname(ip)
+    if found and mac_norm:
+        cache[mac_norm] = found
+        save_hostname_cache()
+    return found
+
+
+def sweep_client_hostnames(limit: int = 400) -> int:
+    """Probe reverse DNS / NetBIOS for clients lacking a hostname (background)."""
+    cache = load_hostname_cache()
+    try:
+        conn = sqlite3.connect(str(NOC_DB_FILE))
+        c = conn.cursor()
+        c.execute("SELECT mac, ip FROM client_presence WHERE ip IS NOT NULL AND ip != ''")
+        rows = c.fetchall()
+        conn.close()
+    except Exception:
+        return 0
+
+    todo = [(m.upper(), i) for m, i in rows if m.upper() not in cache][:limit]
+    if not todo:
+        return 0
+
+    def _one(pair):
+        mac, ip = pair
+        return mac, discover_hostname(ip)
+
+    found = 0
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        for mac, name in ex.map(_one, todo):
+            if name:
+                cache[mac] = name
+                found += 1
+    if found:
+        save_hostname_cache()
+    return found
+
 
 # OUI Prefix Database (First 3 hex octets) for device vendor identification
 OUI_DATABASE = {
@@ -628,74 +809,152 @@ OUI_DATABASE = {
 }
 
 # Detailed mapping for specific Brand, Series/Model, and Type
-OUI_INFO_MAP = {
-    # Infinix & Tecno (Transsion)
-    "BC:91:B5": ("Infinix", "Hot 30 / Note Series", "mobile"),
-    "34:2E:B6": ("Infinix", "Smart / Hot Series", "mobile"),
-    "64:A2:F9": ("Tecno", "Spark / Pova Series", "mobile"),
-    "F0:1D:BC": ("Infinix", "Zero / Note Series", "mobile"),
-    "5C:E9:1E": ("Infinix", "Hot Series", "mobile"),
+# Curated OUI -> model-series hints. IMPORTANT: this table used to contain
+# hand-written entries whose brand disagreed with the IEEE registry (e.g. 5C:E9:1E
+# labelled "Infinix" when IEEE says Apple, B8:78:26 "Apple MacBook" when IEEE says
+# Nintendo). That is exactly why device names did not match their real brand.
+# The table is now only trusted when it AGREES with the bundled IEEE registry, and
+# the brand always comes from IEEE. Entries are kept only for a nicer series hint.
+OUI_SERIES_HINTS = {
     # Apple
-    "AC:BC:32": ("Apple", "iPhone 14 / 13 Series", "mobile"),
-    "F4:F1:5A": ("Apple", "iPhone / iPad (iOS)", "mobile"),
-    "DC:A9:04": ("Apple", "iPhone 15 / 14 Pro", "mobile"),
-    "F0:18:98": ("Apple", "iPad Air / Pro", "tablet"),
-    "B8:78:26": ("Apple", "MacBook Air / Pro", "laptop"),
+    "AC:BC:32": "iPhone Series",
+    "F4:F1:5A": "iPhone / iPad",
+    "DC:A9:04": "iPhone Series",
+    "F0:18:98": "iPad",
     # Samsung
-    "50:01:D9": ("Samsung", "Galaxy A Series (A54/A34)", "mobile"),
-    "B0:C4:E7": ("Samsung", "Galaxy S Series (S23/S22)", "mobile"),
-    "30:07:4D": ("Samsung", "Galaxy Tab Series", "tablet"),
-    "84:25:DB": ("Samsung", "Galaxy A / M Series", "mobile"),
-    "F4:7B:5E": ("Samsung", "Galaxy Z / S Series", "mobile"),
-    # Xiaomi & POCO & Redmi
-    "28:6C:07": ("Xiaomi", "Redmi Note 12 / 13 Pro", "mobile"),
-    "18:59:36": ("Xiaomi", "Redmi 12 / 10C", "mobile"),
-    "64:09:80": ("Xiaomi", "POCO X5 / F5 Pro", "mobile"),
-    "AC:F7:F3": ("Xiaomi", "Xiaomi 13T / 12 Series", "mobile"),
-    # OPPO
-    "08:EA:44": ("OPPO", "Reno / A Series", "mobile"),
-    "14:7D:C5": ("OPPO", "A-Series (A78 / A57)", "mobile"),
-    "AC:C1:EE": ("OPPO", "Reno8 / Reno10 5G", "mobile"),
-    # vivo
-    "2C:57:31": ("vivo", "Y-Series (Y36 / Y22)", "mobile"),
-    "74:5A:AA": ("vivo", "V-Series (V29 / V27)", "mobile"),
-    "C4:EB:67": ("vivo", "Y / V Series", "mobile"),
-    # Realme
-    "D8:16:47": ("Realme", "C-Series (C55 / C33)", "mobile"),
-    "34:7E:5C": ("Realme", "Number Series (11 / 10)", "mobile"),
+    "B0:C4:E7": "Galaxy S Series",
+    "30:07:4D": "Galaxy Tab",
+    "84:25:DB": "Galaxy A / M Series",
+    "F4:7B:5E": "Galaxy Z / S Series",
+    # Xiaomi
+    "28:6C:07": "Redmi Note Series",
+    "18:59:36": "Redmi Series",
+    "64:09:80": "POCO Series",
+    "AC:F7:F3": "Xiaomi Series",
     # Huawei
-    "00:1E:10": ("Huawei", "Nova / Mate Series", "mobile"),
-    "88:28:B3": ("Huawei", "P-Series / MatePad", "mobile"),
-    # PC / Laptop
-    "00:1F:16": ("Lenovo", "ThinkPad L14 / E14", "laptop"),
-    "04:76:6E": ("Lenovo", "IdeaPad / Yoga", "laptop"),
-    "00:14:22": ("Dell", "Latitude 3420 / Inspiron", "laptop"),
-    "34:17:EB": ("Dell", "Vostro / Latitude", "laptop"),
-    "00:1E:0B": ("HP", "ProBook / 240 G8", "laptop"),
-    "00:25:B3": ("HP", "EliteBook / Pavilion", "laptop"),
-    "00:1A:92": ("ASUS", "VivoBook / ExpertBook", "laptop"),
-    "00:24:8C": ("ASUS", "ROG Phone / ZenFone", "mobile"),
-    "00:1E:67": ("Intel", "Wi-Fi (Laptop PC)", "laptop"),
-    "DC:53:60": ("Intel", "Wi-Fi 6 AX200/AX201", "laptop"),
+    "00:1E:10": "Nova / Mate Series",
+    "88:28:B3": "P Series / MatePad",
+    # PC / laptop
+    "00:14:22": "Latitude / Inspiron",
+    "34:17:EB": "Vostro / Latitude",
+    "00:1A:92": "VivoBook / ExpertBook",
+    "00:24:8C": "ROG Phone / ZenFone",
+    "00:1E:67": "Intel Wi-Fi",
+    "DC:53:60": "Intel Wi-Fi 6",
 }
 
-# Deterministic representative mobile device profiles for Indonesian hospital network
-RANDOM_PROFILES = [
-    {"brand": "Samsung", "series": "Galaxy A54 5G", "device_type": "mobile", "vendor": "Samsung Electronics"},
-    {"brand": "Xiaomi", "series": "Redmi Note 12", "device_type": "mobile", "vendor": "Xiaomi Communications"},
-    {"brand": "Apple", "series": "iPhone 14 (iOS)", "device_type": "mobile", "vendor": "Apple, Inc."},
-    {"brand": "OPPO", "series": "Reno8 5G", "device_type": "mobile", "vendor": "OPPO Mobile"},
-    {"brand": "vivo", "series": "Y36 5G", "device_type": "mobile", "vendor": "vivo Mobile"},
-    {"brand": "Infinix", "series": "Hot 30", "device_type": "mobile", "vendor": "Infinix Mobility"},
-    {"brand": "Samsung", "series": "Galaxy S23 5G", "device_type": "mobile", "vendor": "Samsung Electronics"},
-    {"brand": "Apple", "series": "iPhone 13 (iOS)", "device_type": "mobile", "vendor": "Apple, Inc."},
-    {"brand": "Xiaomi", "series": "POCO X5 Pro 5G", "device_type": "mobile", "vendor": "Xiaomi Communications"},
-    {"brand": "Realme", "series": "C55 NFC", "device_type": "mobile", "vendor": "Realme Chongqing"},
-    {"brand": "OPPO", "series": "A78 5G", "device_type": "mobile", "vendor": "OPPO Mobile"},
-    {"brand": "Infinix", "series": "Note 30 Pro", "device_type": "mobile", "vendor": "Infinix Mobility"},
-    {"brand": "Samsung", "series": "Galaxy Tab A8", "device_type": "tablet", "vendor": "Samsung Electronics"},
-    {"brand": "Apple", "series": "iPad Air (iOS)", "device_type": "tablet", "vendor": "Apple, Inc."},
+# ---- IEEE OUI master database (bundled, offline) ---------------------------
+# data/oui_prefixes.tsv.gz : "AABBCC\tVendor Name" per line, ~40.5k entries
+OUI_FILE = BASE / "data" / "oui_prefixes.tsv.gz"
+_IEEE_OUI: dict[str, str] | None = None
+_IEEE_OUI_LOCK = threading.Lock()
+
+
+def load_ieee_oui() -> dict[str, str]:
+    global _IEEE_OUI
+    if _IEEE_OUI is not None:
+        return _IEEE_OUI
+    with _IEEE_OUI_LOCK:
+        if _IEEE_OUI is not None:
+            return _IEEE_OUI
+        table: dict[str, str] = {}
+        try:
+            with gzip.open(OUI_FILE, "rt", encoding="utf-8", errors="replace", newline="") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t", 1)
+                    if len(parts) == 2 and parts[0]:
+                        table[parts[0].strip().upper()] = parts[1].strip()
+        except Exception:
+            table = {}
+        _IEEE_OUI = table
+        return table
+
+
+# Vendor-name normalisation: raw IEEE org name -> (display brand, device type hint)
+VENDOR_BRAND_RULES: list[tuple[tuple[str, ...], str | None, str | None]] = [
+    (("SAMSUNG",), "Samsung", "mobile"),
+    (("APPLE",), "Apple", "mobile"),
+    (("XIAOMI", "BEIJING XIAOMI"), "Xiaomi", "mobile"),
+    (("GUANGDONG OPPO", "OPPO MOBILE"), "OPPO", "mobile"),
+    (("VIVO MOBILE", "VIVO COMMUNICATION"), "vivo", "mobile"),
+    (("REALME",), "Realme", "mobile"),
+    (("HONOR",), "Honor", "mobile"),
+    (("HUAWEI",), "Huawei", "mobile"),
+    (("INFINIX", "TRANSSION"), "Infinix", "mobile"),
+    (("TECNO",), "Tecno", "mobile"),
+    (("INTEL",), "Intel", "laptop"),
+    (("LENOVO",), "Lenovo", "laptop"),
+    (("DELL",), "Dell", "laptop"),
+    (("HEWLETT PACKARD", "HP INC"), "HP", "laptop"),
+    (("ASUSTEK", "ASUS"), "ASUS", "laptop"),
+    (("ACER",), "Acer", "laptop"),
+    (("MICROSOFT",), "Microsoft", "laptop"),
+    (("MICRO-STAR", "MSI"), "MSI", "laptop"),
+    (("TOSHIBA",), "Toshiba", "laptop"),
+    (("MURATA", "ALPS", "AZUREWAVE", "LITEON", "LITE-ON", "FOXCONN", "WISTRON", "QUANTA",
+      "COMPAL", "CHICONY", "HON HAI", "PEGATRON", "CYBERTAN", "CLOUD NETWORK"), None, "unknown"),
+    (("GRANDSTREAM",), "Grandstream", "voip"),
+    (("YEALINK",), "Yealink", "voip"),
+    (("TP-LINK", "TP LINK"), "TP-Link", "network"),
+    (("MIKROTIK",), "MikroTik", "network"),
+    (("UBIQUITI",), "Ubiquiti", "network"),
+    (("CISCO",), "Cisco", "network"),
+    (("ZTE",), "ZTE", "mobile"),
+    (("ONE PLUS", "ONEPLUS"), "OnePlus", "mobile"),
+    (("GOOGLE",), "Google", "mobile"),
+    (("MOTOROLA", "MOTOROLA MOBILITY"), "Motorola", "mobile"),
+    (("NOKIA",), "Nokia", "mobile"),
+    (("SONY",), "Sony", "mobile"),
+    (("LG ELECTRONICS", "LG INNOTEK"), "LG", "mobile"),
+    (("ESPRESSIF",), "Espressif", "iot"),
+    (("RASPBERRY PI",), "Raspberry Pi", "iot"),
+    (("GSA", "GAOSHENGDA"), "Gaoshengda", "unknown"),
+    (("ALTOBEAM",), "AltoBeam", "unknown"),
+    (("EASY3CALL",), "Easy3Call", "voip"),
+    (("HUI ZHOU",), "HuiZhou", "unknown"),
+    (("ALLWINNER", "ROCKCHIP", "AMLOGIC"), "Generic SoC", "iot"),
 ]
+
+
+def normalise_vendor(org: str) -> tuple[str, str]:
+    """Map a raw IEEE organisation name to (display brand, device_type hint)."""
+    if not org:
+        return "", "unknown"
+    up = org.upper()
+    for needles, brand, dtype in VENDOR_BRAND_RULES:
+        if any(n in up for n in needles):
+            if brand is None:
+                # Unknown OEM/ODM module maker: keep a readable short name
+                short = re.split(r"[,\s]+", org.strip())[0]
+                short = short[:18].title()
+                return short, dtype or "unknown"
+            return brand, dtype or "unknown"
+    short = re.sub(r"\b(CO\.?,?\s*LTD\.?|INC\.?|CORP\.?|CORPORATION|LIMITED|TECHNOLOGY|TECHNOLOGIES|"
+                   r"COMMUNICATION|COMMUNICATIONS|ELECTRONICS|COMPANY|GROUP|HOLDINGS?)\b",
+                   "", org, flags=re.IGNORECASE)
+    short = re.sub(r"\s+", " ", short).strip(" ,.")
+    return (short or org)[:22], "unknown"
+
+
+def lookup_oui_vendor(mac: str) -> str:
+    """Raw IEEE organisation name for a MAC's 24-bit prefix, or \"\"."""
+    prefix = "".join(mac.replace(":", "").replace("-", "").upper().split())[:6]
+    if len(prefix) < 6:
+        return ""
+    return load_ieee_oui().get(prefix, "")
+
+
+def is_locally_administered(mac_norm: str) -> bool:
+    try:
+        return (int(mac_norm.split(":")[0], 16) & 0x02) != 0
+    except Exception:
+        return False
+
+
+# NOTE: previous versions carried a "RANDOM_PROFILES" table that guessed a brand
+# (Samsung/Xiaomi/Apple/...) from a hash of the MAC. That produced confident but
+# entirely fabricated device names. It was removed: a randomised MAC genuinely
+# carries no vendor information, so it is now reported as "MAC Acak".
 
 def resolve_client_device(mac: str, ip: str | None = None) -> dict:
     if not mac:
@@ -751,21 +1010,72 @@ def resolve_client_device(mac: str, ip: str | None = None) -> dict:
                 "device_type": "custom"
             }
     
+    # 2. Real hostname discovered on the network (reverse DNS / NetBIOS).
+    #    This is a genuine identity and beats any OUI guess — especially for
+    #    randomised-MAC phones where the OUI carries no information at all.
+    real_host = hostname_for(mac_norm, ip)
+    if real_host:
+        oui_brand, oui_type = "", "unknown"
+        org = lookup_oui_vendor(mac_norm)
+        if org:
+            oui_brand, oui_type = normalise_vendor(org)
+        return {
+            "brand": oui_brand or "Jaringan",
+            "model_series": real_host,
+            "device_name": real_host,
+            "vendor": org or "Nama dari jaringan (DNS/NetBIOS)",
+            "is_custom_name": True,
+            "device_type": oui_type,
+            "is_randomized": is_locally_administered(mac_norm),
+            "oui_prefix": ":".join(mac_norm.split(":")[:3]).replace(":", ""),
+            "hostname_source": "network",
+        }
+
     prefix = ":".join(mac_norm.split(":")[:3])
-    
-    # 2. Check exact OUI info map
-    if prefix in OUI_INFO_MAP:
-        brand, model_series, dev_type = OUI_INFO_MAP[prefix]
+
+    # 3. Full IEEE OUI registry (bundled, ~40.5k prefixes) — the single source
+    #    of truth for the brand. A prefix registered with IEEE is by definition
+    #    a universal (burned-in) address, so this is checked before the
+    #    randomised-MAC test.
+    org = lookup_oui_vendor(mac_norm)
+    if org:
+        brand, dev_type = normalise_vendor(org)
+        series_map = {
+            "laptop": "PC / Laptop",
+            "mobile": "Smartphone",
+            "tablet": "Tablet",
+            "voip": "IP Phone",
+            "network": "Perangkat Jaringan",
+            "iot": "Perangkat IoT",
+        }
+        model_series = OUI_SERIES_HINTS.get(prefix) or series_map.get(dev_type, "Wi-Fi Device")
         return {
             "brand": brand,
             "model_series": model_series,
             "device_name": f"{brand} {model_series}",
-            "vendor": f"{brand} Electronics",
+            "vendor": org,
             "is_custom_name": False,
-            "device_type": dev_type
+            "device_type": dev_type,
+            "is_randomized": False,
+            "oui_prefix": prefix.replace(":", ""),
         }
-        
-    # Check general OUI database
+
+    # 4. Randomised MAC (locally administered bit set) with no IEEE registration
+    #    — the vendor genuinely cannot be derived from the MAC. Report that
+    #    honestly instead of inventing a brand.
+    if is_locally_administered(mac_norm):
+        return {
+            "brand": "Privat",
+            "model_series": "MAC Acak",
+            "device_name": f"Perangkat Privat ({mac_norm[-5:]})",
+            "vendor": "MAC diacak perangkat (Private Wi-Fi Address)",
+            "is_custom_name": False,
+            "device_type": "unknown",
+            "is_randomized": True,
+            "oui_prefix": prefix.replace(":", ""),
+        }
+
+    # 5. Legacy hand-written table (fallback for prefixes missing from IEEE file)
     vendor = OUI_DATABASE.get(prefix)
     if vendor:
         brand = vendor.split()[0]
@@ -789,35 +1099,22 @@ def resolve_client_device(mac: str, ip: str | None = None) -> dict:
             "device_name": f"{brand} {model_series}",
             "vendor": vendor,
             "is_custom_name": False,
-            "device_type": dev_type
+            "device_type": dev_type,
+            "is_randomized": False,
+            "oui_prefix": prefix.replace(":", ""),
         }
 
-    # 3. Randomized MAC (IEEE 802 Locally Administered bit)
-    try:
-        first_byte = int(mac_norm.split(":")[0], 16)
-        is_random = (first_byte & 0x02) != 0
-    except Exception:
-        is_random = False
-        
-    if is_random:
-        h = int(hashlib.md5(mac_norm.encode()).hexdigest(), 16)
-        profile = RANDOM_PROFILES[h % len(RANDOM_PROFILES)]
-        return {
-            "brand": profile["brand"],
-            "model_series": profile["series"],
-            "device_name": f"{profile['brand']} {profile['series']}",
-            "vendor": profile["vendor"],
-            "is_custom_name": False,
-            "device_type": profile["device_type"]
-        }
-        
+    # 6. Truly unknown vendor: label as "Vendor Tidak Dikenal", never a bare
+    #    "Perangkat xx:xx" that looks like a brand.
     return {
-        "brand": "Generic",
-        "model_series": f"Wi-Fi {mac_norm[-5:]}",
-        "device_name": f"Perangkat {mac_norm[-5:]}",
-        "vendor": "Generic Wi-Fi",
+        "brand": "Tidak Dikenal",
+        "model_series": "Vendor Belum Terdaftar IEEE",
+        "device_name": f"Vendor Tidak Dikenal ({mac_norm[-5:]})",
+        "vendor": "Tidak terdaftar di IEEE OUI",
         "is_custom_name": False,
-        "device_type": "unknown"
+        "device_type": "unknown",
+        "is_randomized": False,
+        "oui_prefix": prefix.replace(":", ""),
     }
 
 
@@ -840,6 +1137,7 @@ def build_wireless(mt):
             "device_name": dev_info["device_name"],
             "vendor": dev_info["vendor"],
             "is_custom_name": dev_info["is_custom_name"],
+            "is_randomized": dev_info.get("is_randomized", False),
             "device_type": dev_info["device_type"],
             "signal": c.get("signal-strength"),
             "signal_dbm": _parse_dbm(c.get("signal-strength")),
@@ -857,12 +1155,18 @@ def build_wireless(mt):
         mon = _safe(lambda n=name: mt.wireless_monitor(n), [], f"wlmon {name}")
         m = mon[0] if mon else {}
         ifaces.append({
+            # .id wajib: frontend memakainya untuk update/supported-channels;
+            # tanpa ini semua request edit radio berakhir "Interface tidak ditemukan".
+            # librouteros menormalkan ".id" jadi "id" — terima keduanya.
+            "id": w.get("id") or w.get(".id"),
             "name": name,
             "ssid": w.get("ssid"),
             "band": w.get("band"),
             "frequency": w.get("frequency"),
+            "frequency_live": (str(m.get("channel") or "").split("/")[0]) or None,
             "disabled": w.get("disabled") == "true",
-            "running": w.get("running") == "true",
+            # field `running` basi (radio hidup tapi dilaporkan false) -> pakai status monitor
+            "running": str(m.get("status") or "").startswith("running") or w.get("running") == "true",
             "mode": w.get("mode"),
             "security_profile": w.get("security-profile"),
             "profile_mode": (prof.get(w.get("security-profile")) or {}).get("mode"),
@@ -992,6 +1296,7 @@ def test_connection_helper(host: str, port: int, user: str, password: str) -> di
             port=int(port),
             plaintext_login=True,
         )
+        pool.set_timeout(3.0)  # tanpa ini default 15s → UI "add device" terasa hang
         api = pool.get_api()
         try:
             ident = api.get_resource("/system/identity").get()[0].get("name", "Unknown")
@@ -2049,6 +2354,38 @@ def enrich_client_floor_info(client: dict) -> dict:
     return {**client, "has_floor_map": False}
 
 
+def refresh_client_identities() -> int:
+    """Re-resolve identity for every stored client and update changed rows."""
+    try:
+        conn = sqlite3.connect(str(NOC_DB_FILE))
+        c = conn.cursor()
+        c.execute("SELECT mac, ip, device_name, brand, is_custom_name, is_randomized FROM client_presence")
+        rows = c.fetchall()
+        changed = 0
+        for mac, ip, old_name, old_brand, is_custom, _old_rnd in rows:
+            info = resolve_client_device(mac, ip)
+            if is_custom and old_name and not info.get("hostname_source"):
+                # Keep manual aliases untouched
+                continue
+            new_rnd = 1 if info.get("is_randomized") else 0
+            if (info["device_name"], info.get("brand", "")) != (old_name, old_brand):
+                c.execute(
+                    """UPDATE client_presence SET device_name=?, brand=?, model_series=?,
+                       device_type=?, vendor=?, is_randomized=? WHERE mac=?""",
+                    (info["device_name"], info.get("brand", ""), info.get("model_series", ""),
+                     info.get("device_type", "unknown"), info.get("vendor", ""), new_rnd, mac),
+                )
+                changed += 1
+            else:
+                c.execute("UPDATE client_presence SET is_randomized=? WHERE mac=?", (new_rnd, mac))
+        conn.commit()
+        conn.close()
+        return changed
+    except Exception as ex:
+        print(f"refresh_client_identities error: {ex}")
+        return 0
+
+
 def probe_fleet_clients_and_record():
     """Probe all APs for wireless clients and record presence / roaming events."""
     devs = load_devices()
@@ -2133,13 +2470,14 @@ def probe_fleet_clients_and_record():
                     c.execute("""
                         INSERT OR REPLACE INTO client_presence 
                         (mac, ip, device_name, brand, model_series, device_type, vendor, is_custom_name,
-                         ap_id, ap_name, ap_host, interface, band, ssid, signal_dbm, signal_raw,
+                         is_randomized, ap_id, ap_name, ap_host, interface, band, ssid, signal_dbm, signal_raw,
                          tx_rate, rx_rate, uptime, first_seen, last_seen, status, roam_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', 0)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', 0)
                     """, (
                         mac, ip, dev_info["device_name"], dev_info.get("brand", ""), dev_info.get("model_series", ""),
                         dev_info.get("device_type", "unknown"), dev_info.get("vendor", ""),
                         1 if dev_info.get("is_custom_name") else 0,
+                        1 if dev_info.get("is_randomized") else 0,
                         d["id"], d["name"], d["host"], iface, band, r.get("ssid", ""), sig_dbm, sig_raw,
                         r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""), now, now
                     ))
@@ -2160,14 +2498,26 @@ def probe_fleet_clients_and_record():
                         new_roam_count = (prev.get("roam_count") or 0) + 1
                         c.execute("""
                             UPDATE client_presence SET
-                            ip = ?, device_name = ?, brand = ?, model_series = ?, device_type = ?, vendor = ?,
+                            ip = ?, device_name = ?, brand = ?, model_series = ?, device_type = ?, vendor = ?, is_randomized = ?,
                             ap_id = ?, ap_name = ?, ap_host = ?, interface = ?, band = ?, ssid = ?,
                             signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
                             last_seen = ?, status = 'online', roam_count = ?
-                            WHERE mac = ?
+                            WHERE mac = ? AND (is_custom_name IS NULL OR is_custom_name = 0)
                         """, (
                             ip, dev_info["device_name"], dev_info.get("brand", ""), dev_info.get("model_series", ""),
                             dev_info.get("device_type", "unknown"), dev_info.get("vendor", ""),
+                            1 if dev_info.get("is_randomized") else 0,
+                            d["id"], d["name"], d["host"], iface, band, r.get("ssid", ""),
+                            sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
+                            now, new_roam_count, mac
+                        ))
+                        c.execute("""
+                            UPDATE client_presence SET
+                            ap_id = ?, ap_name = ?, ap_host = ?, interface = ?, band = ?, ssid = ?,
+                            signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
+                            last_seen = ?, status = 'online', roam_count = ?
+                            WHERE mac = ? AND is_custom_name = 1
+                        """, (
                             d["id"], d["name"], d["host"], iface, band, r.get("ssid", ""),
                             sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
                             now, new_roam_count, mac
@@ -2184,11 +2534,27 @@ def probe_fleet_clients_and_record():
                         ))
                         existing[mac] = {"ap_id": d["id"], "ap_name": d["name"], "signal_dbm": sig_dbm, "roam_count": new_roam_count, "first_seen": prev.get("first_seen", now)}
                     else:
+                        # Refresh identity fields too: a row first seen before the
+                        # IEEE OUI table existed must not keep a stale/generic name
+                        # forever just because the client never roamed.
+                        c.execute("""
+                            UPDATE client_presence SET
+                            ip = ?, device_name = ?, brand = ?, model_series = ?, device_type = ?, vendor = ?, is_randomized = ?,
+                            signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
+                            last_seen = ?, status = 'online'
+                            WHERE mac = ? AND (is_custom_name IS NULL OR is_custom_name = 0)
+                        """, (
+                            ip, dev_info["device_name"], dev_info.get("brand", ""), dev_info.get("model_series", ""),
+                            dev_info.get("device_type", "unknown"), dev_info.get("vendor", ""),
+                            1 if dev_info.get("is_randomized") else 0,
+                            sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
+                            now, mac
+                        ))
                         c.execute("""
                             UPDATE client_presence SET
                             ip = ?, signal_dbm = ?, signal_raw = ?, tx_rate = ?, rx_rate = ?, uptime = ?,
                             last_seen = ?, status = 'online'
-                            WHERE mac = ?
+                            WHERE mac = ? AND is_custom_name = 1
                         """, (
                             ip, sig_dbm, sig_raw, r.get("tx-rate", ""), r.get("rx-rate", ""), r.get("uptime", ""),
                             now, mac
@@ -2201,6 +2567,13 @@ def probe_fleet_clients_and_record():
             conn.close()
         except Exception as ex:
             print(f"Error in probe_fleet_clients_and_record: {ex}")
+
+    # Enrich identities from the network itself (reverse DNS / NetBIOS). Runs
+    # after the DB write so a slow DNS server never delays presence updates.
+    try:
+        sweep_client_hostnames()
+    except Exception as ex:
+        print(f"Hostname sweep error: {ex}")
 
     return {
         "status": "ok",
@@ -2466,6 +2839,21 @@ def api_client_trail(mac: str):
 def api_client_locator_poll_now():
     res = probe_fleet_clients_and_record()
     return res
+
+
+@app.post("/api/clients/hostnames/sweep")
+def api_client_hostnames_sweep(limit: int = 400):
+    """Probe reverse DNS / NetBIOS for client hostnames, then refresh the DB."""
+    found = sweep_client_hostnames(limit=limit)
+    refreshed = refresh_client_identities()
+    return {"status": "ok", "hostnames_found": found, "rows_refreshed": refreshed,
+            "cached_total": len(load_hostname_cache())}
+
+
+@app.get("/api/clients/hostnames")
+def api_client_hostnames():
+    cache = load_hostname_cache()
+    return {"status": "ok", "total": len(cache), "hostnames": cache}
 
 @app.post("/api/interfaces/toggle")
 def api_interface_toggle(req: InterfaceToggleReq):
@@ -3365,23 +3753,21 @@ def get_map_floors():
         enriched_p["device_model"] = "cAP (2.4 GHz Only)" if is_single_band_cap else dev.get("model", "cAP ac (Dual-Band)")
         enriched_p["is_online"] = dev.get("online", True)
         
-        # Real-time / cached client count
-        cnt = 0
+        # Jumlah klien: baca registration-table asli, cache 25 s.
+        # AP yang tidak ada di devices.json -> None (UI menyembunyikan), TIDAK pernah dikarang.
         cache_entry = MAP_CLIENTS_CACHE.get(dev_id)
-        if cache_entry and (now - cache_entry.get("ts", 0) < 25):
-            cnt = cache_entry.get("count", 0)
-        elif dev_id == "apm-hrd" or dev.get("host") == "192.168.88.1":
+        if not dev:
+            cnt = None
+        elif cache_entry and (now - cache_entry.get("ts", 0) < 25):
+            cnt = cache_entry.get("count")
+        else:
             try:
                 with get_device_lock(dev["host"]), MT(dev) as mt:
-                    regs = mt.resource("/interface/wireless/registration-table").get()
-                    cnt = len(regs)
-                    MAP_CLIENTS_CACHE[dev_id] = {"count": cnt, "ts": now}
+                    cnt = len(mt.resource("/interface/wireless/registration-table").get())
+                MAP_CLIENTS_CACHE[dev_id] = {"count": cnt, "ts": now}
             except Exception:
-                cnt = cache_entry.get("count", 13) if cache_entry else 13
-        else:
-            cnt = hash(dev_id) % 8 + 3 # representative simulation for mock APs
-            MAP_CLIENTS_CACHE[dev_id] = {"count": cnt, "ts": now}
-            
+                cnt = cache_entry.get("count") if cache_entry else None
+
         enriched_p["clients_count"] = cnt
         enriched_placements.append(enriched_p)
     
@@ -3895,11 +4281,20 @@ def api_rf_scan(
 
     ranked = sorted(channels_out, key=_rank_key)
     best3 = ranked[:3]
-    _cur_freq = int(target.get("frequency", "0") or 0)
+    # RouterOS lapor frequency='auto' saat radio tak terkunci / sedang scanning.
+    # Dulu int('auto') melempar ValueError dan seluruh tahap Scan gagal.
+    def _freq_num(v) -> int:
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return 0
+
+    _cur_freq = _freq_num(target.get("frequency"))
     current = {
         "channel": (round((_cur_freq - 2407) / 5) if band == "2g"
-                    else (_cur_freq - 5000) // 5 if _cur_freq else 0),
-        "freq": int(target.get("frequency", "0") or 0),
+                    else (_cur_freq - 5000) // 5 if _cur_freq else 0) if _cur_freq else None,
+        "freq": _cur_freq,
+        "channel_known": bool(_cur_freq),
         "width": target.get("channel-width"),
         "ssid": target.get("ssid"),
         "interface": target.get("name"),
@@ -4806,6 +5201,1859 @@ def health(device: str | None = None):
         return f"ok device={name} host={dev['host']} id={dev['id']}"
     except Exception as e:
         return PlainTextResponse(f"fail {type(e).__name__}: {e}", status_code=503)
+
+
+# ---------------------------------------------------------------- RRM / auto-optimizer
+# Direct-push self-optimising WLAN (Ruijie-style): DCA + TPC + steering from rrm_engine,
+# applied by the backend itself on a schedule, with snapshot/rollback and client-drop guard.
+import rrm_engine as rrm
+
+RRM_CFG_FILE = BASE / "rrm_config.json"
+RRM_DEFAULT = {
+    "enabled": False,          # auto-push on/off
+    "interval_min": 15,        # evaluation period
+    "include_dfs": False,      # DFS channels opt-in only (radar hit drops the radio)
+    "apply_channel": True,
+    "apply_txpower": False,
+    "apply_steering": False,
+    "apply_roam": False,       # blokir MAC di AP yang salah (pengganti 802.11k/v)
+    "roam_thr_dbm": -74.0,     # blokir hanya saat sinyal klien di AP itu <= ini
+    "roam_alt_min_dbm": -67.0, # AP alternatif minimal sekuat ini, kalau tidak klien yatim
+    "roam_margin_db": 7.0,     # histeresis: selisih minimal agar layak dipaksa pindah
+    "roam_expire_min": 10,     # entry ACL dicabut otomatis setelah ini
+    "min_gain_pct": 15.0,      # do not touch a working network for less than this
+    "quiet_start": "01:00",    # auto-push only inside this window unless no clients attached
+    "quiet_end": "05:00",
+    "max_client_drop": 0,      # rollback automatically if more clients vanish than this
+    "scan_duration": 8,
+    "sample_interval_min": 5,
+    "channels_2g": [1, 6, 11],                                  # channel numbers, not MHz
+    "channels_5g": [36, 40, 44, 48, 149, 153, 157, 161, 165],
+    "last_run_ts": 0.0,
+}
+
+
+def ch_to_freq(band: str, ch: int) -> int:
+    """Channel number -> centre frequency (MHz)."""
+    ch = int(ch)
+    if str(band).startswith("2"):
+        return 2484 if ch == 14 else 2412 + 5 * (ch - 1)
+    if 36 <= ch <= 64:
+        return 5180 + 5 * (ch - 36)
+    if 100 <= ch <= 144:
+        return 5500 + 5 * (ch - 100)
+    if 149 <= ch <= 177:
+        return 5745 + 5 * (ch - 149)
+    return 0
+
+
+def rrm_allowed_freqs(cfg: dict) -> dict:
+    """Whitelist from config, in MHz, ready for rrm.plan_dca(allowed=...)."""
+    out = {}
+    for band, key in (("2g", "channels_2g"), ("5g", "channels_5g")):
+        freqs = [ch_to_freq(band, c) for c in (cfg.get(key) or []) if str(c).strip() != ""]
+        freqs = [f for f in freqs if f]
+        if freqs:
+            out[band] = freqs
+    return out
+RRM_LOCK = threading.Lock()
+
+
+def init_rrm_db():
+    with _DB_LOCK:
+        conn = sqlite3.connect(str(NOC_DB_FILE))
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS rf_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, device_id TEXT, interface TEXT, band TEXT, mac TEXT,
+                rssi REAL, snr REAL, tx_ccq REAL, retry_pct REAL, noise_dbm REAL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rf_samples_dev ON rf_samples (device_id, ts)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS rrm_runs (
+                id TEXT PRIMARY KEY, ts REAL, mode TEXT, status TEXT,
+                gain_pct REAL, plan_json TEXT, snapshot_json TEXT,
+                result_json TEXT, rolled_back INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+
+def load_rrm_cfg() -> dict:
+    cfg = dict(RRM_DEFAULT)
+    if RRM_CFG_FILE.exists():
+        try:
+            cfg.update(json.loads(RRM_CFG_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_rrm_cfg(cfg: dict) -> dict:
+    merged = load_rrm_cfg()
+    merged.update(cfg or {})
+    tmp = RRM_CFG_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    os.replace(tmp, RRM_CFG_FILE)
+    return merged
+
+
+def _hhmm_to_min(s: str) -> int:
+    try:
+        h, m = str(s).split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return 0
+
+
+def _in_quiet_window(cfg: dict) -> bool:
+    now = time.localtime()
+    cur = now.tm_hour * 60 + now.tm_min
+    start, end = _hhmm_to_min(cfg.get("quiet_start", "01:00")), _hhmm_to_min(cfg.get("quiet_end", "05:00"))
+    if start == end:
+        return True
+    return start <= cur < end if start < end else (cur >= start or cur < end)
+
+
+# ---------- RF sample store (training data for the ML anomaly engine) ----------
+def db_rf_samples_insert(rows: list[tuple]):
+    if not rows:
+        return
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.executemany("""
+                INSERT INTO rf_samples (ts, device_id, interface, band, mac, rssi, snr, tx_ccq, retry_pct, noise_dbm)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            conn.execute("DELETE FROM rf_samples WHERE ts < ?", (time.time() - 30 * 86400,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_rf_samples(device_id: str | None = None, limit: int = 20000) -> list[dict]:
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            if device_id:
+                rows = conn.execute(
+                    "SELECT * FROM rf_samples WHERE device_id=? ORDER BY ts DESC LIMIT ?",
+                    (device_id, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM rf_samples ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+
+def db_rrm_run_save(run: dict):
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute("""
+                INSERT OR REPLACE INTO rrm_runs
+                (id, ts, mode, status, gain_pct, plan_json, snapshot_json, result_json, rolled_back)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """, (run["id"], run["ts"], run["mode"], run.get("status", "applied"),
+                  run.get("gain_pct", 0.0), json.dumps(run.get("plan") or {}),
+                  json.dumps(run.get("snapshot") or {}), json.dumps(run.get("result") or {})))
+            conn.execute("DELETE FROM rrm_runs WHERE ts < ?", (time.time() - 90 * 86400,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_rrm_runs(limit: int = 20) -> list[dict]:
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM rrm_runs ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            conn.close()
+            out = []
+            for r in rows:
+                d = dict(r)
+                for k in ("plan_json", "snapshot_json", "result_json"):
+                    try:
+                        d[k.replace("_json", "")] = json.loads(d.pop(k) or "{}")
+                    except Exception:
+                        d[k.replace("_json", "")] = {}
+                out.append(d)
+            return out
+        except Exception:
+            return []
+
+
+def db_rrm_run_get(run_id: str) -> dict | None:
+    return next((r for r in db_rrm_runs(200) if r["id"] == run_id), None)
+
+
+def db_rrm_run_mark_rolled_back(run_id: str):
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute("UPDATE rrm_runs SET rolled_back=1 WHERE id=?", (run_id,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+# ---------- live data collection ----------
+def _sig_dbm(raw) -> float | None:
+    try:
+        return float(str(raw).split("@")[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _band_of(iface: dict) -> str:
+    return "5g" if "5ghz" in (iface.get("band") or "").lower() else "2g"
+
+
+def _width_mhz(iface: dict) -> int:
+    m = re.search(r"(\d+)", str(iface.get("channel-width") or "20"))
+    return int(m.group(1)) if m else 20
+
+
+def collect_rf_samples(dev: dict, mt) -> int:
+    """One row per associated client: the feature vector the ML engine trains on."""
+    ts = time.time()
+    rows = []
+    try:
+        reg = mt.resource("/interface/wireless/registration-table").get()
+    except Exception:
+        return 0
+    ifaces = {i["name"]: i for i in mt.resource("/interface/wireless").get()}
+    for c in reg:
+        rssi = _sig_dbm(c.get("signal-strength"))
+        if rssi is None:
+            continue
+        try:
+            snr = float(c.get("signal-to-noise") or 0)
+        except (TypeError, ValueError):
+            snr = 0.0
+        try:
+            ccq = float(c.get("tx-ccq") or 0)
+        except (TypeError, ValueError):
+            ccq = 0.0
+        try:
+            tx_frames = float(str(c.get("frames", "0,0")).split(",")[1])
+            timed_out = float(c.get("tx-frames-timed-out") or 0)
+            retry_pct = (100.0 * timed_out / tx_frames) if tx_frames > 0 else 0.0
+        except (TypeError, ValueError, IndexError):
+            retry_pct = 0.0
+        iface = ifaces.get(c.get("interface"), {})
+        rows.append((ts, dev["id"], c.get("interface"), _band_of(iface), c.get("mac-address"),
+                     rssi, snr, ccq, round(retry_pct, 2), rssi - snr))
+    db_rf_samples_insert(rows)
+    return len(rows)
+
+
+def _gather_ap(dev: dict, duration: int) -> list[dict]:
+    """Per-band engine input for one AP: own channel, noise floor, neighbour BSSes."""
+    out = []
+    known = {}
+    try:
+        known = get_fleet_known_bssids() or {}
+    except Exception:
+        known = {}
+    for band in ("2g", "5g"):
+        try:
+            scan = api_rf_scan(device=dev["id"], band=band, duration=duration)
+        except HTTPException:
+            continue
+        except Exception:
+            continue
+        iface_name = scan.get("interface")
+        cur = scan.get("current_channel") or {}
+        try:
+            freq = int(float(cur.get("freq")))
+        except (TypeError, ValueError):
+            freq = 0
+        # freq 0 = radio tak punya channel eksplisit ('auto' / sedang scanning /
+        # mati). Dulu di-skip total sehingga plan melihat "tak ada AP" lalu bilang
+        # "sudah optimal". Sekarang tetap masuk plan sebagai perbaikan.
+        noise = {int(c["freq"]): float(c["noise_floor"])
+                 for c in scan.get("channels", [])
+                 if c.get("noise_floor") is not None}
+        neighbours = []
+        for b in scan.get("bss_list", []):
+            owner = (known.get(str(b.get("bssid", "")).upper().replace("-", ":")) or {}).get("device_id")
+            neighbours.append({
+                "freq": int(b.get("freq") or 0),
+                "width": int(b.get("width") or 20),
+                "signal": float(b.get("signal") or -95),
+                "owner": owner,
+                "ssid": b.get("ssid"),
+                "bssid": b.get("bssid"),
+            })
+        out.append({
+            "id": f"{dev['id']}#{band}", "device_id": dev["id"],
+            "interface": iface_name, "band": band,
+            "freq": freq, "width": _width_mhz({"channel-width": cur.get("width")}),
+            "neighbours": neighbours, "noise": noise,
+            "current_quality": scan.get("current_channel_quality"),
+            "tx_power": None,
+        })
+    return out
+
+
+def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None) -> dict:
+    cfg = load_rrm_cfg()
+    if include_dfs is None:
+        include_dfs = bool(cfg.get("include_dfs"))
+    if duration is None:
+        duration = int(cfg.get("scan_duration", 8))
+    devs = load_devices()
+    aps: list[dict] = []
+    samples = 0
+    unhealthy: list[dict] = []
+    sup: dict[str, dict[str, set]] = {}
+
+    def gather(d):
+        # monitor dibaca SEBELUM scan: /interface/wireless/scan mematikan radio
+        # sementara, jadi bacaan sesudahnya kosong (freq 0) dan radio sehat tampak mati.
+        wl: dict = {}
+        mon: dict = {}
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                wl = {w["name"]: w for w in mt.resource("/interface/wireless").get()}
+                mon = _wl_monitor(mt.api, list(wl))
+        except Exception:
+            pass
+        got = _gather_ap(d, duration)
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                for w in wl.values():
+                    band = _band_of(w)
+                    if band not in ("2g", "5g") or w.get("master-interface") \
+                            or str(w.get("disabled")).lower() == "true":
+                        continue
+                    try:
+                        chans = get_supported_channels(mt, w)["channels"]
+                        sup.setdefault(d["id"], {})[band] = {int(c["freq"]) for c in chans}
+                    except Exception:
+                        pass
+                for a in got:
+                    w = wl.get(a["interface"]) or {}
+                    try:
+                        a["tx_power"] = float(w.get("tx-power")) if w.get("tx-power") else None
+                    except (TypeError, ValueError):
+                        a["tx_power"] = None
+                # `/interface/wireless` melaporkan running/frequency BASI: radio
+                # hidup (running-ap di monitor) tapi field-nya bilang running=false
+                # / frequency=auto. Percaya monitor, bukan field.
+                names = [n for n, w in wl.items()
+                         if str(w.get("disabled")).lower() != "true"
+                         and not w.get("master-interface")
+                         and str(w.get("mode") or "") == "ap-bridge"]
+                for name in names:
+                    w, m = wl[name], mon.get(name) or {}
+                    band = _band_of(w)
+                    if band not in ("2g", "5g"):
+                        continue
+                    status = str(m.get("status") or "")
+                    width = str(w.get("channel-width") or "")
+                    if not status:
+                        # monitor gagal/timeout — jangan tuduh radio mati tanpa bukti
+                        if str(w.get("running")).lower() == "true":
+                            continue
+                        status = "monitor tak menjawab"
+                    if status.startswith("running") and m.get("freq"):
+                        continue
+                    reason = (f"radio tidak running ({status or w.get('status') or 'tanpa status'})")
+                    fix_width = None
+                    if band == "2g" and width in ("5mhz", "10mhz", "5/10mhz"):
+                        reason = f"channel-width {width} tak didukung 2.4GHz — radio tak bisa start"
+                        fix_width = "20mhz"
+                    unhealthy.append({
+                        "device_id": d["id"], "interface": name, "band": band,
+                        "freq": int(m.get("freq") or 0), "reason": reason, "fix_width": fix_width,
+                    })
+                n = collect_rf_samples(d, mt)
+        except Exception:
+            n = 0
+        return got, n
+
+    with ThreadPoolExecutor(max_workers=min(len(devs), 4) or 1) as ex:
+        for got, n in ex.map(gather, devs):
+            aps.extend(got)
+            samples += n
+
+    allowed = rrm_allowed_freqs(cfg)
+    # Whitelist config masih bisa memuat kanal yang ditolak regulatory-domain
+    # router ini (mis. ch 149-165 di etsi) -> "bad band or frequency" saat apply.
+    # Saring dengan kanal yang benar-benar didukung SEMUA AP.
+    for band, freqs in list(allowed.items()):
+        ok = [f for f in freqs
+              if all(f in s.get(band, set()) for s in sup.values() if s.get(band))]
+        if ok:
+            allowed[band] = ok
+    dca = rrm.plan_dca(aps, include_dfs=include_dfs, allowed=allowed)
+    for u in unhealthy:
+        if any(c.get("device_id") == u["device_id"] and c.get("interface") == u["interface"]
+               for c in dca["changes"]):
+            continue
+        to_freq = (allowed.get(u["band"]) or [None])[0]
+        if not to_freq:
+            continue
+        dca["changes"].append({
+            "device_id": u["device_id"], "interface": u["interface"], "band": u["band"],
+            "from_freq": u["freq"], "to_freq": to_freq, "repair": True, "reason": u["reason"],
+            "fix_width": u.get("fix_width"),
+            "interference_before_mw": 0.0, "interference_after_mw": 0.0, "relief_pct": 0.0,
+        })
+    tpc = rrm.plan_tpc(aps)
+    steering = []
+    seen: dict[str, dict[str, list[float]]] = {}
+    current: dict[str, dict] = {}
+    roam_cutoff = time.time() - 3600
+    for d in devs:
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                wl = mt.resource("/interface/wireless").get()
+                i2 = next((w["name"] for w in wl if _band_of(w) == "2g"), None)
+                i5 = next((w["name"] for w in wl if _band_of(w) == "5g"), None)
+                clients = mt.resource("/interface/wireless/registration-table").get()
+        except Exception:
+            continue
+        c2 = [c for c in clients if c.get("interface") == i2]
+        rules = rrm.steering_rules(i2, i5, [{"mac": c.get("mac-address"),
+                                            "signal_strength": c.get("signal-strength")} for c in c2])
+        for r in rules:
+            r["device_id"] = d["id"]
+        steering.extend(rules)
+        for c in clients:
+            mac = c.get("mac-address")
+            if not mac:
+                continue
+            iface = c.get("interface")
+            current[mac] = {"device": d["id"], "interface": iface,
+                            "band": "2g" if iface == i2 else ("5g" if iface == i5 else "?")}
+        for s in db_rf_samples(d["id"], limit=20000):
+            if (s.get("ts") or 0) < roam_cutoff or s.get("rssi") is None or not s.get("mac"):
+                continue
+            seen.setdefault(s["mac"], {}).setdefault(d["id"], []).append(float(s["rssi"]))
+
+    roam = rrm.plan_roam(seen, current,
+                         thr_dbm=float(cfg.get("roam_thr_dbm", -74.0)),
+                         alt_min_dbm=float(cfg.get("roam_alt_min_dbm", -67.0)),
+                         margin_db=float(cfg.get("roam_margin_db", 7.0)))
+
+    return {
+        "ok": True,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "include_dfs": include_dfs,
+        "devices_scanned": len(devs),
+        "bands_seen": len(aps),
+        "samples_collected": samples,
+        "dca": dca,
+        "tpc": tpc,
+        "steering": steering,
+        "roam": roam,
+        "summary": {
+            "channel_changes": len(dca["changes"]),
+            "repairs": len([c for c in dca["changes"] if c.get("repair")]),
+            "txpower_changes": len(tpc),
+            "steering_rules": len(steering),
+            "roam_rules": len(roam),
+            "expected_gain_pct": dca["gain_pct"],
+            "actionable": bool(dca["changes"] or tpc or steering or roam),
+        },
+    }
+
+
+# ---------- apply / rollback ----------
+def _snapshot_wireless(dev: dict, mt) -> list[dict]:
+    snap = []
+    for w in mt.resource("/interface/wireless").get():
+        snap.append({
+            "device_id": dev["id"], "interface": w["name"],
+            "frequency": w.get("frequency"), "channel_width": w.get("channel-width"),
+            "tx_power": w.get("tx-power"), "tx_power_mode": w.get("tx-power-mode"),
+            "acl_ids": [],
+        })
+    return snap
+
+
+def _wl_monitor(api, names: list[str]) -> dict:
+    """Sumber kebenaran radio. `/interface/wireless` sering basi (running=false /
+    frequency=auto padahal radio jalan), monitor yang benar-benar melapor."""
+    out = {}
+    for n in names:
+        try:
+            rows = api.get_binary_resource("/").call(
+                "interface/wireless/monitor", {"numbers": n.encode(), "once": b"yes"})
+            row = {k: (v.decode() if isinstance(v, bytes) else v)
+                   for k, v in (rows[0] if rows else {}).items()}
+        except Exception:
+            row = {}
+        m = re.match(r"(\d{4,5})", str(row.get("channel") or ""))
+        out[n] = {"status": row.get("status") or "", "freq": int(m.group(1)) if m else 0,
+                  "channel_raw": row.get("channel"), "noise": row.get("noise-floor"),
+                  "clients": row.get("registered-clients")}
+    return out
+
+
+def _apply_channel_changes(changes: list[dict]) -> list[dict]:
+    done = []
+    for ch in changes:
+        dev = get_device(ch["device_id"])
+
+        def push() -> dict:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                wl = mt.resource("/interface/wireless")
+                target = wl.get(name=ch["interface"])
+                if not target:
+                    return {**ch, "applied": False, "error": "interface tidak ada di router"}
+                # width tak valid (mis. 5mhz di 2.4GHz) bikin radio "no supported
+                # channels" — set frequency saja tak akan pernah start.
+                if ch.get("fix_width"):
+                    wl.set(id=target[0]["id"], **{"channel-width": ch["fix_width"]})
+                extra = {}
+                try:
+                    wl.set(id=target[0]["id"], frequency=str(ch["to_freq"]))
+                except Exception as e:
+                    if "bad band or frequency" not in str(e):
+                        raise
+                    # Lebar channel tak didukung di channel tujuan (country=etsi:
+                    # 80MHz hanya legal di 5470-5725, jadi ch36 ditolak). Sempitkan
+                    # ke 20MHz — lebih baik radio hidup 20MHz daripada gagal total.
+                    wl.set(id=target[0]["id"], **{"channel-width": "20mhz",
+                                                  "frequency": str(ch["to_freq"])})
+                    extra["width_fallback"] = "20mhz"
+                # Radio butuh ~10-20 s untuk benar-benar pindah kanal; sekali baca
+                # setelah 3 s masih menangkap frekuensi transisi ("searching-for-
+                # frequency") -> poll sampai running atau timeout, baru vonis.
+                deadline = time.time() + 22
+                mon = {}
+                while time.time() < deadline:
+                    time.sleep(3)
+                    mon = _wl_monitor(mt.api, [ch["interface"]]).get(ch["interface"]) or {}
+                    if str(mon.get("freq")) == str(ch["to_freq"]) \
+                            and "running" in str(mon.get("status") or ""):
+                        break
+                ok = str(mon.get("freq")) == str(ch["to_freq"])
+                return {**ch, "applied": ok, "verified_freq": mon.get("freq"),
+                        "status": mon.get("status"), **extra,
+                        **({} if ok else {"error": f"freq tetap {mon.get('freq')} ({mon.get('status')})"})}
+
+        row = None
+        for attempt in (1, 2):
+            try:
+                row = push()
+                break
+            except Exception as e:
+                if attempt == 2:
+                    row = {**ch, "applied": False, "error": f"{type(e).__name__}: {e}"}
+                else:
+                    # restart radio AP sebelumnya kerap memutus sesi API router;
+                    # satu AP gagal jangan sampai menggagalkan seluruh batch.
+                    time.sleep(4)
+        done.append(row)
+    return done
+
+
+def _apply_tpc_changes(changes: list[dict]) -> list[dict]:
+    done = []
+    for t in changes:
+        dev = get_device(t["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                wl = mt.resource("/interface/wireless")
+                target = wl.get(name=t["interface"])
+                if not target:
+                    done.append({**t, "applied": False,
+                                 "error": f"interface {t['interface']} tidak ada di {dev['id']}"})
+                    continue
+                # RouterOS wireless: tx-power hanya dipakai kalau tx-power-mode
+                # sudah all-rates-fixed. Dikirim satu paket, tx-power diabaikan
+                # (mode belum aktif saat parameter dibaca) -> dua langkah, lalu
+                # baca balik: tanpa readback "applied: True" cuma tebakan.
+                wl.set(id=target[0]["id"], tx_power_mode="all-rates-fixed")
+                wl.set(id=target[0]["id"], tx_power=str(int(t["to_dbm"])))
+                after = (wl.get(name=t["interface"]) or [{}])[0].get("tx-power")
+                ok = str(after) == str(int(t["to_dbm"]))
+                done.append({**t, "applied": ok, "verified_dbm": after,
+                             **({} if ok else {"error": f"tx-power tetap {after}"})})
+        except Exception as e:
+            done.append({**t, "applied": False, "error": f"{type(e).__name__}: {e}"})
+    return done
+
+
+def _apply_steering_rules(rules: list[dict]) -> list[dict]:
+    done = []
+    for r in rules:
+        dev = get_device(r["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                acl = mt.resource("/interface/wireless/access-list")
+                # ACL RouterOS tidak punya unique-key: add berulang = entri ganda.
+                if not acl.get(comment=r["comment"]):
+                    acl.add(interface=r["interface"], signal_range=r["signal_range"],
+                            authentication="no", forwarding="no", comment=r["comment"])
+                created = acl.get(comment=r["comment"])
+                done.append({**r, "applied": True, "acl_ids": [x["id"] for x in created]})
+        except Exception as e:
+            done.append({**r, "applied": False, "error": f"{type(e).__name__}: {e}"})
+    return done
+
+
+ROAM_PREFIX = "RRM-roam-"
+
+
+def _apply_roam_rules(rules: list[dict], expire_min: int = 10) -> list[dict]:
+    """Blokir MAC di AP yang salah, hanya selama sinyalnya lemah (mac-address + signal-range).
+
+    Entry dicabut otomatis oleh `_roam_expire()` setelah `expire_min` menit, dan klien
+    otomatis boleh asosiasi lagi begitu sinyalnya di AP itu kembali di atas ambang.
+    """
+    done = []
+    exp = int(time.time() + max(1, int(expire_min)) * 60)
+    for r in rules:
+        dev = get_device(r["device_id"])
+        comment = f"{ROAM_PREFIX}{exp}-{r['mac']}"
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                acl = mt.resource("/interface/wireless/access-list")
+                # Idempoten: entry lama untuk MAC yang sama dicabut dulu, kalau tidak
+                # tiap run menumpuk ACL ganda dengan expiry berbeda.
+                for old in acl.get():
+                    if str(old.get("comment") or "").startswith(ROAM_PREFIX) and \
+                            str(old.get("comment") or "").endswith(f"-{r['mac']}"):
+                        try:
+                            acl.remove(id=old["id"])
+                        except Exception:
+                            pass
+                acl.add(**{"mac-address": r["mac"], "signal-range": r["signal_range"],
+                           "authentication": "no", "forwarding": "no",
+                           "interface": r.get("interface") or "", "comment": comment})
+                created = acl.get(comment=comment)
+                done.append({**r, "applied": True, "comment": comment, "expires_ts": exp,
+                             "acl_ids": [x["id"] for x in created]})
+        except Exception as e:
+            done.append({**r, "applied": False, "error": f"{type(e).__name__}: {e}"})
+    return done
+
+
+def _roam_expire() -> int:
+    """Cabut entry RRM-roam-* yang lewat masa berlaku (jaring pengaman kalau sampel basi)."""
+    removed, now = 0, time.time()
+    for d in load_devices():
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                acl = mt.resource("/interface/wireless/access-list")
+                for x in acl.get():
+                    c = str(x.get("comment") or "")
+                    if not c.startswith(ROAM_PREFIX):
+                        continue
+                    try:
+                        exp = int(c[len(ROAM_PREFIX):].split("-", 1)[0])
+                    except (ValueError, IndexError):
+                        continue
+                    if exp <= now:
+                        acl.remove(id=x["id"])
+                        removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+class RrmApplyReq(BaseModel):
+    apply_channel: bool | None = None
+    apply_txpower: bool | None = None
+    apply_steering: bool | None = None
+    apply_roam: bool | None = None
+    include_dfs: bool | None = None
+    min_gain_pct: float | None = None
+    device: str | None = None   # batasi push ke satu AP (channel dikunci: milik plan fleet)
+    plan: dict | None = None
+
+
+class RrmRollbackReq(BaseModel):
+    run_id: str
+
+
+@app.post("/api/rrm/plan")
+def api_rrm_plan(include_dfs: bool | None = None, duration: int | None = Query(None, ge=4, le=20)):
+    return build_rrm_plan(include_dfs=include_dfs, duration=duration)
+
+
+@app.post("/api/rrm/apply")
+def api_rrm_apply(req: RrmApplyReq):
+    cfg = load_rrm_cfg()
+    plan = req.plan or build_rrm_plan(include_dfs=req.include_dfs)
+    do_ch = cfg["apply_channel"] if req.apply_channel is None else req.apply_channel
+    do_tpc = cfg["apply_txpower"] if req.apply_txpower is None else req.apply_txpower
+    do_steer = cfg["apply_steering"] if req.apply_steering is None else req.apply_steering
+    do_roam = cfg.get("apply_roam", False) if req.apply_roam is None else req.apply_roam
+    min_gain = cfg["min_gain_pct"] if req.min_gain_pct is None else req.min_gain_pct
+
+    dca = plan.get("dca") or {}
+    only = req.device
+    ch_skip = None
+    changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
+    if only:
+        # Optimasi channel tetap fleet-only (joint coloring lintas AP), TAPI
+        # perbaikan (radio mati / channel di luar rencana) harus tetap dikirim
+        # walau user menekan "Optimize AP" untuk satu AP — kalau tidak, klik
+        # Optimize AP tidak pernah memperbaiki apa pun.
+        changes = [c for c in changes if c.get("repair") or not c.get("from_freq")]
+        ch_skip = (f"channel optimasi dikelola global (fleet) — AP {only} "
+                   f"hanya dikirimi perbaikan + TX power/steering")
+    # Radio tanpa channel eksplisit (from_freq 0) = perbaikan, bukan optimasi:
+    # gate gain tidak berlaku, kalau tidak radio 'auto' selamanya dibiarkan.
+    repairs = [c for c in changes if c.get("repair") or not c.get("from_freq")]
+    if do_ch and not repairs and dca.get("gain_pct", 0) < float(min_gain):
+        ch_skip = f"gain {dca.get('gain_pct', 0)}% < min_gain {min_gain}% — channel tidak diubah"
+        do_ch = False
+    elif do_ch and repairs:
+        ch_skip = f"{len(repairs)} radio tanpa channel eksplisit — dipulihkan tanpa gate gain"
+    tpc = [t for t in (plan.get("tpc") or []) if not only or t.get("device_id") == only]
+    steer = [s for s in (plan.get("steering") or []) if not only or s.get("device_id") == only]
+    roam = [r for r in (plan.get("roam") or []) if not only or r.get("device_id") == only]
+    if not (do_ch and changes) and not (do_tpc and tpc) and not (do_steer and steer) \
+            and not (do_roam and roam):
+        return {"ok": False, "skipped": True,
+                "reason": ch_skip or "tidak ada aksi yang lolos guard — jaringan tidak disentuh",
+                "channel_skipped": ch_skip}
+
+    devs = {d["id"]: d for d in load_devices()}
+    if only:
+        devs = {k: v for k, v in devs.items() if k == only}
+    max_drop = int(cfg.get("max_client_drop") or 0)
+    roam_expire = int(cfg.get("roam_expire_min") or 10)
+    clients_before: dict = {}
+    snapshot: list = []
+    result = {"channel": [], "txpower": [], "steering": [], "roam": []}
+    aborted = None
+
+    def _clients(dev: dict) -> int:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            return len(mt.resource("/interface/wireless/registration-table").get())
+
+
+    # push sekuensial per AP — satu-satunya blast radius; abort kalau klien hilang melebihi batas
+    for did, dev in devs.items():
+        slice_ch = [c for c in changes if c.get("device_id") == did]
+        slice_tp = [t for t in tpc if t.get("device_id") == did]
+        slice_st = [s for s in steer if s.get("device_id") == did]
+        slice_rm = [r for r in roam if r.get("device_id") == did]
+        if not ((do_ch and slice_ch) or (do_tpc and slice_tp) or (do_steer and slice_st)
+                or (do_roam and slice_rm)):
+            continue
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                snapshot.extend(_snapshot_wireless(dev, mt))
+            before = _clients(dev)
+        except Exception as e:
+            aborted = {"device": did, "reason": f"tidak bisa dihubungi: {type(e).__name__}: {e}"}
+            break
+        clients_before[did] = before
+        applied_now = 0
+        if do_ch and slice_ch:
+            got = _apply_channel_changes(slice_ch)
+            result["channel"] += got
+            applied_now += sum(1 for x in got if x.get("applied"))
+        if do_tpc and slice_tp:
+            got = _apply_tpc_changes(slice_tp)
+            result["txpower"] += got
+            applied_now += sum(1 for x in got if x.get("applied"))
+        if do_steer and slice_st:
+            got = _apply_steering_rules(slice_st)
+            result["steering"] += got
+            applied_now += sum(1 for x in got if x.get("applied"))
+        if do_roam and slice_rm:
+            got = _apply_roam_rules(slice_rm, roam_expire)
+            result["roam"] += got
+            applied_now += sum(1 for x in got if x.get("applied"))
+        if not applied_now:
+            continue
+        after = _settle_clients(before, lambda: _clients(dev), max_drop)
+        if before - after > max_drop:
+            aborted = {"device": did, "clients_before": before, "clients_after": after,
+                       "reason": f"klien turun {before - after} > batas {max_drop} — push dihentikan"}
+            # rollback AP ini saja dari snapshot
+            for entry in [e for e in snapshot if e.get("device_id") == did]:
+                try:
+                    with get_device_lock(dev["host"]), MT(dev) as mt:
+                        wl = mt.resource("/interface/wireless")
+                        cur = wl.get(name=entry["interface"])
+                        if not cur:
+                            continue
+                        # urutan penting: channel-width dulu, baru frequency
+                        # (set frequency ke kanal yang tak mendukung width lama
+                        #  ditolak 'bad band or frequency'), tx-power butuh mode
+                        # all-rates-fixed lebih dulu. Tiap langkah diverifikasi.
+                        if entry.get("channel_width") and \
+                                str(cur[0].get("channel-width") or "") != str(entry["channel_width"]):
+                            wl.set(id=cur[0]["id"], channel_width=entry["channel_width"])
+                        if entry.get("frequency") and \
+                                str(cur[0].get("frequency") or "") != str(entry["frequency"]):
+                            wl.set(id=cur[0]["id"], frequency=str(entry["frequency"]))
+                        if entry.get("tx_power") and \
+                                str(cur[0].get("tx-power") or "") != str(entry["tx_power"]):
+                            wl.set(id=cur[0]["id"], tx_power_mode="all-rates-fixed")
+                            wl.set(id=cur[0]["id"], tx_power=str(entry["tx_power"]))
+                        now = (wl.get(name=entry["interface"]) or [{}])[0]
+                        if entry.get("frequency") and \
+                                str(now.get("frequency") or "") != str(entry["frequency"]):
+                            aborted.setdefault("rollback_errors", []).append(
+                                f"{did}/{entry['interface']}: frequency tetap {now.get('frequency')}")
+                        acl = mt.resource("/interface/wireless/access-list")
+                        for r in acl.get():
+                            if r.get("comment") == "RRM-steer-5g" or \
+                                    str(r.get("comment") or "").startswith(ROAM_PREFIX):
+                                acl.remove(id=r["id"])
+                except Exception as e:
+                    aborted.setdefault("rollback_errors", []).append(
+                        f"{did}/{entry.get('interface')}: {type(e).__name__}: {e}")
+                    continue
+            break
+
+    run = {
+        "id": f"rrm_{secrets.token_hex(4)}", "ts": time.time(), "mode": "manual",
+        "status": "aborted" if aborted else "applied", "gain_pct": dca.get("gain_pct", 0.0),
+        "plan": plan, "snapshot": {"wireless": snapshot, "clients_before": clients_before},
+        "result": result, "aborted": aborted,
+    }
+    db_rrm_run_save(run)
+    applied = sum(1 for k in result for x in result[k] if x.get("applied"))
+    return {"ok": True, "run_id": run["id"], "applied_actions": applied,
+            "gain_pct": run["gain_pct"], "result": result, "channel_skipped": ch_skip,
+            "aborted": aborted, "clients_before": clients_before,
+            "rollback_hint": f"POST /api/rrm/rollback {{'run_id': '{run['id']}'}}"}
+
+
+@app.post("/api/rrm/rollback")
+def api_rrm_rollback(req: RrmRollbackReq):
+    run = db_rrm_run_get(req.run_id)
+    if not run:
+        raise HTTPException(404, "Run tidak ditemukan")
+    snap = (run.get("snapshot") or {}).get("wireless") or []
+    restored, acl_removed = 0, 0
+    for entry in snap:
+        dev = get_device(entry["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                wl = mt.resource("/interface/wireless")
+                target = wl.get(name=entry["interface"])
+                if not target:
+                    continue
+                attrs = {}
+                if entry.get("frequency"):
+                    attrs["frequency"] = str(entry["frequency"])
+                if entry.get("channel_width"):
+                    attrs["channel_width"] = entry["channel_width"]
+                if entry.get("tx_power"):
+                    attrs["tx_power"] = str(entry["tx_power"])
+                if entry.get("tx_power_mode"):
+                    attrs["tx_power_mode"] = entry["tx_power_mode"]
+                cur = target[0]
+                attrs = {k: v for k, v in attrs.items()
+                         if str(cur.get(k.replace("_", "-")) or "") != str(v)}
+                if attrs:
+                    wl.set(id=cur["id"], **attrs)
+                    restored += 1
+                acl = mt.resource("/interface/wireless/access-list")
+                for r in acl.get():
+                    if r.get("comment") == "RRM-steer-5g" or \
+                            str(r.get("comment") or "").startswith(ROAM_PREFIX):
+                        acl.remove(id=r["id"])
+                        acl_removed += 1
+        except Exception:
+            continue
+    db_rrm_run_mark_rolled_back(req.run_id)
+    return {"ok": True, "run_id": req.run_id, "interfaces_restored": restored,
+            "steering_rules_removed": acl_removed}
+
+
+@app.get("/api/rrm/status")
+def api_rrm_status():
+    cfg = load_rrm_cfg()
+    samples = len(db_rf_samples(limit=100000))
+    return {
+        "ok": True,
+        "config": cfg,
+        "in_quiet_window": _in_quiet_window(cfg),
+        "rf_samples": samples,
+        "ml_ready": samples >= 100,
+        "runs": db_rrm_runs(10),
+    }
+
+
+@app.post("/api/rrm/config")
+def api_rrm_config(req: dict):
+    cfg = save_rrm_cfg(req or {})
+    return {"ok": True, "config": cfg}
+
+
+# ---------- WiFi diagnostics (overview dashboard) ----------
+RETRY_BUCKETS = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 35), (35, 1001)]
+RSSI_BUCKETS = [(-50, 0), (-60, -50), (-70, -60), (-80, -70), (-200, -80)]
+
+
+def _bucket_pct(values: list[float], buckets: list[tuple]) -> list[dict]:
+    n = len(values)
+    out = []
+    for lo, hi in buckets:
+        c = sum(1 for v in values if lo <= v < hi)
+        out.append({"lo": lo, "hi": None if hi >= 1001 or hi <= -200 else hi, "count": c,
+                    "pct": round(100.0 * c / n, 1) if n else 0.0})
+    return out
+
+
+def _fleet_ap_coverage(cutoff: float) -> list[dict]:
+    """Satu titik per AP terdaftar: median RSSI klien yang dilayaninya (proksi kualitas cakupan)."""
+    out = []
+    for d in load_devices():
+        vals, macs = [], set()
+        for s in db_rf_samples(d.get("id"), limit=40000):
+            if (s.get("ts") or 0) < cutoff or s.get("rssi") is None:
+                continue
+            vals.append(float(s["rssi"]))
+            if s.get("mac"):
+                macs.add(s["mac"])
+        vals.sort()
+        out.append({
+            "id": d.get("id"), "name": d.get("name") or d.get("host"), "host": d.get("host"),
+            "samples": len(vals), "clients": len(macs),
+            "median_dbm": round(vals[len(vals) // 2], 1) if vals else None,
+            "weak_pct": round(100.0 * sum(1 for v in vals if v < -70) / len(vals), 1) if vals else None,
+        })
+    return out
+
+
+def _worst_link_clients(samples: list[dict], top: int = 5) -> list[dict]:
+    """MAC dengan rata-rata (100 - tx-ccq) tertinggi — biang kerok agregat."""
+    per_mac: dict[str, list[float]] = {}
+    bands: dict[str, str] = {}
+    for s in samples:
+        if s.get("tx_ccq") is None or not s.get("mac"):
+            continue
+        per_mac.setdefault(s["mac"], []).append(100.0 - float(s["tx_ccq"]))
+        bands.setdefault(s["mac"], s.get("band") or "?")
+    out = [{"mac": m, "band": bands[m], "pct": round(sum(v) / len(v), 1), "samples": len(v)}
+           for m, v in per_mac.items()]
+    out.sort(key=lambda x: -x["pct"])
+    return out[:top]
+
+
+@app.get("/api/wifi/diagnostics")
+def api_wifi_diagnostics(device: str | None = None, hours: int = Query(24, ge=1, le=168)):
+    dev = get_device(device)
+    cutoff = time.time() - hours * 3600
+    samples = [s for s in db_rf_samples(dev.get("id"), limit=40000) if (s.get("ts") or 0) >= cutoff]
+    def _quality(sub: list[dict]) -> dict:
+        """Tekanan link = 100 - tx-ccq. Driver legacy cAP ac selalu melaporkan
+        tx-frames-timed-out = 0, jadi retry hardware tak bisa diukur di sini."""
+        pct = [100.0 - float(s["tx_ccq"]) for s in sub if s.get("tx_ccq") is not None]
+        return {"buckets": _bucket_pct(pct, RETRY_BUCKETS), "samples": len(pct),
+                "avg_pct": round(sum(pct) / len(pct), 1) if pct else 0.0}
+
+    rssi_vals = [float(s.get("rssi")) for s in samples if s.get("rssi") is not None]
+    bands = {}
+    for bkey in ("2g", "5g"):
+        sub = [s for s in samples if (s.get("band") or "").lower().startswith(bkey)]
+        if sub:
+            bands[bkey] = _quality(sub)
+
+    clients: list[dict] = []
+    try:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            reg = mt.resource("/interface/wireless/registration-table").get()
+            for c in reg:
+                rssi = _sig_dbm(c.get("signal-strength"))
+                try:
+                    ccq_pct = round(100.0 - float(c.get("tx-ccq") or 0), 1)
+                except (TypeError, ValueError):
+                    ccq_pct = None
+                clients.append({"mac": c.get("mac-address"), "interface": c.get("interface"),
+                                "rssi": rssi, "ccq_pct": ccq_pct,
+                                "has_ip": bool(c.get("last-ip")), "uptime": c.get("uptime")})
+    except Exception as e:
+        return {"ok": False, "error": str(e), "device_id": dev.get("id")}
+
+    per_mac: dict[str, list[float]] = {}
+    for s in samples:
+        if s.get("rssi") is not None:
+            per_mac.setdefault(s.get("mac") or "?", []).append(float(s["rssi"]))
+    for c in clients:
+        vals = per_mac.get(c["mac"] or "?", [])
+        c["rssi_avg"] = round(sum(vals) / len(vals), 1) if vals else c["rssi"]
+        c["samples"] = len(vals)
+    live_rssi = [c["rssi"] for c in clients if c["rssi"] is not None]
+    series_rssi = rssi_vals or live_rssi
+    live = sorted(series_rssi)
+    median = live[len(live) // 2] if live else None
+    weak = sum(1 for v in series_rssi if v < -70)
+    weak_pct = round(100.0 * weak / len(series_rssi), 1) if series_rssi else 0.0
+    need_density = bool(series_rssi) and (median is not None and median < -67 or weak_pct > 20)
+    aps = _fleet_ap_coverage(cutoff)
+    bad = [a for a in aps if a["median_dbm"] is not None and (a["median_dbm"] < -67 or (a["weak_pct"] or 0) > 20)]
+    need_density = bool(bad) or need_density
+    bad_names = ", ".join(a["name"] for a in bad)
+    bad_med = min([a["median_dbm"] for a in bad], default=None)
+    return {
+        "ok": True, "device_id": dev.get("id"), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "window_h": hours,
+        "quality": {
+            **_quality(samples),
+            "measured_retry": False,
+            "worst": _worst_link_clients(samples),
+            "live": [{"mac": c["mac"], "interface": c["interface"], "ccq_pct": c["ccq_pct"]} for c in clients],
+            "bands": bands,
+            "source": "sampler 5 menit — 100 − tx-ccq; driver legacy cAP ac tak melaporkan tx-frames-timed-out",
+        },
+        "signal": {
+            "buckets": _bucket_pct(rssi_vals, RSSI_BUCKETS),
+            "live": [{"mac": c["mac"], "interface": c["interface"], "rssi": c["rssi"],
+                      "rssi_avg": c.get("rssi_avg"), "samples": c.get("samples", 0)} for c in clients],
+            "median_dbm": median, "weak_pct": weak_pct, "clients": len(live_rssi),
+            "samples": len(series_rssi),
+            "source": "rf_samples (rssi) + registration-table live",
+        },
+        "aps": aps,
+        "density": {
+            "need_improvement": need_density,
+            "title": "Kerapatan AP perlu diperbaiki" if need_density else "Kerapatan AP memadai",
+            "detail": (f"{bad_names} median {bad_med} dBm — klien di AP ini mayoritas lemah"
+                       if bad_names else f"{len([a for a in aps if a['median_dbm'] is not None])} AP terukur, median klien terendah {min([a['median_dbm'] for a in aps if a['median_dbm'] is not None], default=None)} dBm"),
+        },
+    }
+
+
+# ---------- ML anomaly engine (IsolationForest) ----------
+ML_FEATURES = ["rssi", "snr", "tx_ccq", "retry_pct", "noise_dbm"]
+
+
+@app.post("/api/ai/ml/anomaly")
+def api_ml_anomaly(device: str | None = None, min_samples: int = Query(100, ge=30, le=5000)):
+    rows = db_rf_samples(device, limit=20000)
+    if len(rows) < min_samples:
+        return {"ok": False, "status": "collecting", "samples": len(rows),
+                "needed": min_samples,
+                "note": "sampel RF dikumpulkan tiap 5 menit — biarkan sampler berjalan"}
+    try:
+        import numpy as np
+        from sklearn.ensemble import IsolationForest
+    except ImportError:
+        raise HTTPException(503, "scikit-learn belum terpasang: pip install scikit-learn")
+    X = np.array([[float(r[f] or 0) for f in ML_FEATURES] for r in rows], dtype=float)
+    model = IsolationForest(n_estimators=200, contamination="auto", random_state=42)
+    pred = model.fit_predict(X)
+    score = model.decision_function(X)
+    anomalies = []
+    for r, p, s in zip(rows, pred, score):
+        if p != -1:
+            continue
+        anomalies.append({
+            "mac": r["mac"], "device_id": r["device_id"], "interface": r["interface"],
+            "band": r["band"], "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"])),
+            "score": round(float(s), 4), "features": {f: r[f] for f in ML_FEATURES},
+            "verdict": _anomaly_verdict(r),
+        })
+    anomalies.sort(key=lambda a: a["score"])
+    return {"ok": True, "samples": len(rows), "anomalies": anomalies[:50],
+            "anomaly_count": len(anomalies),
+            "anomaly_rate_pct": round(100.0 * len(anomalies) / len(rows), 2),
+            "model": "IsolationForest(n_estimators=200)"}
+
+
+def _anomaly_verdict(r: dict) -> str:
+    """Human label for a flagged sample — hidden-node / non-Wi-Fi interference patterns."""
+    snr, retry, ccq = float(r.get("snr") or 0), float(r.get("retry_pct") or 0), float(r.get("tx_ccq") or 0)
+    if snr >= 25 and retry > 15:
+        return "hidden node collision — high SNR but heavy retries"
+    if snr < 15 and retry > 10:
+        return "non-Wi-Fi interference / noise floor rise"
+    if ccq < 60:
+        return "airtime starvation — channel congestion"
+    return "transmission anomaly"
+
+
+# ---------- background workers ----------
+def _rf_sampler_loop():
+    while True:
+        cfg = load_rrm_cfg()
+        try:
+            for d in load_devices():
+                try:
+                    with get_device_lock(d["host"]), MT(d) as mt:
+                        collect_rf_samples(d, mt)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(max(60, int(cfg.get("sample_interval_min", 5)) * 60))
+
+
+def _mean(vals):
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+def _settle_clients(before, sample, max_drop, timeout=45.0, step=3.0):
+    """Tunggu klien re-associate (radio restart 10-30 s), kembalikan hitungan
+    terakhir. Berhenti cepat begitu pulih; timeout -> nilai terakhir (drop nyata
+    tetap terdeteksi). Semua sample gagal -> before (tak ada bukti drop)."""
+    last = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(step)
+        try:
+            last = sample()
+        except Exception:
+            continue
+        if last >= before - max_drop:
+            return last
+    return before if last is None else last
+
+
+def _rrm_auto_loop():
+    while True:
+        cfg = load_rrm_cfg()
+        try:
+            due = time.time() - float(cfg.get("last_run_ts") or 0) >= int(cfg.get("interval_min", 15)) * 60
+            if cfg.get("enabled") and due and _in_quiet_window(cfg):
+                plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"))
+                gain = (plan.get("dca") or {}).get("gain_pct", 0)
+                if plan["summary"]["actionable"] and gain >= float(cfg.get("min_gain_pct", 15.0)):
+                    clients_before = _client_count()
+                    res = api_rrm_apply(RrmApplyReq())
+                    run_id = res.get("run_id")
+                    save_rrm_cfg({"last_run_ts": time.time()})
+                    if run_id:
+                        time.sleep(60)  # let clients re-associate
+                        dropped = clients_before - _client_count()
+                        if dropped > int(cfg.get("max_client_drop", 0)):
+                            api_rrm_rollback(RrmRollbackReq(run_id=run_id))
+                            db_save_alert({
+                                "id": f"rrm_{secrets.token_hex(4)}",
+                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "status": "warning", "device_id": "rrm",
+                                "alert_type": "RRM_AUTO_ROLLBACK",
+                                "text": (f"RRM auto-rollback: {dropped} klien hilang setelah "
+                                         f"push {run_id} (batas {cfg.get('max_client_drop')})"),
+                            })
+                else:
+                    save_rrm_cfg({"last_run_ts": time.time()})
+        except Exception:
+            pass
+        try:
+            _roam_expire()   # jaring pengaman: entry RRM-roam-* lewat masa berlaku dicabut
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+def _client_count() -> int:
+    total = 0
+    for d in load_devices():
+        try:
+            with get_device_lock(d["host"]), MT(d) as mt:
+                total += len(mt.resource("/interface/wireless/registration-table").get())
+        except Exception:
+            continue
+    return total
+
+
+init_rrm_db()
+threading.Thread(target=_rf_sampler_loop, daemon=True, name="rf-sampler").start()
+threading.Thread(target=_rrm_auto_loop, daemon=True, name="rrm-auto").start()
+
+
+# ---------- AI auto-push: recommendations → applied by the backend, no clicking ----------
+# Channel work is owned by the RRM engine (DCA/TPC), so set_2ghz_channel is deliberately NOT
+# auto-pushed here — two controllers fighting over the same radio is how you get flapping.
+AI_AUTO_POLICY = {
+    "flush_dns":                  {"auto": True,  "risk": "low",    "label": "flush cache DNS"},
+    "clean_storage_and_cache":    {"auto": True,  "risk": "low",    "label": "bersihkan cache + proteksi flash"},
+    "disable_dns_remote":         {"auto": True,  "risk": "low",    "label": "tutup DNS open resolver"},
+    "enable_fasttrack":           {"auto": True,  "risk": "low",    "label": "aktifkan FastTrack"},
+    "optimize_5ghz_throughput":   {"auto": True,  "risk": "medium", "label": "lebar pita 5GHz → 80MHz"},
+    "set_2ghz_channel":           {"auto": False, "risk": "medium", "label": "kunci channel 2.4GHz"},
+    "disable_service":            {"auto": False, "risk": "medium", "label": "nonaktifkan service"},
+    "kick_weak_clients":          {"auto": False, "risk": "high",   "label": "putus klien lemah"},
+}
+
+
+class AiAutoReq(BaseModel):
+    device: str | None = None
+    dry_run: bool = False
+    include_medium: bool = True
+    actions: list[str] | None = None
+
+
+def _ai_snapshot(dev: dict, mt) -> dict:
+    snap = {"wireless": [], "dns": None, "fasttrack_ids": []}
+    try:
+        for w in mt.resource("/interface/wireless").get():
+            snap["wireless"].append({
+                "device_id": dev["id"], "interface": w["name"],
+                "channel_width": w.get("channel-width"), "frequency": w.get("frequency"),
+            })
+    except Exception:
+        pass
+    try:
+        d = mt.resource("/ip/dns").get()
+        snap["dns"] = {"allow_remote_requests": (d[0] if d else {}).get("allow-remote-requests")}
+    except Exception:
+        pass
+    try:
+        snap["fasttrack_ids"] = [r["id"] for r in mt.resource("/ip/firewall/filter").get()
+                                 if r.get("comment") == "AI-FastTrack"]
+    except Exception:
+        pass
+    return snap
+
+
+@app.post("/api/ai/optimize/auto")
+def api_ai_optimize_auto(req: AiAutoReq):
+    dev = get_device(req.device)
+    diag = api_ai_diagnose(device=dev["id"])
+    recs = diag.get("recommendations") or []
+
+    eligible, skipped = [], []
+    for r in recs:
+        action = r.get("action_type")
+        pol = AI_AUTO_POLICY.get(action)
+        if not pol or not pol.get("auto"):
+            skipped.append({"id": r.get("id"), "action_type": action, "title": r.get("title"),
+                            "reason": ("tidak ada di whitelist auto-push" if not pol
+                                       else f"risk {pol['risk']} — {pol['label']} butuh persetujuan manual")})
+            continue
+        if pol["risk"] == "medium" and not req.include_medium:
+            skipped.append({"id": r.get("id"), "action_type": action, "title": r.get("title"),
+                            "reason": "risk medium dinonaktifkan (include_medium=false)"})
+            continue
+        if req.actions and action not in req.actions:
+            skipped.append({"id": r.get("id"), "action_type": action, "title": r.get("title"),
+                            "reason": "tidak diminta di filter actions"})
+            continue
+        eligible.append(r)
+
+    if req.dry_run:
+        return {"ok": True, "dry_run": True, "score": diag.get("score"), "grade": diag.get("grade"),
+                "would_apply": [{"action_type": r["action_type"], "title": r.get("title"),
+                                 "command": r.get("command")} for r in eligible],
+                "skipped": skipped}
+
+    if not eligible:
+        return {"ok": True, "run_id": None, "steps": [], "skipped": skipped,
+                "score_before": diag.get("score"), "score_after": diag.get("score"),
+                "message": "Tidak ada rekomendasi aman untuk di-push — router sudah bersih"}
+
+    try:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            snap = _ai_snapshot(dev, mt)
+    except Exception as e:
+        raise HTTPException(503, f"Snapshot gagal, push dibatalkan: {type(e).__name__}: {e}")
+
+    steps = []
+    for r in eligible:
+        action = r["action_type"]
+        try:
+            res = api_ai_apply(AiApplyReq(device=dev["id"], action_type=action,
+                                          action_params=r.get("action_params")))
+            steps.append({"action_type": action, "label": AI_AUTO_POLICY[action]["label"],
+                          "title": r.get("title"), "ok": True,
+                          "message": res.get("message"), "command": r.get("command")})
+        except Exception as e:
+            steps.append({"action_type": action, "label": AI_AUTO_POLICY[action]["label"],
+                          "title": r.get("title"), "ok": False,
+                          "error": f"{type(e).__name__}: {e}", "command": r.get("command")})
+
+    run = {
+        "id": f"ai_{secrets.token_hex(4)}", "ts": time.time(), "mode": "ai-auto", "status": "applied",
+        "gain_pct": 0.0,
+        "plan": {"device": dev["id"], "score_before": diag.get("score"),
+                 "eligible": [r["action_type"] for r in eligible]},
+        "snapshot": {"ai": snap},
+        "result": {"steps": steps},
+    }
+    db_rrm_run_save(run)
+
+    after = None
+    try:
+        after = api_ai_diagnose(device=dev["id"]).get("score")
+    except Exception:
+        pass
+    return {"ok": True, "run_id": run["id"], "steps": steps, "skipped": skipped,
+            "applied": sum(1 for s in steps if s["ok"]),
+            "failed": sum(1 for s in steps if not s["ok"]),
+            "score_before": diag.get("score"), "score_after": after,
+            "rollback_hint": f"POST /api/ai/optimize/rollback {{'run_id': '{run['id']}'}}"}
+
+
+@app.post("/api/ai/optimize/rollback")
+def api_ai_optimize_rollback(req: RrmRollbackReq):
+    run = db_rrm_run_get(req.run_id)
+    if not run:
+        raise HTTPException(404, "Run tidak ditemukan")
+    snap = (run.get("snapshot") or {}).get("ai")
+    if not snap:
+        raise HTTPException(400, "Run ini tidak punya snapshot AI (bukan ai-auto)")
+    restored, removed = 0, 0
+    for entry in snap.get("wireless") or []:
+        dev = get_device(entry["device_id"])
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                wl = mt.resource("/interface/wireless")
+                target = wl.get(name=entry["interface"])
+                if not target:
+                    continue
+                attrs = {}
+                if entry.get("channel_width"):
+                    attrs["channel_width"] = entry["channel_width"]
+                if entry.get("frequency"):
+                    attrs["frequency"] = str(entry["frequency"])
+                cur = target[0]
+                attrs = {k: v for k, v in attrs.items()
+                         if str(cur.get(k.replace("_", "-")) or "") != str(v)}
+                if attrs:
+                    wl.set(id=cur["id"], **attrs)
+                    restored += 1
+        except Exception:
+            continue
+    if snap.get("dns") and snap["dns"].get("allow_remote_requests") is not None:
+        dev = get_device((run.get("plan") or {}).get("device"))
+        try:
+            with get_device_lock(dev["host"]), MT(dev) as mt:
+                mt.resource("/ip/dns").set(
+                    allow_remote_requests=str(snap["dns"]["allow_remote_requests"]))
+        except Exception:
+            pass
+    keep = set(snap.get("fasttrack_ids") or [])
+    dev = get_device((run.get("plan") or {}).get("device"))
+    try:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            flt = mt.resource("/ip/firewall/filter")
+            for r in flt.get():
+                if r.get("comment") == "AI-FastTrack" and r["id"] not in keep:
+                    flt.remove(id=r["id"])
+                    removed += 1
+    except Exception:
+        pass
+    db_rrm_run_mark_rolled_back(req.run_id)
+    return {"ok": True, "run_id": req.run_id, "interfaces_restored": restored,
+            "fasttrack_rules_removed": removed}
+
+
+# ---------- Optimization pipeline (Ruijie-style 5-phase wizard, runs in background) ----------
+# Stages: identify critical APs -> collect history -> scan WLAN -> compute -> deliver.
+# Job state lives in SQLite + a worker thread, so leaving the page does not stop it.
+OPT_JOBS: dict[str, dict] = {}
+OPT_LOCK = threading.Lock()
+
+
+def _opt_db_init():
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS optimize_jobs (
+                    id TEXT PRIMARY KEY, device TEXT, status TEXT, stage TEXT,
+                    stage_index INTEGER, stages_json TEXT, details_json TEXT,
+                    run_id TEXT, started REAL, updated REAL, error TEXT
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def _opt_job_save(job: dict):
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute("""
+                INSERT INTO optimize_jobs (id, device, status, stage, stage_index, stages_json,
+                                           details_json, run_id, started, updated, error)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET status=excluded.status, stage=excluded.stage,
+                    stage_index=excluded.stage_index, stages_json=excluded.stages_json,
+                    details_json=excluded.details_json, run_id=excluded.run_id,
+                    updated=excluded.updated, error=excluded.error
+            """, (job["id"], job.get("device"), job["status"], job.get("stage"),
+                  job.get("stage_index", 0), json.dumps(job["stages"]),
+                  json.dumps(job["details"], default=str), job.get("run_id"),
+                  job["started"], time.time(), job.get("error")))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def _opt_job_load(job_id: str) -> dict | None:
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM optimize_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                conn.close()
+                return None
+            out = dict(row)
+            out["stages"] = json.loads(out.pop("stages_json") or "[]")
+            out["details"] = json.loads(out.pop("details_json") or "{}")
+            conn.close()
+            return out
+        except Exception:
+            return None
+
+
+def _opt_latest(device: str | None = None) -> dict | None:
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            if device:
+                row = conn.execute(
+                    "SELECT * FROM optimize_jobs WHERE device=? ORDER BY started DESC LIMIT 1",
+                    (device,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM optimize_jobs ORDER BY started DESC LIMIT 1").fetchone()
+            if not row:
+                conn.close()
+                return None
+            out = dict(row)
+            out["stages"] = json.loads(out.pop("stages_json") or "[]")
+            out["details"] = json.loads(out.pop("details_json") or "{}")
+            conn.close()
+            return out
+        except Exception:
+            return None
+
+
+def _opt_stages(history_min: int, scan_s: int) -> list[dict]:
+    return [
+        {"key": "identify", "name": "Identify critical APs", "eta": "~5 s",
+         "status": "pending", "started": None, "ended": None},
+        {"key": "history", "name": "Collect historical data", "eta": f"window {history_min} min",
+         "status": "pending", "started": None, "ended": None},
+        {"key": "scan", "name": "Scan the WLAN environment", "eta": f"~{scan_s} s per band",
+         "status": "pending", "started": None, "ended": None},
+        {"key": "compute", "name": "Compute the optimal configuration", "eta": "~10 s",
+         "status": "pending", "started": None, "ended": None},
+        {"key": "deliver", "name": "Deliver the configuration", "eta": "~15 s",
+         "status": "pending", "started": None, "ended": None},
+    ]
+
+
+def _opt_set_stage(job: dict, idx: int, status: str):
+    now = time.time()
+    if 0 <= idx < len(job["stages"]):
+        st = job["stages"][idx]
+        st["status"] = status
+        if status == "running":
+            st["started"] = now
+        elif status in ("done", "error", "skipped"):
+            st["ended"] = now
+        job["stage"] = st["key"]
+        job["stage_index"] = idx
+    job["updated"] = now
+    _opt_job_save(job)
+
+
+def _opt_roaming_issues(samples: list[dict]) -> list[dict]:
+    """Roaming problems derived from stored RF samples (no router I/O)."""
+    by_mac: dict[str, list[dict]] = {}
+    for s in samples:
+        if s.get("mac"):
+            by_mac.setdefault(s["mac"], []).append(s)
+    issues = []
+    for mac, rows in by_mac.items():
+        radios = sorted({r.get("interface") for r in rows if r.get("interface")})
+        devices = sorted({r.get("device_id") for r in rows if r.get("device_id")})
+        rssi = [r["rssi"] for r in rows if r.get("rssi") is not None]
+        weak = [v for v in rssi if v < -75]
+        if len(devices) > 1:
+            issues.append({
+                "mac": mac, "type": "roaming_flip",
+                "scope": "cross-AP", "devices": devices, "interfaces": radios,
+                "samples": len(rows),
+                "avg_rssi": round(sum(rssi) / len(rssi), 1) if rssi else None,
+                "note": "Klien berpindah antar-AP dalam window — roaming sensitivity terlalu longgar / coverage overlap kurang.",
+            })
+        elif len(radios) > 1:
+            issues.append({
+                "mac": mac, "type": "roaming_flip",
+                "scope": "intra-AP band", "devices": devices, "interfaces": radios,
+                "samples": len(rows),
+                "avg_rssi": round(sum(rssi) / len(rssi), 1) if rssi else None,
+                "note": "Klien bolak-balik 2.4/5GHz — band steering belum menahan klien capable di 5GHz. "
+                        "Tidak diubah otomatis: RSSI masih kuat, perlu band-steering per-MAC (manual).",
+            })
+        elif weak and len(weak) >= max(3, len(rows) // 2):
+            issues.append({
+                "mac": mac, "type": "sticky_weak",
+                "scope": "sticky client", "devices": devices, "interfaces": radios,
+                "samples": len(rows), "weak_samples": len(weak),
+                "avg_rssi": round(sum(weak) / len(weak), 1),
+                "note": "Klien menempel di RSSI < -75 dBm — kandidat kick / steering threshold.",
+            })
+    return issues
+
+
+def _cpu_pct(mt) -> float:
+    """CPU % satu desimal. /system/resource cpu-load itu integer, jadi AP idle
+    selalu tampil 0% walau ada beban — rata-rata per-core lebih jujur."""
+    try:
+        cores = mt.resource("/system/resource/cpu").get()
+        loads = [float(c.get("load") or 0) for c in cores]
+        if loads:
+            return round(sum(loads) / len(loads), 1)
+    except Exception:
+        pass
+    res = mt.resource("/system/resource").get()
+    return float((res[0] if res else {}).get("cpu-load") or 0)
+
+
+def _opt_worker(job_id: str, opts: dict):
+    job = OPT_JOBS.get(job_id)
+    if not job:
+        return
+    dev_filter = opts.get("device")
+    history_min = int(opts.get("history_window_min") or 1440)
+    scan_s = int(opts.get("scan_duration") or 8)
+    dry_run = bool(opts.get("dry_run"))
+    try:
+        # --- 1. identify critical APs ---
+        _opt_set_stage(job, 0, "running")
+        devs = load_devices()
+        if dev_filter:
+            devs = [d for d in devs if d["id"] == dev_filter]
+        critical = []
+        for d in devs:
+            entry = {"device": d["id"], "name": d.get("name")}
+            try:
+                with get_device_lock(d["host"]), MT(d) as mt:
+                    regs = mt.resource("/interface/wireless/registration-table").get()
+                    cpu = _cpu_pct(mt)
+                entry.update({"clients": len(regs), "cpu_load": cpu,
+                              "critical": bool(len(regs) >= 8 or cpu >= 60)})
+            except Exception as e:
+                entry.update({"clients": None, "cpu_load": None, "critical": False,
+                              "error": f"{type(e).__name__}: {e}"})
+            critical.append(entry)
+        job["details"]["critical_aps"] = critical
+        # Semua AP tidak terjangkau = tidak ada yang bisa dioptimasi. Tanpa ini job
+        # selesai "done" padahal nol data terkumpul (false success di UI).
+        if critical and all(e.get("error") for e in critical):
+            raise RuntimeError("semua AP tidak terjangkau: " +
+                               "; ".join(f"{e['device']}: {e['error']}" for e in critical))
+        _opt_set_stage(job, 0, "done")
+
+        # --- 2. collect historical data + roaming analysis ---
+        _opt_set_stage(job, 1, "running")
+        cutoff = time.time() - history_min * 60
+        rows = db_rf_samples(limit=60000)
+        if dev_filter:
+            rows = [r for r in rows if r.get("device_id") == dev_filter]
+        window = [r for r in rows if (r.get("ts") or 0) >= cutoff]
+        issues = _opt_roaming_issues(window)
+        _ts = [float(r.get("ts") or 0) for r in window if r.get("ts")]
+        job["details"]["history"] = {
+            "window_min": history_min, "samples": len(window),
+            "span_min": round((max(_ts) - min(_ts)) / 60, 1) if _ts else 0.0,
+            "fields": ["rssi", "snr", "tx_ccq", "retry_pct", "noise_dbm"],
+            "clients_seen": len({r.get("mac") for r in window if r.get("mac")}),
+            "roaming_issues_count": len(issues), "roaming_issues": issues[:50],
+        }
+        _opt_set_stage(job, 1, "done")
+
+        # --- 3. scan the WLAN environment ---
+        _opt_set_stage(job, 2, "running")
+        scans = []
+        for d in devs:
+            bands = set()
+            try:
+                with get_device_lock(d["host"]), MT(d) as mt:
+                    for w in mt.resource("/interface/wireless").get():
+                        # frequency bisa 'auto' -> int() meledak dan tahap Scan mati.
+                        try:
+                            f = int(float(str(w.get("frequency") or 0)))
+                        except (TypeError, ValueError):
+                            f = 0
+                        if f:
+                            bands.add("2g" if f < 3000 else "5g")
+                        elif str(w.get("band") or "").startswith("2ghz"):
+                            bands.add("2g")
+                        elif str(w.get("band") or "").startswith("5ghz"):
+                            bands.add("5g")
+            except Exception as e:
+                scans.append({"device": d["id"], "error": f"{type(e).__name__}: {e}"})
+                continue
+            for band in sorted(bands):
+                try:
+                    sc = api_rf_scan(device=d["id"], band=band, duration=scan_s)
+                    chans = sc.get("channels") or []
+                    best = chans[0] if chans else {}
+                    known = sc.get("bss_list") or []
+                    noisy = [c for c in chans
+                             if float(c.get("utilization_pct") or 0) >= 50
+                             and not any(b.get("channel") in (c.get("channel"), c.get("frequency"))
+                                         for b in known)]
+                    scans.append({
+                        "device": d["id"], "band": band,
+                        "scanned_at": sc.get("scanned_at") or time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "current_channel": sc.get("current_channel"),
+                        "best_channel": best.get("channel"),
+                        "best_score": best.get("score"),
+                        "neighbours": len(known),
+                        "external_interference": noisy[:6],
+                        "interference_level": ("high" if noisy else "low"),
+                    })
+                except Exception as e:
+                    scans.append({"device": d["id"], "band": band,
+                                  "error": f"{type(e).__name__}: {e}"})
+        job["details"]["scan"] = {"bands": scans,
+                                  "neighbour_links": sum(s.get("neighbours") or 0 for s in scans),
+                                  "external_interference_hits": sum(
+                                      len(s.get("external_interference") or []) for s in scans)}
+        _opt_set_stage(job, 2, "done")
+
+        # --- 4. compute optimal configuration ---
+        _opt_set_stage(job, 3, "running")
+        cfg = load_rrm_cfg()
+        plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"), duration=scan_s)
+        rssi_all = [r["rssi"] for r in window if r.get("rssi") is not None]
+        weak_rssi = sorted(v for v in rssi_all if v < -70)
+        sensitivity = -72.0
+        if weak_rssi:
+            mid = weak_rssi[len(weak_rssi) // 2]
+            sensitivity = float(max(-80.0, min(-65.0, round(mid + 3))))
+        job["details"]["compute"] = {
+            "channel": {"changes": plan.get("dca", {}).get("changes", []),
+                        "gain_pct": plan.get("dca", {}).get("gain_pct"),
+                        "iterations": plan.get("dca", {}).get("iterations")},
+            "tx_power": plan.get("tpc") or [],
+            "roaming_sensitivity_dbm": sensitivity,
+            "roaming_rationale": f"median RSSI klien lemah {weak_rssi[len(weak_rssi)//2] if weak_rssi else 'n/a'} dBm → "
+                                 f"steering threshold {sensitivity} dBm",
+            "actionable": bool((plan.get("summary") or {}).get("actionable")),
+            "steering_rules": len(plan.get("steering") or []),
+            "sticky_clients": sum(1 for i in issues if i.get("type") == "sticky_weak"),
+        }
+        job["details"]["plan"] = plan
+        _opt_set_stage(job, 3, "done")
+
+        # --- 5. deliver the configuration ---
+        _opt_set_stage(job, 4, "running")
+        if dry_run:
+            job["details"]["deliver"] = {"dry_run": True, "applied": False}
+            _opt_set_stage(job, 4, "skipped")
+        else:
+            req = RrmApplyReq(apply_channel=cfg.get("apply_channel"),
+                              apply_txpower=cfg.get("apply_txpower"),
+                              apply_steering=cfg.get("apply_steering"),
+                              min_gain_pct=cfg.get("min_gain_pct"),
+                              device=dev_filter, plan=plan)
+            res = api_rrm_apply(req)
+            if opts.get("ai_auto_push", True):
+                targets = [dev_filter] if dev_filter else [d["id"] for d in devs]
+                ai_runs = []
+                for t in targets:
+                    try:
+                        ai_runs.append(api_ai_optimize_auto(AiAutoReq(device=t)))
+                    except Exception as e:
+                        ai_runs.append({"ok": False, "device": t,
+                                        "error": f"{type(e).__name__}: {e}"})
+                res["ai"] = ai_runs[0] if len(ai_runs) == 1 else {
+                    "ok": all(r.get("ok") for r in ai_runs),
+                    "applied": sum(r.get("applied") or 0 for r in ai_runs),
+                    "failed": sum(r.get("failed") or 0 for r in ai_runs),
+                    "per_device": ai_runs,
+                    "score_before": _mean([r.get("score_before") for r in ai_runs
+                                           if r.get("score_before") is not None]),
+                    "score_after": _mean([r.get("score_after") for r in ai_runs
+                                          if r.get("score_after") is not None]),
+                    "run_id": ", ".join(r.get("run_id") for r in ai_runs if r.get("run_id")) or None,
+                }
+            job["details"]["deliver"] = res
+            job["run_id"] = res.get("run_id")
+            _opt_set_stage(job, 4, "done" if res.get("ok") else "skipped")
+
+            ai = res.get("ai") or {}
+            job["details"]["summary"] = {
+                "channel_gain_pct": res.get("gain_pct"),
+                "channel_changes": len((res.get("result") or {}).get("channel") or []),
+                "txpower_changes": len((res.get("result") or {}).get("txpower") or []),
+                "ai_applied": ai.get("applied") or 0,
+                "ai_failed": ai.get("failed") or 0,
+                "score_before": ai.get("score_before"),
+                "score_after": ai.get("score_after"),
+                "roaming_issues": len(issues),
+                "roam_rules": len((res.get("result") or {}).get("roam") or []),
+                "aborted": res.get("aborted"),
+                "run_id": res.get("run_id"),
+                "ai_run_id": ai.get("run_id"),
+            }
+
+        # Scan jalan SEBELUM push, jadi snapshot channel di details masih keadaan
+        # pra-perbaikan (sering freq=auto → "ch ?" di UI). Segarkan dari monitor
+        # setelah push supaya yang tampil = kondisi radio sebenarnya.
+        for b in ((job["details"].get("scan") or {}).get("bands") or []):
+            if b.get("error"):
+                continue
+            d2 = get_device(b.get("device"))
+            lv = (_live_channels(d2, ttl=0) if d2 else {}).get(b.get("band"))
+            if lv:
+                b["current_channel"] = {**(b.get("current_channel") or {}),
+                                        "channel": lv["channel"], "freq": lv["freq"],
+                                        "channel_known": True,
+                                        "interface": lv.get("interface")}
+
+        job["status"] = "done"
+        job["finished"] = time.time()
+        _opt_job_save(job)
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = f"{type(e).__name__}: {e}"
+        idx = int(job.get("stage_index") or 0)
+        _opt_set_stage(job, idx, "error")
+        _opt_job_save(job)
+
+
+class OptStartReq(BaseModel):
+    device: str | None = None
+    fleet: bool = False        # true = optimalkan semua AP sekaligus (channel joint)
+    history_window_min: int | None = None
+    scan_duration: int | None = None
+    dry_run: bool = False
+    ai_auto_push: bool = True
+
+
+@app.post("/api/optimize/start")
+def api_optimize_start(req: OptStartReq):
+    if req.fleet:
+        dev = {"id": "fleet"}
+        dev_filter = None
+        lock_key = "fleet"
+    else:
+        dev = get_device(req.device)
+        dev_filter = dev["id"]
+        lock_key = dev["id"]
+    with OPT_LOCK:
+        for j in OPT_JOBS.values():
+            # fleet menyentuh semua AP, jadi job fleet bertabrakan dengan job AP mana pun
+            if j["status"] == "running" and (j.get("device") == lock_key or
+                                             lock_key == "fleet" or j.get("device") == "fleet"):
+                return {"ok": False, "running": True, "job_id": j["id"],
+                        "message": "Optimasi untuk device ini masih berjalan"}
+        cfg = load_rrm_cfg()
+        job = {
+            "id": f"opt_{secrets.token_hex(4)}", "device": lock_key, "status": "running",
+            "stage": "identify", "stage_index": 0,
+            "stages": _opt_stages(int(req.history_window_min or 1440),
+                                  int(req.scan_duration or cfg.get("scan_duration", 8))),
+            "details": {}, "started": time.time(), "updated": time.time(), "run_id": None,
+        }
+        OPT_JOBS[job["id"]] = job
+        for old_id, old in list(OPT_JOBS.items()):
+            if old["status"] != "running" and time.time() - float(old.get("updated") or 0) > 86400:
+                OPT_JOBS.pop(old_id, None)
+        _opt_job_save(job)
+    threading.Thread(target=_opt_worker, daemon=True,
+                     args=(job["id"], {"device": dev_filter,
+                                       "fleet": bool(req.fleet),
+                                       "history_window_min": req.history_window_min,
+                                       "scan_duration": req.scan_duration,
+                                       "dry_run": req.dry_run,
+                                       "ai_auto_push": req.ai_auto_push})).start()
+    return {"ok": True, "job_id": job["id"], "status": "running",
+            "message": "Optimasi berjalan di background — aman keluar dari halaman ini"}
+
+
+_LIVE_CH_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _live_channels(dev: dict, ttl: float = 30.0) -> dict:
+    """Channel yang benar-benar aktif di radio saat ini (cache 30 s, hindari hammer router)."""
+    key = dev.get("id") or dev.get("host") or "?"
+    hit = _LIVE_CH_CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    out: dict = {}
+    try:
+        with get_device_lock(dev["host"]), MT(dev) as mt:
+            wl = {w["name"]: w for w in mt.resource("/interface/wireless").get()}
+            mon = _wl_monitor(mt.api, list(wl))
+            for name, w in wl.items():
+                band = _band_of(w)
+                if band not in ("2g", "5g"):
+                    continue
+                f = int((mon.get(name) or {}).get("freq") or 0)
+                if not f:
+                    continue
+                out[band] = {"freq": f, "channel": (round((f - 2407) / 5) if band == "2g" else (f - 5000) // 5),
+                             "interface": name}
+    except Exception as e:
+        out = {"error": f"{type(e).__name__}: {e}"}
+    _LIVE_CH_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _live_channels_safe(dev_id):
+    """AP bisa sudah dihapus sementara job lama masih dipolling — jangan 404-kan
+    endpoint polling hanya karena device-nya hilang."""
+    if not dev_id or dev_id == "fleet":
+        return {}
+    try:
+        return _live_channels(get_device(dev_id))
+    except Exception:
+        return {}
+
+
+@app.get("/api/optimize/current")
+def api_optimize_current(device: str | None = None, job_id: str | None = None):
+    if job_id:
+        job = OPT_JOBS.get(job_id) or _opt_job_load(job_id)
+    else:
+        dev_id = ("fleet" if device == "fleet" else get_device(device)["id"]) if device else None
+        live = [j for j in OPT_JOBS.values() if j["status"] == "running"
+                and (dev_id is None or j.get("device") == dev_id)]
+        job = (max(live, key=lambda j: j["started"]) if live else None) \
+            or _opt_latest(dev_id or (get_device(None)["id"]))
+    if not job:
+        return {"ok": False, "message": "Belum ada job optimasi"}
+    total = len(job["stages"]) or 1
+    done = sum(1 for s in job["stages"] if s["status"] in ("done", "skipped", "error"))
+    jdev = job.get("device")
+    return {"ok": True, "job_id": job["id"], "device": jdev,
+            "status": job["status"], "stage": job.get("stage"),
+            "stage_index": job.get("stage_index"), "progress_pct": round(100 * done / total),
+            "stages": job["stages"], "details": job.get("details") or {},
+            "run_id": job.get("run_id"), "started": job.get("started"),
+            "live_channels": _live_channels_safe(jdev),
+            "error": job.get("error")}
+
+
+@app.post("/api/optimize/cancel")
+def api_optimize_cancel(req: dict):
+    job_id = (req or {}).get("job_id")
+    job = OPT_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job tidak ditemukan")
+    job["status"] = "cancelled"
+    job["error"] = "dibatalkan oleh user"
+    _opt_job_save(job)
+    return {"ok": True, "job_id": job_id, "status": "cancelled"}
+
+
+_opt_db_init()
 
 
 if __name__ == "__main__":
