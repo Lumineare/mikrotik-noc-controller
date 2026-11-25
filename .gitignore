@@ -21,6 +21,7 @@ _w2id.txt
 # ---- catatan perencanaan internal ----
 .superpowers/
 docs/superpowers/
+.agent/
 
 # ---- Python ----
 __pycache__/
