@@ -5949,19 +5949,47 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None,
 def _extract_json_object(text: str) -> dict | None:
     if not text:
         return None
-    s = text.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    start = s.find("{")
-    end = s.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    # Buang blok <think>...</think> milik model reasoning agar kurung kurawal di dalamnya tidak merusak parser
+    s = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not s:
         return None
+    # 1. Coba blok ```json ... ``` jika ada
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+    for blk in reversed(fenced):
+        try:
+            obj = json.loads(blk)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    # 2. Coba parse langsung seluruh string
     try:
-        obj = json.loads(s[start:end + 1])
-        return obj if isinstance(obj, dict) else None
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
-        return None
+        pass
+    # 3. Scan semua objek JSON seimbang dengan raw_decode; prioritaskan yang berisi key RRM
+    dec = json.JSONDecoder()
+    candidates: list[dict] = []
+    pos = 0
+    while True:
+        idx = s.find("{", pos)
+        if idx == -1:
+            break
+        try:
+            obj, end = dec.raw_decode(s, idx)
+            if isinstance(obj, dict):
+                candidates.append(obj)
+                pos = end
+                continue
+        except Exception:
+            pass
+        pos = idx + 1
+    for obj in reversed(candidates):
+        if "channel_changes" in obj or "rationale" in obj or "txpower_changes" in obj:
+            return obj
+    return candidates[-1] if candidates else None
 
 
 def plan_rrm_via_omniroute(
@@ -6086,7 +6114,8 @@ def plan_rrm_via_omniroute(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
         ],
-        "max_tokens": max(int(cfg.get("max_tokens", 750) or 750), 2200),
+        # 4096 memberi ruang cukup bagi model thinking/reasoning agar JSON tidak terpotong
+        "max_tokens": max(int(cfg.get("max_tokens", 750) or 750), 4096),
         "temperature": 0.2,
     }
 
@@ -6105,10 +6134,15 @@ def plan_rrm_via_omniroute(
             )
             with urllib.request.urlopen(req, timeout=60) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
-                content = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                msg_obj = (body.get("choices") or [{}])[0].get("message") or {}
+                content = msg_obj.get("content") or ""
                 parsed = _extract_json_object(content)
+                if parsed is None and msg_obj.get("reasoning_content"):
+                    parsed = _extract_json_object(msg_obj.get("reasoning_content") or "")
                 if parsed is not None:
                     break
+                preview = (content or "").replace("\n", " ")[:180]
+                print(f"[RRM-OmniRoute] attempt {attempt}/2 invalid JSON ({model_name}): {preview!r}")
                 last_err = "respons OmniRoute bukan JSON valid"
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
@@ -6731,8 +6765,10 @@ def api_rrm_apply(req: RrmApplyReq):
             return len(mt.resource("/interface/wireless/registration-table").get())
 
 
-    # push sekuensial per AP — satu-satunya blast radius; abort kalau klien hilang melebihi batas
+    # push sekuensial per AP — satu-satunya blast radius
     skipped_unreachable: list[dict] = []
+    rolled_back_aps: list[dict] = []
+    is_multi_ap = len(devs) > 1
     for did, dev in devs.items():
         slice_ch = [c for c in changes if c.get("device_id") == did]
         slice_tp = [t for t in tpc if t.get("device_id") == did]
@@ -6774,10 +6810,21 @@ def api_rrm_apply(req: RrmApplyReq):
         # Klien yang sengaja di-kick ke AP terdekat (roam_kicked) tidak boleh dianggap "hilang"
         effective_before = max(0, before - roam_kicked)
         after = _settle_clients(effective_before, lambda: _clients(dev), max_drop)
-        if effective_before - after > max_drop:
-            aborted = {"device": did, "clients_before": before, "roam_kicked": roam_kicked,
+        # Di armada padat multi-AP (RS ~100 AP), saat 1 AP ganti channel klien wajar
+        # langsung roam ke AP sebelah yang overlap. Selama masih ada klien yang konek
+        # kembali (after > 0), radio sehat. Rollback hanya jika blackout (after == 0)
+        # di multi-AP, atau drop > max_drop pada single-AP.
+        failed_drop = (
+            (effective_before >= 3 and after == 0)
+            if is_multi_ap
+            else (effective_before - after > max_drop)
+        )
+        if failed_drop:
+            rb_info = {"device": did, "clients_before": before, "roam_kicked": roam_kicked,
                        "clients_after": after,
-                       "reason": f"klien turun {effective_before - after} > batas {max_drop} — push dihentikan"}
+                       "reason": (f"radio blackout (0/{effective_before} klien kembali setelah 45s) — AP dikembalikan"
+                                  if is_multi_ap else
+                                  f"klien turun {effective_before - after} > batas {max_drop} — AP dikembalikan")}
             # rollback AP ini saja dari snapshot
             for entry in [e for e in snapshot if e.get("device_id") == did]:
                 try:
@@ -6786,10 +6833,6 @@ def api_rrm_apply(req: RrmApplyReq):
                         cur = wl.get(name=entry["interface"])
                         if not cur:
                             continue
-                        # urutan penting: channel-width dulu, baru frequency
-                        # (set frequency ke kanal yang tak mendukung width lama
-                        #  ditolak 'bad band or frequency'), tx-power butuh mode
-                        # all-rates-fixed lebih dulu. Tiap langkah diverifikasi.
                         if entry.get("channel_width") and \
                                 str(cur[0].get("channel-width") or "") != str(entry["channel_width"]):
                             wl.set(id=cur[0]["id"], channel_width=entry["channel_width"])
@@ -6803,7 +6846,7 @@ def api_rrm_apply(req: RrmApplyReq):
                         now = (wl.get(name=entry["interface"]) or [{}])[0]
                         if entry.get("frequency") and \
                                 str(now.get("frequency") or "") != str(entry["frequency"]):
-                            aborted.setdefault("rollback_errors", []).append(
+                            rb_info.setdefault("rollback_errors", []).append(
                                 f"{did}/{entry['interface']}: frequency tetap {now.get('frequency')}")
                         acl = mt.resource("/interface/wireless/access-list")
                         for r in acl.get():
@@ -6811,10 +6854,15 @@ def api_rrm_apply(req: RrmApplyReq):
                                     str(r.get("comment") or "").startswith(ROAM_PREFIX):
                                 acl.remove(id=r["id"])
                 except Exception as e:
-                    aborted.setdefault("rollback_errors", []).append(
+                    rb_info.setdefault("rollback_errors", []).append(
                         f"{did}/{entry.get('interface')}: {type(e).__name__}: {e}")
                     continue
-            break
+            rolled_back_aps.append(rb_info)
+            # Di fleet multi-AP, jangan hentikan sisa 99 AP hanya karena 1 AP bermasalah;
+            # baru abort seluruh fleet jika >= 3 AP mengalami blackout sistemik.
+            if (not is_multi_ap) or len(rolled_back_aps) >= 3:
+                aborted = rb_info
+                break
 
     run = {
         "id": f"rrm_{secrets.token_hex(4)}", "ts": time.time(), "mode": "manual",
@@ -6826,7 +6874,8 @@ def api_rrm_apply(req: RrmApplyReq):
     applied = sum(1 for k in result for x in result[k] if x.get("applied"))
     return {"ok": True, "run_id": run["id"], "applied_actions": applied,
             "gain_pct": run["gain_pct"], "result": result, "channel_skipped": ch_skip,
-            "aborted": aborted, "skipped_unreachable": skipped_unreachable,
+            "aborted": aborted, "rolled_back_aps": rolled_back_aps,
+            "skipped_unreachable": skipped_unreachable,
             "clients_before": clients_before,
             "rollback_hint": f"POST /api/rrm/rollback {{'run_id': '{run['id']}'}}"}
 
