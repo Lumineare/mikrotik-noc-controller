@@ -70,7 +70,6 @@ export const OptimizeWizard: React.FC<{
   const [historyMin, setHistoryMin] = useState(1440);
   const [scanS, setScanS] = useState(8);
   const [dryRun, setDryRun] = useState(false);
-  const [aiPush, setAiPush] = useState(true);
   const [useOmniroute, setUseOmniroute] = useState(true);
   const notified = useRef<string | null>(null);
 
@@ -130,7 +129,6 @@ export const OptimizeWizard: React.FC<{
         history_window_min: historyMin,
         scan_duration: scanS,
         dry_run: dryRun,
-        ai_auto_push: aiPush,
         use_omniroute: useOmniroute,
         fleet,
       } as any);
@@ -504,6 +502,182 @@ export const OptimizeWizard: React.FC<{
         );
       })()}
 
+      {compute?.compare && (() => {
+        const cmp = compute.compare as any;
+        const rrmSide = cmp.rrm || {};
+        const omniSide = cmp.omniroute || {};
+        const rrmWon = cmp.winner !== 'omniroute';
+        const mathRejected = Boolean(cmp.omniroute_rejected_by_math);
+        const fmtMw = (v: any) => {
+          if (v == null || Number.isNaN(Number(v))) return '—';
+          const n = Number(v);
+          if (n === 0) return '0 mW';
+          return `${n.toExponential(2)} mW`;
+        };
+        const renderChanges = (chs: any[], tpcs: any[]) => {
+          if (!chs?.length && !tpcs?.length) {
+            return <div className="text-[11px] text-slate-500 italic">Tidak ada perubahan — sudah optimal.</div>;
+          }
+          return (
+            <ul className="space-y-1 text-[11px]">
+              {(chs || []).map((c: any, idx: number) => (
+                <li key={`ch-${idx}`} className="flex items-center justify-between gap-2 bg-slate-50 rounded px-2 py-1">
+                  <span className="font-mono text-slate-700 truncate">
+                    {c.device_id}/{c.interface}: {c.from_freq || 'auto'} → <b>{c.to_freq} MHz</b>
+                    {c.fix_width ? ` (${c.fix_width})` : ''}
+                  </span>
+                  {c.relief_pct != null && c.relief_pct !== 0 && (
+                    <span className={`font-bold shrink-0 ${c.relief_pct > 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
+                      {c.relief_pct > 0 ? `-${c.relief_pct}%` : `+${Math.abs(c.relief_pct)}%`}
+                    </span>
+                  )}
+                </li>
+              ))}
+              {(tpcs || []).map((t: any, idx: number) => (
+                <li key={`tp-${idx}`} className="flex items-center justify-between gap-2 bg-slate-50 rounded px-2 py-1">
+                  <span className="font-mono text-slate-700 truncate">
+                    {t.device_id}/{t.interface}: TX {t.from_dbm ?? '?'} → <b>{t.to_dbm} dBm</b>
+                  </span>
+                  <span className="text-[10px] text-slate-500 shrink-0">TPC</span>
+                </li>
+              ))}
+            </ul>
+          );
+        };
+
+        return (
+          <div className="mt-3 rounded-xl border border-slate-200 bg-white overflow-hidden">
+            <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[12px] font-bold text-slate-800">
+                Compare Engine: <span className="font-mono">rrm_engine.py</span> vs OmniRoute AI
+              </div>
+              <span
+                className={`text-[10.5px] font-bold px-2 py-0.5 rounded-full border ${
+                  mathRejected
+                    ? 'bg-rose-50 text-rose-700 border-rose-200'
+                    : rrmWon
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                }`}
+              >
+                {mathRejected
+                  ? 'OmniRoute Ditolak (Interferensi Lebih Buruk) → Pakai rrm_engine.py'
+                  : rrmWon
+                  ? 'Dipakai: rrm_engine.py'
+                  : `Dipakai: ${omniSide.engine || 'OmniRoute AI'}`}
+              </span>
+            </div>
+
+            {cmp.verdict && (
+              <div
+                className={`px-3 py-1.5 text-[11px] border-b ${
+                  mathRejected
+                    ? 'bg-rose-50/70 text-rose-800 border-rose-100'
+                    : 'bg-slate-50/50 text-slate-600 border-slate-100'
+                }`}
+              >
+                {cmp.verdict}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-slate-200">
+              {/* Left: rrm_engine.py */}
+              <div className={`p-3 space-y-2 ${rrmWon ? 'bg-emerald-50/20' : ''}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[12px] font-bold text-slate-800">rrm_engine.py (Matematis)</div>
+                  {rrmWon && (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">
+                      Terpilih
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                    <div className="text-[10px] text-slate-400">Interferensi (mW)</div>
+                    <div className="font-mono font-bold text-slate-800">
+                      {fmtMw(rrmSide.cost_before_mw)} → {fmtMw(rrmSide.cost_after_mw)}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                    <div className="text-[10px] text-slate-400">Gain Interferensi</div>
+                    <div className={`font-mono font-bold ${(rrmSide.gain_pct ?? 0) > 0 ? 'text-emerald-700' : 'text-slate-700'}`}>
+                      {rrmSide.gain_pct ?? 0}%
+                    </div>
+                  </div>
+                </div>
+                {renderChanges(rrmSide.channel_changes, rrmSide.txpower_changes)}
+              </div>
+
+              {/* Right: OmniRoute AI */}
+              <div className={`p-3 space-y-2 ${!rrmWon ? 'bg-indigo-50/20' : mathRejected ? 'bg-rose-50/20' : ''}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[12px] font-bold text-slate-800 truncate">
+                    {omniSide.engine || 'OmniRoute AI'}
+                  </div>
+                  {!rrmWon ? (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 shrink-0">
+                      Terpilih
+                    </span>
+                  ) : mathRejected ? (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 shrink-0">
+                      Ditolak Validasi
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 shrink-0">
+                      Fallback
+                    </span>
+                  )}
+                </div>
+
+                {omniSide.available ? (
+                  <>
+                    <div className="grid grid-cols-2 gap-2 text-[11px]">
+                      <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                        <div className="text-[10px] text-slate-400">Interferensi (mW)</div>
+                        <div className="font-mono font-bold text-slate-800">
+                          {fmtMw(omniSide.cost_before_mw)} → {fmtMw(omniSide.cost_after_mw)}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                        <div className="text-[10px] text-slate-400">Gain Interferensi</div>
+                        <div
+                          className={`font-mono font-bold ${
+                            (omniSide.gain_pct ?? 0) > 0
+                              ? 'text-emerald-700'
+                              : (omniSide.gain_pct ?? 0) < 0
+                              ? 'text-rose-600'
+                              : 'text-slate-700'
+                          }`}
+                        >
+                          {omniSide.gain_pct ?? 0}%
+                        </div>
+                      </div>
+                    </div>
+                    {renderChanges(omniSide.channel_changes, omniSide.txpower_changes)}
+                    {omniSide.rationale && (
+                      <div className="text-[11px] text-slate-600 bg-slate-50 rounded px-2 py-1.5 leading-relaxed">
+                        <span className="font-semibold text-slate-700">Alasan AI: </span>
+                        {omniSide.rationale}
+                      </div>
+                    )}
+                    {omniSide.rejected?.length > 0 && (
+                      <div className="text-[10.5px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                        Ditolak filter legalitas: {omniSide.rejected.join('; ')}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-2">
+                    <span className="font-semibold text-slate-700">Tidak tersedia: </span>
+                    {omniSide.error || 'OmniRoute tidak aktif'}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {job?.status === 'done' && s && (
         <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50/60 px-3 py-2.5">
           <div className="text-[12px] font-bold text-emerald-800">
@@ -749,7 +923,6 @@ export const OptimizeWizard: React.FC<{
             {([
               ['omni', 'Gunakan OmniRoute AI', useOmniroute, setUseOmniroute],
               ['dry', 'Dry-run (jangan kirim)', dryRun, setDryRun],
-              ['ai', 'Sekalian perbaikan AI', aiPush, setAiPush],
               ['ch', 'Atur channel', cfg?.apply_channel ?? true, (v: boolean) => saveCfg({ apply_channel: v })],
               ['tp', 'Atur tx-power', cfg?.apply_txpower ?? false, (v: boolean) => saveCfg({ apply_txpower: v })],
               [
