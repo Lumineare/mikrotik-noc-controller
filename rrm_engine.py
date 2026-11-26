@@ -244,7 +244,17 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
     for _ in range(max_passes):
         iterations += 1
         improved = False
-        for ap in aps:
+        # Highest-conflict-first (deterministik): AP paling berinterferensi memilih dulu
+        order = sorted(
+            aps,
+            key=lambda a: (
+                -channel_cost(assign[a["id"]], a.get("width", 20),
+                              _neighbours_for(a, assign, ap_by_id, owner_idx),
+                              _noise_at(a, assign[a["id"]]), _util_at(a, assign[a["id"]])),
+                a["id"],
+            ),
+        )
+        for ap in order:
             band = ap.get("band", "2g")
             width = ap.get("width", 20)
             opts = _opts_for(ap)
@@ -253,13 +263,17 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
             nb = _neighbours_for(ap, assign, ap_by_id, owner_idx)
             cur_f = assign[ap["id"]]
             cur_block = cur_f if str(band).startswith("2") else _block_primary(cur_f, width)
-            best_f, best_c = cur_f, None
+            cur_c = channel_cost(cur_f, width, nb, _noise_at(ap, cur_f), _util_at(ap, cur_f))
+            best_f, best_c = cur_f, cur_c
             for f in opts:
                 c = channel_cost(f, width, nb, _noise_at(ap, f), _util_at(ap, f))
-                if best_c is None or c < best_c * (1 - 1e-9):
+                if c < best_c * (1 - 1e-9):
                     best_f, best_c = f, c
-                elif abs(c - best_c) <= best_c * 1e-9 and f == cur_f:
-                    best_f = f  # tie: keep the channel the radio already uses
+            # Anti-churn histeresis: di armada padat 100 AP, jangan restart radio jika
+            # perbaikan interferensi lokal < 5% (kecuali kanal memang off-plan).
+            if best_f != cur_f and ap["id"] not in off_plan and cur_c > 0:
+                if best_c > cur_c * 0.95:
+                    best_f = cur_f
             if not str(band).startswith("2") and _block_primary(best_f, width) == cur_block:
                 best_f = cur_f  # same 40/80 MHz block: moving the primary buys nothing, costs a restart
             if best_f != cur_f:
@@ -426,7 +440,7 @@ def plan_roam(seen: dict[str, dict[str, list[float]]],
               current: dict[str, dict],
               thr_dbm: float = -75.0, alt_min_dbm: float = -67.0,
               margin_db: float = 7.0, min_samples: int = 3,
-              max_rules: int = 10) -> list[dict]:
+              max_rules: int = 50, max_per_ap: int = 3) -> list[dict]:
     """Roaming paksa tanpa 802.11k/v: blokir & kick MAC di AP yang lemah (<= thr_dbm)
     agar langsung pindah ke AP terdekat yang lebih kuat.
 
@@ -496,7 +510,18 @@ def plan_roam(seen: dict[str, dict[str, list[float]]],
                           f"agar pindah ke {best_dev}"),
         })
     out.sort(key=lambda r: -r["gain_db"])
-    return out[:max_rules]
+    # Batasi max_per_ap agar tidak pernah meng-kick terlalu banyak klien sekaligus dari 1 AP
+    capped = []
+    per_ap: dict[str, int] = {}
+    for r in out:
+        did = r["device_id"]
+        if per_ap.get(did, 0) >= max_per_ap:
+            continue
+        per_ap[did] = per_ap.get(did, 0) + 1
+        capped.append(r)
+        if len(capped) >= max_rules:
+            break
+    return capped
 
 
 if __name__ == "__main__":
