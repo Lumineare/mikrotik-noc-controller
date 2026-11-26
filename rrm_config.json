@@ -1,7 +1,7 @@
 {
   "enabled": false,
   "interval_min": 15,
-  "include_dfs": true,
+  "include_dfs": false,
   "apply_channel": true,
   "apply_txpower": true,
   "apply_steering": true,
