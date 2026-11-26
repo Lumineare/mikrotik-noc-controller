@@ -65,10 +65,12 @@ export const OptimizeWizard: React.FC<{
   const [msg, setMsg] = useState<string | null>(null);
   const [showDetail, setShowDetail] = useState(false);
   const [showCfg, setShowCfg] = useState(false);
+  const [showApList, setShowApList] = useState(false);
+  const [expandedAp, setExpandedAp] = useState<string | null>(null);
   const [historyMin, setHistoryMin] = useState(1440);
   const [scanS, setScanS] = useState(8);
   const [dryRun, setDryRun] = useState(false);
-  const [aiPush, setAiPush] = useState(true);
+  const [useOmniroute, setUseOmniroute] = useState(true);
   const notified = useRef<string | null>(null);
 
   const load = useCallback(async () => {
@@ -127,7 +129,7 @@ export const OptimizeWizard: React.FC<{
         history_window_min: historyMin,
         scan_duration: scanS,
         dry_run: dryRun,
-        ai_auto_push: aiPush,
+        use_omniroute: useOmniroute,
         fleet,
       } as any);
       setMsg(r.ok ? null : r.message || 'Optimasi lain masih berjalan');
@@ -183,10 +185,13 @@ export const OptimizeWizard: React.FC<{
   return (
     <div className="bg-white border border-slate-200/90 rounded-2xl p-5 shadow-sm">
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <Sparkles className="w-4 h-4 text-blue-600" />
           <span className="font-bold text-slate-800">{fleet ? 'AI Optimize · Semua AP' : 'AI Optimize'}</span>
           <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${p.cls}`}>{p.text}</span>
+          <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border border-indigo-200 bg-indigo-50 text-indigo-700">
+            {compute?.engine || (useOmniroute ? 'OmniRoute AI' : 'rrm_engine.py')}
+          </span>
         </div>
         <div className="flex items-center gap-3">
           <button
@@ -211,33 +216,28 @@ export const OptimizeWizard: React.FC<{
       </p>
 
       {!running && (
-        <button
-          onClick={start}
-          disabled={busy || (!fleet && !deviceId)}
-          className="group relative mt-3 w-full overflow-hidden rounded-2xl bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 px-5 py-3.5 text-white shadow-lg shadow-blue-600/25 transition-all duration-300 hover:-translate-y-0.5 hover:shadow-xl hover:shadow-indigo-600/30 active:translate-y-0 disabled:opacity-60 disabled:hover:translate-y-0 cursor-pointer"
-        >
-          <span className="pointer-events-none absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/25 to-transparent transition-transform duration-700 group-hover:translate-x-full" />
-          <span className="relative flex items-center justify-center gap-2.5">
-            <span className="grid place-items-center w-8 h-8 rounded-xl bg-white/15 ring-1 ring-white/30">
-              {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+        <div className="mt-3 flex items-center justify-between gap-3 flex-wrap">
+          <button
+            type="button"
+            onClick={start}
+            disabled={busy || (!fleet && !deviceId)}
+            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800 px-4 py-2 text-white text-xs font-bold shadow-xs transition-colors disabled:opacity-60 cursor-pointer"
+          >
+            {busy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+            <span>
+              {fleet
+                ? job?.status === 'done'
+                  ? 'Optimalkan Ulang Semua AP'
+                  : 'Optimalkan Semua AP'
+                : job?.status === 'done'
+                ? 'Optimalkan Ulang'
+                : 'Optimalkan AP Ini'}
             </span>
-            <span className="text-left">
-              <span className="block text-sm font-extrabold tracking-wide">
-                {fleet
-                  ? job?.status === 'done'
-                    ? 'Optimalkan Ulang Semua AP'
-                    : 'Optimalkan Semua AP'
-                  : job?.status === 'done'
-                  ? 'Optimalkan Ulang'
-                  : 'Optimalkan AP Ini'}
-              </span>
-              <span className="block text-[10px] font-medium text-white/75">
-                5 langkah otomatis · bisa dibatalkan kapan saja
-              </span>
-            </span>
-            <Play className="w-4 h-4 ml-1 opacity-80 transition-transform group-hover:translate-x-0.5" />
+          </button>
+          <span className="text-[11px] text-slate-500">
+            5 langkah otomatis · bisa dibatalkan kapan saja
           </span>
-        </button>
+        </div>
       )}
 
       {job && (
@@ -278,50 +278,405 @@ export const OptimizeWizard: React.FC<{
         </>
       )}
 
-      {fleet && job && (
-        <div className="mt-3 rounded-xl border border-slate-200 divide-y divide-slate-100 overflow-hidden">
-          {(((job.details as any)?.critical_aps as any[]) || []).map((ap: any) => {
-            const scans = (((job.details as any)?.scan?.bands as any[]) || []).filter(
-              (b: any) => b.device === ap.device
-            );
-            const ch = scans
-              .map((b: any) => `${b.band} ch ${b.current_channel?.channel ?? '?'}`)
-              .join(' · ');
-            const acts = deliver?.result
-              ? [
-                  ...(deliver.result.channel || []),
-                  ...(deliver.result.txpower || []),
-                  ...(deliver.result.steering || []),
-                  ...(deliver.result.roam || []),
-                ]
-              : [];
-            const applied = acts.filter((x: any) => x.device_id === ap.device && x.applied).length;
-            const aborted = deliver?.aborted?.device === ap.device;
-            const state = ap.error
-              ? { t: 'gagal', c: 'text-rose-600' }
-              : aborted
-              ? { t: 'dihentikan', c: 'text-rose-600' }
-              : applied
-              ? { t: `${applied} aksi`, c: 'text-emerald-700' }
-              : job.status === 'running'
-              ? { t: 'menunggu', c: 'text-slate-400' }
-              : { t: 'tanpa perubahan', c: 'text-slate-400' };
-            return (
-              <div key={ap.device} className="flex items-center justify-between gap-2 px-3 py-2 text-[11px]">
-                <div className="min-w-0">
-                  <div className="font-bold text-slate-800 truncate">{ap.name || ap.device}</div>
-                  <div className="text-slate-500 truncate">
-                    {ch || 'belum discan'}
-                    {ap.clients != null ? ` · ${ap.clients} klien` : ''}
-                    {ap.cpu_load != null ? ` · CPU ${ap.cpu_load}%` : ''}
+      {fleet && job && (() => {
+        const aps = ((job.details as any)?.critical_aps as any[]) || [];
+        if (aps.length === 0) return null;
+        const planData = (job.details as any)?.plan || {};
+        const resCh = (deliver?.result?.channel || []) as any[];
+        const resTp = (deliver?.result?.txpower || []) as any[];
+        const resSt = (deliver?.result?.steering || []) as any[];
+        const resRm = (deliver?.result?.roam || []) as any[];
+        const planCh = (planData?.dca?.changes || []) as any[];
+        const planTp = (planData?.tpc || []) as any[];
+
+        const rows = aps.map((ap: any) => {
+          const scans = (((job.details as any)?.scan?.bands as any[]) || []).filter(
+            (b: any) => b.device === ap.device
+          );
+          const ch = scans
+            .map((b: any) => `${b.band} ch ${b.current_channel?.channel ?? '?'}`)
+            .join(' · ');
+
+          const chActs = resCh.filter((x: any) => x.device_id === ap.device);
+          const tpActs = resTp.filter((x: any) => x.device_id === ap.device);
+          const stActs = resSt.filter((x: any) => x.device_id === ap.device);
+          const rmActs = resRm.filter((x: any) => x.device_id === ap.device);
+
+          const actionItems: { label: string; detail?: string; ok: boolean }[] = [
+            ...chActs.map((x: any) => ({
+              label: `Channel ${x.interface || x.band}: ${x.from_freq ? `${x.from_freq}` : 'auto'} -> ${x.to_freq} MHz`,
+              detail: x.error ? `Gagal: ${x.error}` : x.reason || (x.repair ? 'Perbaikan radio/kanal' : 'Optimasi interferensi'),
+              ok: !!x.applied,
+            })),
+            ...tpActs.map((x: any) => ({
+              label: `TX Power ${x.interface || x.band}: ${x.from_dbm ?? '?'} -> ${x.to_dbm} dBm`,
+              detail: x.error ? `Gagal: ${x.error}` : x.reason || 'Penyesuaian daya pancar',
+              ok: !!x.applied,
+            })),
+            ...stActs.map((x: any) => ({
+              label: `Band Steering ${x.mac || ''}${x.interface ? ` (${x.interface})` : ''}`,
+              detail: x.error ? `Gagal: ${x.error}` : `Atur batas sinyal ${x.signal_range || '5 GHz'} agar klien pindah ke 5 GHz`,
+              ok: !!x.applied,
+            })),
+            ...rmActs.map((x: any) => ({
+              label: `Paksa Roaming ${x.mac || ''}`,
+              detail: x.error
+                ? `Gagal: ${x.error}`
+                : `${x.current_dbm ?? '?'} dBm, arahkan ke ${x.best_device || 'AP lebih dekat'}${x.best_dbm != null ? ` (${x.best_dbm} dBm)` : ''}`,
+              ok: !!x.applied,
+            })),
+          ];
+
+          const applied = actionItems.filter((a) => a.ok).length;
+          const aborted = deliver?.aborted?.device === ap.device;
+          const plannedForAp =
+            planCh.filter((x: any) => x.device_id === ap.device).length +
+            planTp.filter((x: any) => x.device_id === ap.device).length;
+          const scanErr = scans.find((s: any) => s.error)?.error;
+
+          let whyNoChange = '';
+          if (ap.error) {
+            whyNoChange = `Tidak terjangkau saat pemeriksaan: ${ap.error}`;
+          } else if (aborted) {
+            whyNoChange = `Push dihentikan otomatis: ${deliver.aborted.reason}`;
+          } else if (applied === 0 && job.status !== 'running') {
+            if (actionItems.length > 0) {
+              whyNoChange = actionItems.map((a) => `${a.label} (${a.detail || 'gagal'})`).join('; ');
+            } else if (deliver?.dry_run) {
+              whyNoChange = plannedForAp > 0
+                ? `Mode dry-run aktif: ada ${plannedForAp} rencana perubahan, tidak dikirim ke router.`
+                : 'Mode dry-run aktif dan tidak ada perubahan yang diperlukan.';
+            } else if (deliver?.aborted && plannedForAp > 0) {
+              whyNoChange = `Ada ${plannedForAp} rencana perubahan, tetapi push berhenti lebih dulu di ${deliver.aborted.device} (${deliver.aborted.reason}).`;
+            } else if (deliver?.skipped) {
+              whyNoChange = `Dilewati: ${deliver.reason || 'tidak ada aksi yang lolos batas aman.'}`;
+            } else if (deliver?.channel_skipped && plannedForAp > 0) {
+              whyNoChange = `Dilewati: ${deliver.channel_skipped}`;
+            } else if (scanErr) {
+              whyNoChange = `Scan radio gagal: ${scanErr}`;
+            } else if (deliver?.aborted) {
+              whyNoChange = `Tidak ada perubahan untuk AP ini (dan push berhenti di ${deliver.aborted.device}).`;
+            } else {
+              const highIntf = scans.some((s: any) => s.interference_level === 'high');
+              whyNoChange = highIntf
+                ? 'Tidak ada kanal/TX power kandidat yang memberi penurunan interferensi melebihi batas minimum.'
+                : 'Channel dan TX power sudah optimal berdasarkan hasil scan saat ini (interferensi rendah, tidak ada klien sticky/konflik).';
+            }
+          }
+
+          const previewText =
+            applied > 0
+              ? actionItems
+                  .filter((a) => a.ok)
+                  .map((a) => a.label)
+                  .join(' · ')
+              : whyNoChange;
+
+          const state = ap.error
+            ? { t: 'gagal', c: 'text-rose-600', kind: 'err' }
+            : aborted
+            ? { t: 'dihentikan', c: 'text-rose-600', kind: 'err' }
+            : applied
+            ? { t: `${applied} aksi`, c: 'text-emerald-700', kind: 'ok' }
+            : job.status === 'running'
+            ? { t: 'menunggu', c: 'text-slate-500', kind: 'idle' }
+            : { t: 'tanpa perubahan', c: 'text-slate-500', kind: 'idle' };
+          return { ap, ch, state, actionItems, whyNoChange, previewText };
+        });
+        const appliedCount = rows.filter((r) => r.state.kind === 'ok').length;
+        const errCount = rows.filter((r) => r.state.kind === 'err').length;
+        const idleCount = rows.length - appliedCount - errCount;
+
+        return (
+          <div className="mt-3 rounded-xl border border-slate-200 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowApList((v) => !v)}
+              aria-expanded={showApList}
+              className="w-full flex items-center justify-between gap-2 px-3 py-2.5 bg-slate-50 hover:bg-slate-100 text-[11px] transition-colors cursor-pointer"
+            >
+              <div className="flex items-center gap-2 flex-wrap text-left">
+                <span className="font-bold text-slate-800">Daftar Hasil AP ({rows.length})</span>
+                <span className="text-slate-500">
+                  {appliedCount > 0 && (
+                    <span className="text-emerald-700 font-semibold">{appliedCount} berubah</span>
+                  )}
+                  {appliedCount > 0 && (idleCount > 0 || errCount > 0) ? ' · ' : ''}
+                  {idleCount > 0 && <span>{idleCount} tanpa perubahan</span>}
+                  {errCount > 0 && (
+                    <>
+                      {idleCount > 0 ? ' · ' : ''}
+                      <span className="text-rose-600 font-semibold">{errCount} gagal/dihentikan</span>
+                    </>
+                  )}
+                </span>
+              </div>
+              <span className="inline-flex items-center gap-1 font-semibold text-blue-600 shrink-0">
+                <span>{showApList ? 'Sembunyikan' : 'Tampilkan'}</span>
+                <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showApList ? 'rotate-180' : ''}`} />
+              </span>
+            </button>
+
+            {showApList && (
+              <div className="max-h-96 overflow-y-auto divide-y divide-slate-100 border-t border-slate-200">
+                {rows.map(({ ap, ch, state, actionItems, whyNoChange, previewText }) => {
+                  const isOpen = expandedAp === ap.device;
+                  return (
+                    <div key={ap.device} className="text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setExpandedAp(isOpen ? null : ap.device)}
+                        aria-expanded={isOpen}
+                        className="w-full text-left flex items-start justify-between gap-2 px-3 py-2.5 hover:bg-slate-50 transition-colors cursor-pointer"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="font-bold text-slate-800 truncate">{ap.name || ap.device}</div>
+                          <div className="text-slate-500 truncate">
+                            {ch || 'belum discan'}
+                            {ap.clients != null ? ` · ${ap.clients} klien` : ''}
+                            {ap.cpu_load != null ? ` · CPU ${ap.cpu_load}%` : ''}
+                          </div>
+                          {previewText && (
+                            <div
+                              className={`mt-1 text-[10.5px] leading-snug ${
+                                state.kind === 'ok'
+                                  ? 'text-emerald-700'
+                                  : state.kind === 'err'
+                                  ? 'text-rose-600'
+                                  : 'text-slate-500'
+                              } ${isOpen ? '' : 'truncate'}`}
+                            >
+                              {previewText}
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0 pt-0.5">
+                          <span className={`font-bold ${state.c}`}>{state.t}</span>
+                          <ChevronDown
+                            className={`w-3.5 h-3.5 text-slate-400 transition-transform ${isOpen ? 'rotate-180' : ''}`}
+                          />
+                        </div>
+                      </button>
+
+                      {isOpen && (
+                        <div className="px-3 pb-3 pt-1 bg-slate-50/80 border-t border-slate-100 space-y-1.5">
+                          {actionItems.length > 0 ? (
+                            <ul className="space-y-1">
+                              {actionItems.map((act, idx) => (
+                                <li
+                                  key={idx}
+                                  className="flex items-start justify-between gap-2 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5"
+                                >
+                                  <div className="min-w-0">
+                                    <div className="font-semibold text-slate-800">{act.label}</div>
+                                    {act.detail && (
+                                      <div className="text-[10.5px] text-slate-500">{act.detail}</div>
+                                    )}
+                                  </div>
+                                  <span
+                                    className={`text-[10px] font-bold shrink-0 px-1.5 py-0.5 rounded ${
+                                      act.ok
+                                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                        : 'bg-rose-50 text-rose-700 border border-rose-200'
+                                    }`}
+                                  >
+                                    {act.ok ? 'Diterapkan' : 'Gagal'}
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <div className="text-[11px] text-slate-600 bg-white border border-slate-200 rounded-lg px-2.5 py-2 leading-relaxed">
+                              <span className="font-semibold text-slate-800">Alasan: </span>
+                              {whyNoChange || 'Menunggu proses optimasi selesai.'}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {compute?.compare && (() => {
+        const cmp = compute.compare as any;
+        const rrmSide = cmp.rrm || {};
+        const omniSide = cmp.omniroute || {};
+        const rrmWon = cmp.winner !== 'omniroute';
+        const mathRejected = Boolean(cmp.omniroute_rejected_by_math);
+        const fmtMw = (v: any) => {
+          if (v == null || Number.isNaN(Number(v))) return '—';
+          const n = Number(v);
+          if (n === 0) return '0 mW';
+          return `${n.toExponential(2)} mW`;
+        };
+        const renderChanges = (chs: any[], tpcs: any[]) => {
+          if (!chs?.length && !tpcs?.length) {
+            return <div className="text-[11px] text-slate-500 italic">Tidak ada perubahan — sudah optimal.</div>;
+          }
+          return (
+            <ul className="space-y-1 text-[11px]">
+              {(chs || []).map((c: any, idx: number) => (
+                <li key={`ch-${idx}`} className="flex items-center justify-between gap-2 bg-slate-50 rounded px-2 py-1">
+                  <span className="font-mono text-slate-700 truncate">
+                    {c.device_id}/{c.interface}: {c.from_freq || 'auto'} → <b>{c.to_freq} MHz</b>
+                    {c.fix_width ? ` (${c.fix_width})` : ''}
+                  </span>
+                  {c.relief_pct != null && c.relief_pct !== 0 && (
+                    <span className={`font-bold shrink-0 ${c.relief_pct > 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
+                      {c.relief_pct > 0 ? `-${c.relief_pct}%` : `+${Math.abs(c.relief_pct)}%`}
+                    </span>
+                  )}
+                </li>
+              ))}
+              {(tpcs || []).map((t: any, idx: number) => (
+                <li key={`tp-${idx}`} className="flex items-center justify-between gap-2 bg-slate-50 rounded px-2 py-1">
+                  <span className="font-mono text-slate-700 truncate">
+                    {t.device_id}/{t.interface}: TX {t.from_dbm ?? '?'} → <b>{t.to_dbm} dBm</b>
+                  </span>
+                  <span className="text-[10px] text-slate-500 shrink-0">TPC</span>
+                </li>
+              ))}
+            </ul>
+          );
+        };
+
+        return (
+          <div className="mt-3 rounded-xl border border-slate-200 bg-white overflow-hidden">
+            <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[12px] font-bold text-slate-800">
+                Compare Engine: <span className="font-mono">rrm_engine.py</span> vs OmniRoute AI
+              </div>
+              <span
+                className={`text-[10.5px] font-bold px-2 py-0.5 rounded-full border ${
+                  mathRejected
+                    ? 'bg-rose-50 text-rose-700 border-rose-200'
+                    : rrmWon
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                }`}
+              >
+                {mathRejected
+                  ? 'OmniRoute Ditolak (Interferensi Lebih Buruk) → Pakai rrm_engine.py'
+                  : rrmWon
+                  ? 'Dipakai: rrm_engine.py'
+                  : `Dipakai: ${omniSide.engine || 'OmniRoute AI'}`}
+              </span>
+            </div>
+
+            {cmp.verdict && (
+              <div
+                className={`px-3 py-1.5 text-[11px] border-b ${
+                  mathRejected
+                    ? 'bg-rose-50/70 text-rose-800 border-rose-100'
+                    : 'bg-slate-50/50 text-slate-600 border-slate-100'
+                }`}
+              >
+                {cmp.verdict}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-slate-200">
+              {/* Left: rrm_engine.py */}
+              <div className={`p-3 space-y-2 ${rrmWon ? 'bg-emerald-50/20' : ''}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[12px] font-bold text-slate-800">rrm_engine.py (Matematis)</div>
+                  {rrmWon && (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">
+                      Terpilih
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                    <div className="text-[10px] text-slate-400">Interferensi (mW)</div>
+                    <div className="font-mono font-bold text-slate-800">
+                      {fmtMw(rrmSide.cost_before_mw)} → {fmtMw(rrmSide.cost_after_mw)}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                    <div className="text-[10px] text-slate-400">Gain Interferensi</div>
+                    <div className={`font-mono font-bold ${(rrmSide.gain_pct ?? 0) > 0 ? 'text-emerald-700' : 'text-slate-700'}`}>
+                      {rrmSide.gain_pct ?? 0}%
+                    </div>
                   </div>
                 </div>
-                <div className={`font-bold shrink-0 ${state.c}`}>{state.t}</div>
+                {renderChanges(rrmSide.channel_changes, rrmSide.txpower_changes)}
               </div>
-            );
-          })}
-        </div>
-      )}
+
+              {/* Right: OmniRoute AI */}
+              <div className={`p-3 space-y-2 ${!rrmWon ? 'bg-indigo-50/20' : mathRejected ? 'bg-rose-50/20' : ''}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[12px] font-bold text-slate-800 truncate">
+                    {omniSide.engine || 'OmniRoute AI'}
+                  </div>
+                  {!rrmWon ? (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 shrink-0">
+                      Terpilih
+                    </span>
+                  ) : mathRejected ? (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 shrink-0">
+                      Ditolak Validasi
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 shrink-0">
+                      Fallback
+                    </span>
+                  )}
+                </div>
+
+                {omniSide.available ? (
+                  <>
+                    <div className="grid grid-cols-2 gap-2 text-[11px]">
+                      <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                        <div className="text-[10px] text-slate-400">Interferensi (mW)</div>
+                        <div className="font-mono font-bold text-slate-800">
+                          {fmtMw(omniSide.cost_before_mw)} → {fmtMw(omniSide.cost_after_mw)}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                        <div className="text-[10px] text-slate-400">Gain Interferensi</div>
+                        <div
+                          className={`font-mono font-bold ${
+                            (omniSide.gain_pct ?? 0) > 0
+                              ? 'text-emerald-700'
+                              : (omniSide.gain_pct ?? 0) < 0
+                              ? 'text-rose-600'
+                              : 'text-slate-700'
+                          }`}
+                        >
+                          {omniSide.gain_pct ?? 0}%
+                        </div>
+                      </div>
+                    </div>
+                    {renderChanges(omniSide.channel_changes, omniSide.txpower_changes)}
+                    {omniSide.rationale && (
+                      <div className="text-[11px] text-slate-600 bg-slate-50 rounded px-2 py-1.5 leading-relaxed">
+                        <span className="font-semibold text-slate-700">Alasan AI: </span>
+                        {omniSide.rationale}
+                      </div>
+                    )}
+                    {omniSide.rejected?.length > 0 && (
+                      <div className="text-[10.5px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                        Ditolak filter legalitas: {omniSide.rejected.join('; ')}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-2">
+                    <span className="font-semibold text-slate-700">Tidak tersedia: </span>
+                    {omniSide.error || 'OmniRoute tidak aktif'}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {job?.status === 'done' && s && (
         <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50/60 px-3 py-2.5">
@@ -338,6 +693,11 @@ export const OptimizeWizard: React.FC<{
               ? ` (score ${s.score_before}→${s.score_after})`
               : ''}
           </div>
+          {compute?.omniroute_rationale && (
+            <div className="mt-1.5 text-[11px] text-emerald-900/90 leading-relaxed">
+              <span className="font-bold">OmniRoute:</span> {compute.omniroute_rationale}
+            </div>
+          )}
           <button
             onClick={rollback}
             disabled={busy}
@@ -362,7 +722,7 @@ export const OptimizeWizard: React.FC<{
       {msg && <div className="mt-2 text-[11px] text-slate-600">{msg}</div>}
 
       {showDetail && job && (
-        <div className="mt-3 border-t border-slate-100 pt-3 space-y-1.5 text-[11px] text-slate-600">
+        <div className="mt-3 border-t border-slate-100 pt-3 space-y-1.5 text-[11px] text-slate-600 max-h-96 overflow-y-auto pr-1">
           <div className="font-bold text-slate-800">Hasil tiap langkah</div>
           <div className="text-slate-400">
             Semua angka di bawah dari router &amp; database lokal. LLM tidak dipakai di jalur ini.
@@ -456,8 +816,9 @@ export const OptimizeWizard: React.FC<{
             </div>
           )}
           <div className="text-slate-400">
-            sumber: <code>rrm_engine.py</code> — model biaya deterministik (bukan LLM): cost(f) = noise(f) + Σ
-            overlap×10^(RSSI/10)
+            {compute?.used_omniroute
+              ? `sumber: ${compute.engine} (LLM OmniRoute, divalidasi terhadap whitelist frekuensi legal router)`
+              : `sumber: ${compute?.engine || 'rrm_engine.py'} — model biaya deterministik: cost(f) = noise(f) + Σ overlap×10^(RSSI/10)`}
           </div>
           {deliver && !deliver.dry_run && !deliver.skipped && (
             <div>
@@ -560,8 +921,8 @@ export const OptimizeWizard: React.FC<{
           </div>
           <div className="flex flex-wrap gap-3">
             {([
+              ['omni', 'Gunakan OmniRoute AI', useOmniroute, setUseOmniroute],
               ['dry', 'Dry-run (jangan kirim)', dryRun, setDryRun],
-              ['ai', 'Sekalian perbaikan AI', aiPush, setAiPush],
               ['ch', 'Atur channel', cfg?.apply_channel ?? true, (v: boolean) => saveCfg({ apply_channel: v })],
               ['tp', 'Atur tx-power', cfg?.apply_txpower ?? false, (v: boolean) => saveCfg({ apply_txpower: v })],
               [

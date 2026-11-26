@@ -12,6 +12,7 @@ import {
   User,
   MapPin,
   Send,
+  Footprints,
 } from 'lucide-react';
 import { Device, FleetDevice, AuthUser } from '../types';
 
@@ -19,8 +20,8 @@ interface HeaderProps {
   devices: Device[];
   activeDeviceId: string;
   onSelectDevice: (id: string) => void;
-  activeView: 'fleet' | 'device' | 'map';
-  onChangeView: (view: 'fleet' | 'device' | 'map') => void;
+  activeView: 'fleet' | 'device' | 'map' | 'locator';
+  onChangeView: (view: 'fleet' | 'device' | 'map' | 'locator') => void;
   fleetSummary: { total: number; online: number; offline: number; avg_cpu: number };
   pollingInterval: number; // in seconds, 0 = paused
   onChangePolling: (sec: number) => void;
@@ -107,6 +108,18 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <MapPin className="w-3.5 h-3.5 text-blue-600" />
               <span>Denah &amp; Heatmap</span>
+            </button>
+
+            <button
+              onClick={() => onChangeView('locator')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                activeView === 'locator'
+                  ? 'bg-white text-blue-700 border border-slate-200/80 shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Footprints className="w-3.5 h-3.5 text-blue-600" />
+              <span>Pelacak Klien / Roaming</span>
             </button>
 
             <button

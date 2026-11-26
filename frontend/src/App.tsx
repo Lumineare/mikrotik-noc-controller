@@ -11,6 +11,7 @@ import { LoginPage } from './components/LoginPage';
 import { ConfirmModal } from './components/ConfirmModal';
 import { AlertModal } from './components/AlertModal';
 import { FloorMapView } from './components/map/FloorMapView';
+import { ClientLocatorView } from './components/locator/ClientLocatorView';
 import { TelegramSettingsModal } from './components/TelegramSettingsModal';
 import { Activity, AlertTriangle, RefreshCw } from 'lucide-react';
 
@@ -21,7 +22,7 @@ export default function App() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [fleet, setFleet] = useState<FleetDevice[]>([]);
   const [activeDeviceId, setActiveDeviceId] = useState<string>('');
-  const [activeView, setActiveView] = useState<'fleet' | 'device' | 'map'>('fleet');
+  const [activeView, setActiveView] = useState<'fleet' | 'device' | 'map' | 'locator'>('fleet');
 
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
   const [pollingInterval, setPollingInterval] = useState<number>(2); // seconds, 0 = pause
@@ -393,6 +394,12 @@ export default function App() {
           <FloorMapView
             onSelectDevice={(id) => {
               handleSelectDevice(id);
+            }}
+          />
+        ) : activeView === 'locator' ? (
+          <ClientLocatorView
+            onSelectFloorMap={(floorId, deviceId) => {
+              setActiveView('map');
             }}
           />
         ) : dashboardData ? (

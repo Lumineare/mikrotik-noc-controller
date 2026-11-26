@@ -31,6 +31,10 @@ import {
   TelegramConfig,
   TelegramAlertRecord,
   SupportedChannelsResponse,
+  ClientPresence,
+  RoamingEvent,
+  ClientTrailResponse,
+  LocatorStats,
 } from '../types';
 
 const BASE_URL = '';
@@ -694,6 +698,115 @@ export const api = {
     const res = await fetch(`${BASE_URL}/api/telegram/clear-history`, {
       method: 'POST',
       headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  // --- Client Locator & Roaming Trail ---
+  async getClientLocator(params?: {
+    query?: string;
+    status?: string;
+    band?: string;
+    ap_id?: string;
+    roamed_only?: boolean;
+    weak_signal?: boolean;
+    sort?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ status: string; total: number; limit: number; offset: number; clients: ClientPresence[] }> {
+    const q = new URLSearchParams();
+    if (params?.query) q.append('query', params.query);
+    if (params?.status) q.append('status', params.status);
+    if (params?.band) q.append('band', params.band);
+    if (params?.ap_id) q.append('ap_id', params.ap_id);
+    if (params?.roamed_only) q.append('roamed_only', 'true');
+    if (params?.weak_signal) q.append('weak_signal', 'true');
+    if (params?.sort) q.append('sort', params.sort);
+    if (params?.limit) q.append('limit', String(params.limit));
+    if (params?.offset) q.append('offset', String(params.offset));
+
+    const res = await fetch(`${BASE_URL}/api/clients/locator?${q.toString()}`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async getClientLocatorStats(): Promise<LocatorStats> {
+    const res = await fetch(`${BASE_URL}/api/clients/locator/stats`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async getClientTrail(mac: string): Promise<ClientTrailResponse> {
+    const res = await fetch(`${BASE_URL}/api/clients/locator/${encodeURIComponent(mac)}/trail`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async pollClientLocatorNow(): Promise<{ status: string; total_seen: number; new_clients: number; roams_detected: number }> {
+    const res = await fetch(`${BASE_URL}/api/clients/locator/poll-now`, {
+      method: 'POST',
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  // --- Fleet Wi-Fi Sync (Bulk SSID & Password Rotation) ---
+  async getFleetWifiSsids(): Promise<{
+    ok: boolean;
+    scanned_ok: number;
+    scanned_err: number;
+    total_devices: number;
+    ssids: {
+      ssid: string;
+      ap_count: number;
+      interfaces: number;
+      bands: string[];
+      profiles: string[];
+      device_ids: string[];
+    }[];
+  }> {
+    const res = await fetch(`${BASE_URL}/api/fleet/wifi/ssids`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async syncFleetWifi(payload: {
+    action: 'rotate_password' | 'create_ssid' | 'rename_ssid';
+    device_ids: string[];
+    target_ssid: string;
+    new_ssid?: string;
+    password?: string;
+    security_mode?: 'password' | 'open';
+    bands?: string[];
+    vlan_mode?: 'no-tag' | 'use-tag';
+    vlan_id?: number;
+    hide_ssid?: boolean;
+    add_bridge?: boolean;
+    bridge_name?: string;
+    dry_run?: boolean;
+  }): Promise<{
+    ok: boolean;
+    dry_run: boolean;
+    action: string;
+    target_ssid: string;
+    summary: { total: number; success: number; skipped: number; failed: number };
+    results: {
+      device_id: string;
+      device_name: string;
+      host: string;
+      status: 'ok' | 'skipped' | 'error';
+      actions: string[];
+      message: string;
+    }[];
+  }> {
+    const res = await fetch(`${BASE_URL}/api/fleet/wifi/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify(payload),
     });
     return handleResponse(res);
   },
