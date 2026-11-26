@@ -5922,6 +5922,7 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None,
                 "freq": a.get("freq"),
                 "width": a.get("width"),
                 "dense_2g": rrm.is_dense_2g(a),
+                "dense_5g": rrm.is_dense_5g(a),
                 "tx_power": a.get("tx_power"),
                 "supported_freqs": sorted(int(f) for f in (sup.get(a.get("device_id") or "", {}).get(a.get("band") or "", set()))),
             }
@@ -6211,7 +6212,9 @@ def plan_rrm_via_omniroute(
             continue
         from_freq = int(radio.get("freq") or 0)
         wide_2g = str(band).startswith("2") and float(radio.get("width") or 20) > 20
-        if to_freq == from_freq and from_freq > 0 and not wide_2g:
+        wide_dense_5g = (not str(band).startswith("2")) and bool(radio.get("dense_5g")) and float(radio.get("width") or 20) >= 80
+        needs_narrow = wide_2g or wide_dense_5g
+        if to_freq == from_freq and from_freq > 0 and not needs_narrow:
             continue
         if (did, iface) in seen_ch:
             continue
@@ -6224,12 +6227,12 @@ def plan_rrm_via_omniroute(
             "to_freq": to_freq,
             "reason": str(item.get("reason") or f"Rekomendasi OmniRoute ({model_name})"),
             "omniroute": True,
-            "repair": from_freq == 0 or wide_2g,
+            "repair": from_freq == 0 or needs_narrow,
             "interference_before_mw": 0.0,
             "interference_after_mw": 0.0,
             "relief_pct": 0.0,
         }
-        if wide_2g:
+        if needs_narrow:
             ch_entry["fix_width"] = "20mhz"
         valid_ch.append(ch_entry)
 

@@ -212,9 +212,17 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
         return {"changes": [], "cost_before": 0.0, "cost_after": 0.0,
                 "gain_pct": 0.0, "iterations": 0}
 
+    def _eff_width(ap):
+        w = float(ap.get("width") or 20)
+        if str(ap.get("band", "")).startswith("2") and w > 20:
+            return 20.0
+        if is_dense_5g(ap) and w >= 80:
+            return 20.0
+        return w
+
     def _opts_for(ap):
         band = ap.get("band", "2g")
-        width = ap.get("width", 20)
+        width = _eff_width(ap)
         opts = candidates(band, include_dfs, width)
         if allowed:
             keep = allowed.get("2g" if str(band).startswith("2") else "5g")
@@ -256,7 +264,7 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
         )
         for ap in order:
             band = ap.get("band", "2g")
-            width = ap.get("width", 20)
+            width = _eff_width(ap)
             opts = _opts_for(ap)
             if not opts:
                 continue
@@ -291,14 +299,16 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
         is_2g = str(ap.get("band", "")).startswith("2")
         cur_width = float(ap.get("width") or 20)
         wide_2g = is_2g and cur_width > 20
-        if old == new and not wide_2g:
+        wide_dense_5g = (not is_2g) and is_dense_5g(ap) and cur_width >= 80
+        needs_narrow = wide_2g or wide_dense_5g
+        if old == new and not needs_narrow:
             continue
-        if not is_2g and old and \
+        if not is_2g and not needs_narrow and old and \
                 _block_primary(old, cur_width) == _block_primary(new, cur_width):
             continue  # same 40/80 MHz block, only the primary label moved
         nb = _neighbours_for(ap, best_assign, ap_by_id, owner_idx)
         old_cost = channel_cost(old, cur_width, nb, _noise_at(ap, old), _util_at(ap, old)) if old else cost_before
-        new_cost = channel_cost(new, 20 if wide_2g else cur_width, nb, _noise_at(ap, new), _util_at(ap, new))
+        new_cost = channel_cost(new, 20 if needs_narrow else cur_width, nb, _noise_at(ap, new), _util_at(ap, new))
         ch = {
             "device_id": ap.get("device_id") or ap["id"], "interface": ap.get("interface"),
             "band": ap.get("band"), "from_freq": old, "to_freq": new,
@@ -310,6 +320,10 @@ def plan_dca(aps: list[dict], include_dfs: bool = False, max_passes: int = 40,
             ch["fix_width"] = "20mhz"
             ch["repair"] = True
             ch["reason"] = f"2.4 GHz memakai {int(cur_width)} MHz (overlap channel) — dipersempit ke 20 MHz"
+        elif wide_dense_5g:
+            ch["fix_width"] = "20mhz"
+            ch["repair"] = True
+            ch["reason"] = f"5 GHz padat (>=3 AP armada) memakai {int(cur_width)} MHz (hanya 2 blok) — dipersempit ke 20 MHz"
         if ap["id"] in off_plan:
             ch["repair"] = True
             ch["reason"] = f"channel {old} di luar rencana — dikembalikan ke {new}"
@@ -342,6 +356,15 @@ def _fleet_neighbours(ap: dict) -> list[dict]:
 def is_dense_2g(ap: dict) -> bool:
     """True when a 2.4 GHz radio hears >= 3 distinct fleet APs (physical 3-channel limit)."""
     if not str(ap.get("band", "")).startswith("2"):
+        return False
+    fleet = _fleet_neighbours(ap)
+    owners = {n.get("owner") or idx for idx, n in enumerate(fleet)}
+    return len(owners) >= 3
+
+
+def is_dense_5g(ap: dict) -> bool:
+    """True when a 5 GHz radio hears >= 3 distinct fleet APs (80 MHz only has 2 non-DFS blocks)."""
+    if str(ap.get("band", "")).startswith("2"):
         return False
     fleet = _fleet_neighbours(ap)
     owners = {n.get("owner") or idx for idx, n in enumerate(fleet)}
@@ -628,5 +651,17 @@ if __name__ == "__main__":
     ev_good = evaluate_plan(aps, [{"device_id": "b", "interface": "wlan1", "to_freq": 2437}])
     ev_bad = evaluate_plan(aps, [{"device_id": "b", "interface": "wlan1", "to_freq": 2412}])
     assert ev_good["cost_after"] < ev_bad["cost_after"] and ev_good["gain_pct"] > 0, (ev_good, ev_bad)
+
+    # Dense 5 GHz (>=3 fleet APs) on 80 MHz is narrowed to 20 MHz; solo 5 GHz keeps 80 MHz
+    solo_5g = [{"id": "s5", "device_id": "s5", "band": "5g", "freq": 5180, "width": 80, "interface": "wlan2",
+                "neighbours": [], "noise": {5180: -96}}]
+    assert plan_dca(solo_5g)["changes"] == []
+    dense_5g = [{"id": "d5", "device_id": "d5", "band": "5g", "freq": 5180, "width": 80, "interface": "wlan2",
+                 "neighbours": [{"freq": 5180, "width": 80, "signal": -62, "owner": "b"},
+                                {"freq": 5200, "width": 80, "signal": -65, "owner": "c"},
+                                {"freq": 5745, "width": 80, "signal": -68, "owner": "e"}],
+                 "noise": {5180: -95, 5220: -95, 5785: -95}}]
+    d5_plan = plan_dca(dense_5g)
+    assert d5_plan["changes"] and d5_plan["changes"][0].get("fix_width") == "20mhz", d5_plan
 
     print("rrm_engine self-check OK")
