@@ -6765,8 +6765,10 @@ def api_rrm_apply(req: RrmApplyReq):
             return len(mt.resource("/interface/wireless/registration-table").get())
 
 
-    # push sekuensial per AP — satu-satunya blast radius; abort kalau klien hilang melebihi batas
+    # push sekuensial per AP — satu-satunya blast radius
     skipped_unreachable: list[dict] = []
+    rolled_back_aps: list[dict] = []
+    is_multi_ap = len(devs) > 1
     for did, dev in devs.items():
         slice_ch = [c for c in changes if c.get("device_id") == did]
         slice_tp = [t for t in tpc if t.get("device_id") == did]
@@ -6808,10 +6810,21 @@ def api_rrm_apply(req: RrmApplyReq):
         # Klien yang sengaja di-kick ke AP terdekat (roam_kicked) tidak boleh dianggap "hilang"
         effective_before = max(0, before - roam_kicked)
         after = _settle_clients(effective_before, lambda: _clients(dev), max_drop)
-        if effective_before - after > max_drop:
-            aborted = {"device": did, "clients_before": before, "roam_kicked": roam_kicked,
+        # Di armada padat multi-AP (RS ~100 AP), saat 1 AP ganti channel klien wajar
+        # langsung roam ke AP sebelah yang overlap. Selama masih ada klien yang konek
+        # kembali (after > 0), radio sehat. Rollback hanya jika blackout (after == 0)
+        # di multi-AP, atau drop > max_drop pada single-AP.
+        failed_drop = (
+            (effective_before >= 3 and after == 0)
+            if is_multi_ap
+            else (effective_before - after > max_drop)
+        )
+        if failed_drop:
+            rb_info = {"device": did, "clients_before": before, "roam_kicked": roam_kicked,
                        "clients_after": after,
-                       "reason": f"klien turun {effective_before - after} > batas {max_drop} — push dihentikan"}
+                       "reason": (f"radio blackout (0/{effective_before} klien kembali setelah 45s) — AP dikembalikan"
+                                  if is_multi_ap else
+                                  f"klien turun {effective_before - after} > batas {max_drop} — AP dikembalikan")}
             # rollback AP ini saja dari snapshot
             for entry in [e for e in snapshot if e.get("device_id") == did]:
                 try:
@@ -6820,10 +6833,6 @@ def api_rrm_apply(req: RrmApplyReq):
                         cur = wl.get(name=entry["interface"])
                         if not cur:
                             continue
-                        # urutan penting: channel-width dulu, baru frequency
-                        # (set frequency ke kanal yang tak mendukung width lama
-                        #  ditolak 'bad band or frequency'), tx-power butuh mode
-                        # all-rates-fixed lebih dulu. Tiap langkah diverifikasi.
                         if entry.get("channel_width") and \
                                 str(cur[0].get("channel-width") or "") != str(entry["channel_width"]):
                             wl.set(id=cur[0]["id"], channel_width=entry["channel_width"])
@@ -6837,7 +6846,7 @@ def api_rrm_apply(req: RrmApplyReq):
                         now = (wl.get(name=entry["interface"]) or [{}])[0]
                         if entry.get("frequency") and \
                                 str(now.get("frequency") or "") != str(entry["frequency"]):
-                            aborted.setdefault("rollback_errors", []).append(
+                            rb_info.setdefault("rollback_errors", []).append(
                                 f"{did}/{entry['interface']}: frequency tetap {now.get('frequency')}")
                         acl = mt.resource("/interface/wireless/access-list")
                         for r in acl.get():
@@ -6845,10 +6854,15 @@ def api_rrm_apply(req: RrmApplyReq):
                                     str(r.get("comment") or "").startswith(ROAM_PREFIX):
                                 acl.remove(id=r["id"])
                 except Exception as e:
-                    aborted.setdefault("rollback_errors", []).append(
+                    rb_info.setdefault("rollback_errors", []).append(
                         f"{did}/{entry.get('interface')}: {type(e).__name__}: {e}")
                     continue
-            break
+            rolled_back_aps.append(rb_info)
+            # Di fleet multi-AP, jangan hentikan sisa 99 AP hanya karena 1 AP bermasalah;
+            # baru abort seluruh fleet jika >= 3 AP mengalami blackout sistemik.
+            if (not is_multi_ap) or len(rolled_back_aps) >= 3:
+                aborted = rb_info
+                break
 
     run = {
         "id": f"rrm_{secrets.token_hex(4)}", "ts": time.time(), "mode": "manual",
@@ -6860,7 +6874,8 @@ def api_rrm_apply(req: RrmApplyReq):
     applied = sum(1 for k in result for x in result[k] if x.get("applied"))
     return {"ok": True, "run_id": run["id"], "applied_actions": applied,
             "gain_pct": run["gain_pct"], "result": result, "channel_skipped": ch_skip,
-            "aborted": aborted, "skipped_unreachable": skipped_unreachable,
+            "aborted": aborted, "rolled_back_aps": rolled_back_aps,
+            "skipped_unreachable": skipped_unreachable,
             "clients_before": clients_before,
             "rollback_hint": f"POST /api/rrm/rollback {{'run_id': '{run['id']}'}}"}
 
