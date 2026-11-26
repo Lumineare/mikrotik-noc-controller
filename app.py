@@ -5949,19 +5949,47 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None,
 def _extract_json_object(text: str) -> dict | None:
     if not text:
         return None
-    s = text.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    start = s.find("{")
-    end = s.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    # Buang blok <think>...</think> milik model reasoning agar kurung kurawal di dalamnya tidak merusak parser
+    s = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not s:
         return None
+    # 1. Coba blok ```json ... ``` jika ada
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+    for blk in reversed(fenced):
+        try:
+            obj = json.loads(blk)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    # 2. Coba parse langsung seluruh string
     try:
-        obj = json.loads(s[start:end + 1])
-        return obj if isinstance(obj, dict) else None
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
-        return None
+        pass
+    # 3. Scan semua objek JSON seimbang dengan raw_decode; prioritaskan yang berisi key RRM
+    dec = json.JSONDecoder()
+    candidates: list[dict] = []
+    pos = 0
+    while True:
+        idx = s.find("{", pos)
+        if idx == -1:
+            break
+        try:
+            obj, end = dec.raw_decode(s, idx)
+            if isinstance(obj, dict):
+                candidates.append(obj)
+                pos = end
+                continue
+        except Exception:
+            pass
+        pos = idx + 1
+    for obj in reversed(candidates):
+        if "channel_changes" in obj or "rationale" in obj or "txpower_changes" in obj:
+            return obj
+    return candidates[-1] if candidates else None
 
 
 def plan_rrm_via_omniroute(
@@ -6086,7 +6114,8 @@ def plan_rrm_via_omniroute(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
         ],
-        "max_tokens": max(int(cfg.get("max_tokens", 750) or 750), 2200),
+        # 4096 memberi ruang cukup bagi model thinking/reasoning agar JSON tidak terpotong
+        "max_tokens": max(int(cfg.get("max_tokens", 750) or 750), 4096),
         "temperature": 0.2,
     }
 
@@ -6105,10 +6134,15 @@ def plan_rrm_via_omniroute(
             )
             with urllib.request.urlopen(req, timeout=60) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
-                content = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                msg_obj = (body.get("choices") or [{}])[0].get("message") or {}
+                content = msg_obj.get("content") or ""
                 parsed = _extract_json_object(content)
+                if parsed is None and msg_obj.get("reasoning_content"):
+                    parsed = _extract_json_object(msg_obj.get("reasoning_content") or "")
                 if parsed is not None:
                     break
+                preview = (content or "").replace("\n", " ")[:180]
+                print(f"[RRM-OmniRoute] attempt {attempt}/2 invalid JSON ({model_name}): {preview!r}")
                 last_err = "respons OmniRoute bukan JSON valid"
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
