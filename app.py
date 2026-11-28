@@ -6777,55 +6777,70 @@ def api_rrm_apply(req: RrmApplyReq):
             return len(mt.resource("/interface/wireless/registration-table").get())
 
 
-    # push sekuensial per AP — satu-satunya blast radius
+    # Push paralel terkendali (maks 6 AP serentak di fleet besar) agar 60-100 AP
+    # selesai dalam ~1-2 menit, bukan 60 menit. Tetap hentikan fleet jika >= 3 AP blackout.
     skipped_unreachable: list[dict] = []
     rolled_back_aps: list[dict] = []
     is_multi_ap = len(devs) > 1
-    for did, dev in devs.items():
+    apply_lock = threading.Lock()
+    abort_flag = threading.Event()
+
+    def _apply_one_ap(item):
+        nonlocal aborted
+        did, dev = item
+        if abort_flag.is_set():
+            return
         slice_ch = [c for c in changes if c.get("device_id") == did]
         slice_tp = [t for t in tpc if t.get("device_id") == did]
         slice_st = [s for s in steer if s.get("device_id") == did]
         slice_rm = [r for r in roam if r.get("device_id") == did]
         if not ((do_ch and slice_ch) or (do_tpc and slice_tp) or (do_steer and slice_st)
                 or (do_roam and slice_rm)):
-            continue
+            return
         try:
             with get_device_lock(dev["host"]), MT(dev) as mt:
-                snapshot.extend(_snapshot_wireless(dev, mt))
+                ap_snap = _snapshot_wireless(dev, mt)
             before = _clients(dev)
         except Exception as e:
-            # Di armada 100 AP RS, 1 AP offline/maintenance tidak boleh menghentikan 99 AP lain
-            skipped_unreachable.append({"device": did, "reason": f"tidak bisa dihubungi: {type(e).__name__}: {e}"})
-            continue
-        clients_before[did] = before
+            with apply_lock:
+                skipped_unreachable.append({"device": did, "reason": f"tidak bisa dihubungi: {type(e).__name__}: {e}"})
+            return
+        with apply_lock:
+            snapshot.extend(ap_snap)
+            clients_before[did] = before
         applied_now = 0
         roam_kicked = 0
+        ch_got = tp_got = st_got = rm_got = []
         if do_ch and slice_ch:
-            got = _apply_channel_changes(slice_ch)
-            result["channel"] += got
-            applied_now += sum(1 for x in got if x.get("applied"))
+            ch_got = _apply_channel_changes(slice_ch)
+            applied_now += sum(1 for x in ch_got if x.get("applied"))
         if do_tpc and slice_tp:
-            got = _apply_tpc_changes(slice_tp)
-            result["txpower"] += got
-            applied_now += sum(1 for x in got if x.get("applied"))
+            tp_got = _apply_tpc_changes(slice_tp)
+            applied_now += sum(1 for x in tp_got if x.get("applied"))
         if do_steer and slice_st:
-            got = _apply_steering_rules(slice_st)
-            result["steering"] += got
-            applied_now += sum(1 for x in got if x.get("applied"))
+            st_got = _apply_steering_rules(slice_st)
+            applied_now += sum(1 for x in st_got if x.get("applied"))
         if do_roam and slice_rm:
-            got = _apply_roam_rules(slice_rm, roam_expire)
-            result["roam"] += got
-            applied_now += sum(1 for x in got if x.get("applied"))
-            roam_kicked += sum(1 for x in got if x.get("kicked"))
+            rm_got = _apply_roam_rules(slice_rm, roam_expire)
+            applied_now += sum(1 for x in rm_got if x.get("applied"))
+            roam_kicked += sum(1 for x in rm_got if x.get("kicked"))
+        with apply_lock:
+            result["channel"] += ch_got
+            result["txpower"] += tp_got
+            result["steering"] += st_got
+            result["roam"] += rm_got
         if not applied_now:
-            continue
-        # Klien yang sengaja di-kick ke AP terdekat (roam_kicked) tidak boleh dianggap "hilang"
+            return
         effective_before = max(0, before - roam_kicked)
-        after = _settle_clients(effective_before, lambda: _clients(dev), max_drop)
-        # Di armada padat multi-AP (RS ~100 AP), saat 1 AP ganti channel klien wajar
-        # langsung roam ke AP sebelah yang overlap. Selama masih ada klien yang konek
-        # kembali (after > 0), radio sehat. Rollback hanya jika blackout (after == 0)
-        # di multi-AP, atau drop > max_drop pada single-AP.
+        if effective_before == 0:
+            after = 0
+        elif is_multi_ap:
+            # Di fleet multi-AP, begitu >=1 klien konek kembali radio sudah terbukti sehat (2-4s)
+            after = _settle_clients(effective_before, lambda: _clients(dev), max_drop,
+                                    timeout=18.0, step=2.0, min_ok=1)
+        else:
+            after = _settle_clients(effective_before, lambda: _clients(dev), max_drop,
+                                    timeout=30.0, step=2.0)
         failed_drop = (
             (effective_before >= 3 and after == 0)
             if is_multi_ap
@@ -6834,11 +6849,10 @@ def api_rrm_apply(req: RrmApplyReq):
         if failed_drop:
             rb_info = {"device": did, "clients_before": before, "roam_kicked": roam_kicked,
                        "clients_after": after,
-                       "reason": (f"radio blackout (0/{effective_before} klien kembali setelah 45s) — AP dikembalikan"
+                       "reason": (f"radio blackout (0/{effective_before} klien kembali setelah 18s) — AP dikembalikan"
                                   if is_multi_ap else
                                   f"klien turun {effective_before - after} > batas {max_drop} — AP dikembalikan")}
-            # rollback AP ini saja dari snapshot
-            for entry in [e for e in snapshot if e.get("device_id") == did]:
+            for entry in ap_snap:
                 try:
                     with get_device_lock(dev["host"]), MT(dev) as mt:
                         wl = mt.resource("/interface/wireless")
@@ -6869,12 +6883,15 @@ def api_rrm_apply(req: RrmApplyReq):
                     rb_info.setdefault("rollback_errors", []).append(
                         f"{did}/{entry.get('interface')}: {type(e).__name__}: {e}")
                     continue
-            rolled_back_aps.append(rb_info)
-            # Di fleet multi-AP, jangan hentikan sisa 99 AP hanya karena 1 AP bermasalah;
-            # baru abort seluruh fleet jika >= 3 AP mengalami blackout sistemik.
-            if (not is_multi_ap) or len(rolled_back_aps) >= 3:
-                aborted = rb_info
-                break
+            with apply_lock:
+                rolled_back_aps.append(rb_info)
+                if (not is_multi_ap) or len(rolled_back_aps) >= 3:
+                    aborted = rb_info
+                    abort_flag.set()
+
+    workers = min(len(devs), 6) if is_multi_ap else 1
+    with ThreadPoolExecutor(max_workers=workers or 1) as ex:
+        list(ex.map(_apply_one_ap, list(devs.items())))
 
     run = {
         "id": f"rrm_{secrets.token_hex(4)}", "ts": time.time(), "mode": "manual",
@@ -7167,10 +7184,13 @@ def _mean(vals):
     return round(sum(vals) / len(vals), 1) if vals else None
 
 
-def _settle_clients(before, sample, max_drop, timeout=45.0, step=3.0):
+def _settle_clients(before, sample, max_drop, timeout=45.0, step=3.0, min_ok=None):
     """Tunggu klien re-associate (radio restart 10-30 s), kembalikan hitungan
     terakhir. Berhenti cepat begitu pulih; timeout -> nilai terakhir (drop nyata
     tetap terdeteksi). Semua sample gagal -> before (tak ada bukti drop)."""
+    if before <= 0:
+        return 0
+    target = (before - max_drop) if min_ok is None else min_ok
     last = None
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -7179,7 +7199,7 @@ def _settle_clients(before, sample, max_drop, timeout=45.0, step=3.0):
             last = sample()
         except Exception:
             continue
-        if last >= before - max_drop:
+        if last >= target:
             return last
     return before if last is None else last
 
