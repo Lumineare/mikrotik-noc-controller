@@ -122,6 +122,7 @@ def init_noc_db():
                 device_type TEXT,
                 vendor TEXT,
                 is_custom_name INTEGER DEFAULT 0,
+                is_randomized INTEGER DEFAULT 0,
                 ap_id TEXT NOT NULL,
                 ap_name TEXT NOT NULL,
                 ap_host TEXT,
@@ -166,6 +167,12 @@ def init_noc_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_presence_ap ON client_presence (ap_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_roam_mac ON client_roaming_events (mac, timestamp DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_roam_time ON client_roaming_events (timestamp DESC)")
+        try:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(client_presence)").fetchall()}
+            if "is_randomized" not in cols:
+                c.execute("ALTER TABLE client_presence ADD COLUMN is_randomized INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         # Job optimasi hidup di memori; yang tercatat "running" saat proses mati
         # tidak akan pernah selesai dan bikin UI polling selamanya.
         try:
@@ -3484,24 +3491,28 @@ def api_ai_apply(req: AiApplyReq):
 AI_CONFIG_FILE = BASE / "ai_config.json"
 
 DEFAULT_AI_CONFIG = {
-    "base_url": os.environ.get("OMNIROUTE_BASE_URL", "https://api.example.com/v1"),
-    "api_key": os.environ.get("OMNIROUTE_API_KEY", "sk-cde734e45194001b-fb4a5f-135f6e41"),
-    "model": os.environ.get("OMNIROUTE_MODEL", "MiMo"),
+    "base_url": os.environ.get("OMNIROUTE_BASE_URL", ""),
+    "api_key": os.environ.get("OMNIROUTE_API_KEY", ""),
+    "model": os.environ.get("OMNIROUTE_MODEL", "auto/best-chat"),
     "temperature": 0.4,
     "max_tokens": 750
 }
 
 def load_ai_config():
+    """Baca konfigurasi AI secara dinamis dari ai_config.json (fallback ke env/.env)."""
+    merged = dict(DEFAULT_AI_CONFIG)
     if not AI_CONFIG_FILE.exists():
-        return dict(DEFAULT_AI_CONFIG)
+        return merged
     try:
         with open(AI_CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-            merged = dict(DEFAULT_AI_CONFIG)
-            merged.update(cfg)
+            if isinstance(cfg, dict):
+                for k, v in cfg.items():
+                    if v is not None and v != "":
+                        merged[k] = v
             return merged
     except Exception:
-        return dict(DEFAULT_AI_CONFIG)
+        return merged
 
 def save_ai_config(cfg: dict):
     with open(AI_CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -3552,6 +3563,8 @@ def call_omniroute_chat(system_prompt: str, user_message: str, model: str | None
 class AiConfigReq(BaseModel):
     model: str | None = None
     temperature: float | None = None
+    base_url: str | None = None
+    api_key: str | None = None
 
 @app.get("/api/ai/models")
 def api_ai_models():
@@ -3597,7 +3610,15 @@ def api_ai_models():
 @app.get("/api/ai/config")
 def api_get_ai_config():
     cfg = load_ai_config()
-    return {"status": "ok", "config": {"model": cfg.get("model", "MiMo")}}
+    return {
+        "status": "ok",
+        "config": {
+            "model": cfg.get("model", "auto/best-chat"),
+            "base_url": cfg.get("base_url", ""),
+            "has_api_key": bool(cfg.get("api_key")),
+            "temperature": cfg.get("temperature", 0.4),
+        },
+    }
 
 @app.post("/api/ai/config")
 def api_save_ai_config(req: AiConfigReq):
@@ -3606,8 +3627,20 @@ def api_save_ai_config(req: AiConfigReq):
         cfg["model"] = req.model.strip()
     if req.temperature is not None:
         cfg["temperature"] = req.temperature
+    if req.base_url is not None and req.base_url.strip():
+        cfg["base_url"] = req.base_url.strip().rstrip("/")
+    if req.api_key is not None and req.api_key.strip():
+        cfg["api_key"] = req.api_key.strip()
     save_ai_config(cfg)
-    return {"status": "ok", "message": f"Model AI berhasil diubah ke: {cfg['model']}", "config": {"model": cfg["model"]}}
+    return {
+        "status": "ok",
+        "message": f"Konfigurasi AI berhasil disimpan (model: {cfg['model']})",
+        "config": {
+            "model": cfg["model"],
+            "base_url": cfg.get("base_url", ""),
+            "has_api_key": bool(cfg.get("api_key")),
+        },
+    }
 
 
 @app.post("/api/ai/chat")
@@ -3995,11 +4028,14 @@ def api_rf_scan(
     device: str | None = Query(None),
     band: str = Query("2g"),
     duration: int = Query(8, ge=4, le=20),
+    non_disruptive: bool = Query(False),
 ):
     """Live RF frequency-usage scan via RouterOS /interface/wireless scan.
 
     Returns per-channel occupancy, interference score and a clean-channel ranking
     so the technician knows which frequency is actually best on site.
+    When `non_disruptive=True`, uses 1s `frequency-monitor` instead of full scan
+    to avoid dropping active clients.
     """
     import re as _re
 
@@ -4036,40 +4072,54 @@ def api_rf_scan(
             reg_channels = []
 
         freq_usage = []
-        scan_mode = "scan"
-        try:
-            raw = wl_res.call("scan", {"id": target["id"], "duration": str(duration)}) or []
-        except Exception as e:
-            msg = str(e)
-            if "other tool running" not in msg:
-                raise HTTPException(status_code=502, detail=f"Scan RF gagal: {type(e).__name__}: {e}")
-            # The radio is busy with another tool (Winbox Freq. Usage, snooper, ...).
-            # frequency-monitor still works and reports the same per-channel data
-            # that Winbox "Freq. Usage" shows: real usage % and noise floor.
+        raw = []
+        scan_mode = "frequency-monitor" if non_disruptive else "scan"
+
+        def _read_freq_monitor():
+            fm_rows = []
             try:
                 fm = wl_res.call("frequency-monitor", {"id": target["id"], "duration": "1"}) or []
             except Exception:
                 fm = []
-            if not fm:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Radio {target.get('name')} sedang dipakai tool lain di router "
-                        "(Freq. Usage / Snooper / scan sebelumnya belum selesai). "
-                        "Tutup tool tersebut di Winbox atau tunggu beberapa detik, lalu coba lagi."
-                    ),
-                )
             for row in fm:
                 try:
-                    freq_usage.append({
+                    fm_rows.append({
                         "freq": int(row.get("freq", 0)),
                         "use_pct": float(row.get("use", 0) or 0),
                         "noise_floor": int(float(row.get("nf", 0) or 0)),
                     })
                 except (TypeError, ValueError):
                     continue
-            raw = []
-            scan_mode = "frequency-monitor"
+            return fm_rows
+
+        if non_disruptive:
+            freq_usage = _read_freq_monitor()
+            if not freq_usage:
+                scan_mode = "scan-short"
+                try:
+                    raw = wl_res.call("scan", {"id": target["id"], "duration": "4"}) or []
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"Scan RF gagal: {type(e).__name__}: {e}")
+        else:
+            try:
+                raw = wl_res.call("scan", {"id": target["id"], "duration": str(duration)}) or []
+                freq_usage = _read_freq_monitor()
+            except Exception as e:
+                msg = str(e)
+                if "other tool running" not in msg:
+                    raise HTTPException(status_code=502, detail=f"Scan RF gagal: {type(e).__name__}: {e}")
+                freq_usage = _read_freq_monitor()
+                if not freq_usage:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Radio {target.get('name')} sedang dipakai tool lain di router "
+                            "(Freq. Usage / Snooper / scan sebelumnya belum selesai). "
+                            "Tutup tool tersebut di Winbox atau tunggu beberapa detik, lalu coba lagi."
+                        ),
+                    )
+                raw = []
+                scan_mode = "frequency-monitor"
 
     # ---- parse scan results ------------------------------------------------
     known_bssids = get_fleet_known_bssids()
@@ -4348,6 +4398,12 @@ def api_rf_scan(
             + ", ".join(f"{r['ssid']} ({r['bssid']})" for r in rogues),
         })
 
+    sorted_bss = sorted(bss_list, key=lambda x: -x["signal"])[:60]
+    try:
+        db_rf_scan_save(dev.get("id"), band, channels_out, sorted_bss)
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "device_id": dev.get("id"),
@@ -4357,6 +4413,7 @@ def api_rf_scan(
         "duration_s": duration,
         "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "scan_mode": scan_mode,
+        "non_disruptive": bool(non_disruptive),
         "freq_usage": freq_usage,
         "total_bss_detected": len(bss_list),
         "rogue_count": len(rogues),
@@ -4366,7 +4423,7 @@ def api_rf_scan(
         "current_channel_grade": current_entry["grade"] if current_entry else None,
         "best_channels": best3,
         "channels": channels_out,
-        "bss_list": sorted(bss_list, key=lambda x: -x["signal"])[:60],
+        "bss_list": sorted_bss,
     }
 
 
@@ -5251,8 +5308,8 @@ RRM_DEFAULT = {
     "apply_channel": True,
     "apply_txpower": False,
     "apply_steering": False,
-    "apply_roam": False,       # blokir MAC di AP yang salah (pengganti 802.11k/v)
-    "roam_thr_dbm": -74.0,     # blokir hanya saat sinyal klien di AP itu <= ini
+    "apply_roam": True,        # kick & blokir MAC di AP lemah (<= -75 dBm) agar pindah ke AP terdekat
+    "roam_thr_dbm": -75.0,     # kick & blokir hanya saat sinyal klien di AP itu <= ini
     "roam_alt_min_dbm": -67.0, # AP alternatif minimal sekuat ini, kalau tidak klien yatim
     "roam_margin_db": 7.0,     # histeresis: selisih minimal agar layak dipaksa pindah
     "roam_expire_min": 10,     # entry ACL dicabut otomatis setelah ini
@@ -5296,8 +5353,11 @@ RRM_LOCK = threading.Lock()
 
 def init_rrm_db():
     with _DB_LOCK:
-        conn = sqlite3.connect(str(NOC_DB_FILE))
+        conn = sqlite3.connect(str(NOC_DB_FILE), timeout=10.0)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA busy_timeout=5000")
         c.execute("""
             CREATE TABLE IF NOT EXISTS rf_samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5313,6 +5373,14 @@ def init_rrm_db():
                 result_json TEXT, rolled_back INTEGER DEFAULT 0
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS rf_scan_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, device_id TEXT, band TEXT,
+                channels_json TEXT, bss_json TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rf_scan_hist ON rf_scan_history (device_id, band, ts)")
         conn.commit()
         conn.close()
 
@@ -5385,6 +5453,59 @@ def db_rf_samples(device_id: str | None = None, limit: int = 20000) -> list[dict
                     "SELECT * FROM rf_samples ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
             conn.close()
             return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+
+def db_rf_scan_save(device_id: str | None, band: str, channels: list[dict], bss_list: list[dict]):
+    if not device_id:
+        return
+    slim_ch = [
+        {"freq": int(c["freq"]),
+         "noise_floor": c.get("noise_floor"),
+         "usage_pct": c.get("usage_pct") if c.get("usage_pct") is not None else c.get("load")}
+        for c in (channels or []) if c.get("freq")
+    ]
+    slim_bss = [
+        {"bssid": b.get("bssid"), "freq": int(b.get("freq") or 0),
+         "width": int(b.get("width") or 20), "signal": float(b.get("signal") or -95),
+         "ssid": b.get("ssid")}
+        for b in (bss_list or []) if b.get("freq")
+    ]
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.execute(
+                "INSERT INTO rf_scan_history (ts, device_id, band, channels_json, bss_json) VALUES (?, ?, ?, ?, ?)",
+                (time.time(), device_id, band, json.dumps(slim_ch), json.dumps(slim_bss)),
+            )
+            conn.execute("DELETE FROM rf_scan_history WHERE ts < ?", (time.time() - 7 * 86400,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_rf_scan_history(device_id: str, band: str, window_sec: int = 86400, limit: int = 48) -> list[dict]:
+    cutoff = time.time() - window_sec
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT ts, channels_json, bss_json FROM rf_scan_history "
+                "WHERE device_id=? AND band=? AND ts>=? ORDER BY ts DESC LIMIT ?",
+                (device_id, band, cutoff, limit),
+            ).fetchall()
+            conn.close()
+            out = []
+            for r in rows:
+                out.append({
+                    "ts": float(r["ts"]),
+                    "channels": json.loads(r["channels_json"] or "[]"),
+                    "bss_list": json.loads(r["bss_json"] or "[]"),
+                })
+            return out
         except Exception:
             return []
 
@@ -5494,62 +5615,142 @@ def collect_rf_samples(dev: dict, mt) -> int:
     return len(rows)
 
 
-def _gather_ap(dev: dict, duration: int) -> list[dict]:
-    """Per-band engine input for one AP: own channel, noise floor, neighbour BSSes."""
+def _gather_ap(dev: dict, duration: int, scan_cache: dict | None = None,
+               non_disruptive: bool = False) -> list[dict]:
+    """Per-band engine input for one AP: own channel, noise floor, utilization, neighbour BSSes.
+
+    Blends live scan with 24h RF scan history (exponential time decay) so a brief
+    quiet snapshot never hides persistent peak-hour interference or intermittent
+    neighbours, and reuses `scan_cache` when provided to avoid double-scanning.
+    """
     out = []
     known = {}
     try:
         known = get_fleet_known_bssids() or {}
     except Exception:
         known = {}
+    now = time.time()
+    half_life_s = 6 * 3600.0
     for band in ("2g", "5g"):
-        try:
-            scan = api_rf_scan(device=dev["id"], band=band, duration=duration)
-        except HTTPException:
-            continue
-        except Exception:
-            continue
+        cache_key = (dev["id"], band)
+        scan = (scan_cache or {}).get(cache_key)
+        if scan is None:
+            try:
+                scan = api_rf_scan(device=dev["id"], band=band, duration=duration,
+                                   non_disruptive=non_disruptive)
+            except HTTPException:
+                continue
+            except Exception:
+                continue
         iface_name = scan.get("interface")
         cur = scan.get("current_channel") or {}
         try:
             freq = int(float(cur.get("freq")))
         except (TypeError, ValueError):
             freq = 0
-        # freq 0 = radio tak punya channel eksplisit ('auto' / sedang scanning /
-        # mati). Dulu di-skip total sehingga plan melihat "tak ada AP" lalu bilang
-        # "sudah optimal". Sekarang tetap masuk plan sebagai perbaikan.
-        noise = {int(c["freq"]): float(c["noise_floor"])
-                 for c in scan.get("channels", [])
-                 if c.get("noise_floor") is not None}
+
+        hist = db_rf_scan_history(dev["id"], band, window_sec=86400, limit=48)
+        noise_acc: dict[int, list[tuple[float, float]]] = {}
+        util_acc: dict[int, list[tuple[float, float]]] = {}
+
+        for c in scan.get("channels", []):
+            cf = int(c.get("freq") or 0)
+            if not cf:
+                continue
+            if c.get("noise_floor") is not None:
+                noise_acc.setdefault(cf, []).append((float(c["noise_floor"]), 1.0))
+            u = c.get("usage_pct") if c.get("usage_pct") is not None else c.get("load")
+            if u is not None:
+                util_acc.setdefault(cf, []).append((float(u), 1.0))
+
+        for h in hist:
+            age = max(0.0, now - h["ts"])
+            if age < 30.0:
+                continue
+            w_decay = 0.5 ** (age / half_life_s)
+            for c in h.get("channels", []):
+                cf = int(c.get("freq") or 0)
+                if not cf:
+                    continue
+                if c.get("noise_floor") is not None:
+                    noise_acc.setdefault(cf, []).append((float(c["noise_floor"]), 0.5 * w_decay))
+                if c.get("usage_pct") is not None:
+                    util_acc.setdefault(cf, []).append((float(c["usage_pct"]), 0.5 * w_decay))
+
+        noise = {
+            f: round(sum(v * w for v, w in pairs) / sum(w for _, w in pairs), 1)
+            for f, pairs in noise_acc.items() if pairs
+        }
+        utilization = {
+            f: round(sum(v * w for v, w in pairs) / sum(w for _, w in pairs), 1)
+            for f, pairs in util_acc.items() if pairs
+        }
+
+        live_by_bssid: dict[str, dict] = {}
         neighbours = []
         for b in scan.get("bss_list", []):
-            owner = (known.get(str(b.get("bssid", "")).upper().replace("-", ":")) or {}).get("device_id")
-            neighbours.append({
+            bssid = str(b.get("bssid", "")).upper().replace("-", ":")
+            owner = (known.get(bssid) or {}).get("device_id")
+            entry = {
                 "freq": int(b.get("freq") or 0),
                 "width": int(b.get("width") or 20),
                 "signal": float(b.get("signal") or -95),
                 "owner": owner,
                 "ssid": b.get("ssid"),
-                "bssid": b.get("bssid"),
-            })
+                "bssid": bssid,
+                "weight": 1.0,
+            }
+            neighbours.append(entry)
+            if bssid:
+                live_by_bssid[bssid] = entry
+
+        hist_seen: dict[str, dict] = {}
+        for h in hist:
+            age = max(0.0, now - h["ts"])
+            if age < 30.0:
+                continue
+            w_decay = 0.5 ** (age / half_life_s)
+            base_w = 0.85 if not live_by_bssid else 0.35
+            for b in h.get("bss_list", []):
+                bssid = str(b.get("bssid", "")).upper().replace("-", ":")
+                if not bssid or bssid in live_by_bssid or bssid in hist_seen:
+                    continue
+                owner = (known.get(bssid) or {}).get("device_id")
+                hist_seen[bssid] = {
+                    "freq": int(b.get("freq") or 0),
+                    "width": int(b.get("width") or 20),
+                    "signal": float(b.get("signal") or -95),
+                    "owner": owner,
+                    "ssid": b.get("ssid"),
+                    "bssid": bssid,
+                    "weight": round(base_w * w_decay, 3),
+                }
+        neighbours.extend(hist_seen.values())
+
         out.append({
             "id": f"{dev['id']}#{band}", "device_id": dev["id"],
             "interface": iface_name, "band": band,
             "freq": freq, "width": _width_mhz({"channel-width": cur.get("width")}),
-            "neighbours": neighbours, "noise": noise,
+            "neighbours": neighbours, "noise": noise, "utilization": utilization,
+            "history_scans_blended": len(hist),
             "current_quality": scan.get("current_channel_quality"),
             "tx_power": None,
         })
     return out
 
 
-def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None) -> dict:
+def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None,
+                   scan_cache: dict | None = None,
+                   device_ids: list[str] | None = None) -> dict:
     cfg = load_rrm_cfg()
     if include_dfs is None:
         include_dfs = bool(cfg.get("include_dfs"))
     if duration is None:
         duration = int(cfg.get("scan_duration", 8))
     devs = load_devices()
+    target_set = set(device_ids) if device_ids else None
+    if target_set is not None:
+        devs = [d for d in devs if d["id"] in target_set]
     aps: list[dict] = []
     samples = 0
     unhealthy: list[dict] = []
@@ -5566,7 +5767,7 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
                 mon = _wl_monitor(mt.api, list(wl))
         except Exception:
             pass
-        got = _gather_ap(d, duration)
+        got = _gather_ap(d, duration, scan_cache=scan_cache)
         try:
             with get_device_lock(d["host"]), MT(d) as mt:
                 for w in wl.values():
@@ -5620,7 +5821,7 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
             n = 0
         return got, n
 
-    with ThreadPoolExecutor(max_workers=min(len(devs), 4) or 1) as ex:
+    with ThreadPoolExecutor(max_workers=min(len(devs), 12) or 1) as ex:
         for got, n in ex.map(gather, devs):
             aps.extend(got)
             samples += n
@@ -5653,35 +5854,54 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
     seen: dict[str, dict[str, list[float]]] = {}
     current: dict[str, dict] = {}
     roam_cutoff = time.time() - 3600
-    for d in devs:
+
+    # Satu query SQLite untuk seluruh fleet (bukan N query per AP di skala 100 AP)
+    for s in db_rf_samples(limit=100000):
+        if (s.get("ts") or 0) < roam_cutoff or s.get("rssi") is None or not s.get("mac"):
+            continue
+        dev_id = s.get("device_id")
+        if dev_id:
+            seen.setdefault(s["mac"], {}).setdefault(dev_id, []).append(float(s["rssi"]))
+
+    def _fetch_dev_clients(d):
         try:
             with get_device_lock(d["host"]), MT(d) as mt:
                 wl = mt.resource("/interface/wireless").get()
                 i2 = next((w["name"] for w in wl if _band_of(w) == "2g"), None)
                 i5 = next((w["name"] for w in wl if _band_of(w) == "5g"), None)
                 clients = mt.resource("/interface/wireless/registration-table").get()
+            return d, i2, i5, clients
         except Exception:
-            continue
-        c2 = [c for c in clients if c.get("interface") == i2]
-        rules = rrm.steering_rules(i2, i5, [{"mac": c.get("mac-address"),
-                                            "signal_strength": c.get("signal-strength")} for c in c2])
-        for r in rules:
-            r["device_id"] = d["id"]
-        steering.extend(rules)
-        for c in clients:
-            mac = c.get("mac-address")
-            if not mac:
+            return d, None, None, None
+
+    with ThreadPoolExecutor(max_workers=min(len(devs), 16) or 1) as ex:
+        for d, i2, i5, clients in ex.map(_fetch_dev_clients, devs):
+            if clients is None:
                 continue
-            iface = c.get("interface")
-            current[mac] = {"device": d["id"], "interface": iface,
-                            "band": "2g" if iface == i2 else ("5g" if iface == i5 else "?")}
-        for s in db_rf_samples(d["id"], limit=20000):
-            if (s.get("ts") or 0) < roam_cutoff or s.get("rssi") is None or not s.get("mac"):
-                continue
-            seen.setdefault(s["mac"], {}).setdefault(d["id"], []).append(float(s["rssi"]))
+            c2 = [c for c in clients if c.get("interface") == i2]
+            ap_2g = next((a for a in aps if a.get("device_id") == d["id"] and a.get("band") == "2g"), None)
+            dense_2g = rrm.is_dense_2g(ap_2g) if ap_2g else False
+            rules = rrm.steering_rules(i2, i5, [{"mac": c.get("mac-address"),
+                                                "signal_strength": c.get("signal-strength")} for c in c2],
+                                       dense_2g=dense_2g)
+            for r in rules:
+                r["device_id"] = d["id"]
+            steering.extend(rules)
+            for c in clients:
+                mac = c.get("mac-address")
+                if not mac:
+                    continue
+                iface = c.get("interface")
+                try:
+                    live_rssi = float(str(c.get("signal-strength", "")).split("@")[0])
+                except (TypeError, ValueError):
+                    live_rssi = None
+                current[mac] = {"device": d["id"], "interface": iface,
+                                "band": "2g" if iface == i2 else ("5g" if iface == i5 else "?"),
+                                "rssi": live_rssi}
 
     roam = rrm.plan_roam(seen, current,
-                         thr_dbm=float(cfg.get("roam_thr_dbm", -74.0)),
+                         thr_dbm=float(cfg.get("roam_thr_dbm", -75.0)),
                          alt_min_dbm=float(cfg.get("roam_alt_min_dbm", -67.0)),
                          margin_db=float(cfg.get("roam_margin_db", 7.0)))
 
@@ -5704,12 +5924,16 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
                 "interface": a.get("interface"),
                 "band": a.get("band"),
                 "freq": a.get("freq"),
+                "width": a.get("width"),
+                "dense_2g": rrm.is_dense_2g(a),
+                "dense_5g": rrm.is_dense_5g(a),
                 "tx_power": a.get("tx_power"),
                 "supported_freqs": sorted(int(f) for f in (sup.get(a.get("device_id") or "", {}).get(a.get("band") or "", set()))),
             }
             for a in aps
         ],
         "unhealthy": unhealthy,
+        "_aps": aps,
         "dca": dca,
         "tpc": tpc,
         "steering": steering,
@@ -5729,19 +5953,47 @@ def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None)
 def _extract_json_object(text: str) -> dict | None:
     if not text:
         return None
-    s = text.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    start = s.find("{")
-    end = s.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    # Buang blok <think>...</think> milik model reasoning agar kurung kurawal di dalamnya tidak merusak parser
+    s = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not s:
         return None
+    # 1. Coba blok ```json ... ``` jika ada
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+    for blk in reversed(fenced):
+        try:
+            obj = json.loads(blk)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    # 2. Coba parse langsung seluruh string
     try:
-        obj = json.loads(s[start:end + 1])
-        return obj if isinstance(obj, dict) else None
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
-        return None
+        pass
+    # 3. Scan semua objek JSON seimbang dengan raw_decode; prioritaskan yang berisi key RRM
+    dec = json.JSONDecoder()
+    candidates: list[dict] = []
+    pos = 0
+    while True:
+        idx = s.find("{", pos)
+        if idx == -1:
+            break
+        try:
+            obj, end = dec.raw_decode(s, idx)
+            if isinstance(obj, dict):
+                candidates.append(obj)
+                pos = end
+                continue
+        except Exception:
+            pass
+        pos = idx + 1
+    for obj in reversed(candidates):
+        if "channel_changes" in obj or "rationale" in obj or "txpower_changes" in obj:
+            return obj
+    return candidates[-1] if candidates else None
 
 
 def plan_rrm_via_omniroute(
@@ -5750,11 +6002,12 @@ def plan_rrm_via_omniroute(
     critical: list[dict],
     issues: list[dict],
     dev_filter: str | None = None,
+    model_override: str | None = None,
 ) -> tuple[dict, dict]:
     """Minta OmniRoute LLM menyusun rencana optimasi channel & TX power dari data scan real,
     lalu validasi ketat terhadap daftar frekuensi legal perangkat agar aman di-push ke MikroTik."""
     cfg = load_ai_config()
-    model_name = (cfg.get("model") or "auto/best-chat").strip()
+    model_name = ((model_override or "").strip() or (cfg.get("model") or "auto/best-chat").strip())
     base_url = cfg.get("base_url", "https://api.example.com/v1").rstrip("/")
     api_key = cfg.get("api_key") or DEFAULT_AI_CONFIG["api_key"]
     endpoint = f"{base_url}/chat/completions"
@@ -5765,6 +6018,42 @@ def plan_rrm_via_omniroute(
         radios = [r for r in radios if r.get("device_id") == dev_filter]
     radio_map = {(r.get("device_id"), r.get("interface")): r for r in radios}
 
+    aps_by_key = {
+        (a.get("device_id"), a.get("band")): a
+        for a in (base_plan.get("_aps") or [])
+        if not dev_filter or a.get("device_id") == dev_filter
+    }
+
+    def _per_channel_breakdown(dev_id: str | None, band: str | None) -> list[dict]:
+        ap = aps_by_key.get((dev_id, band))
+        if not ap:
+            return []
+        band_key = "2g" if str(band or "").startswith("2") else "5g"
+        cand_freqs = [int(f) for f in (allowed.get(band_key) or [])]
+        if not cand_freqs:
+            return []
+        width = float(ap.get("width") or 20)
+        nbs = ap.get("neighbours") or []
+        cur_f = int(ap.get("freq") or 0)
+        rows = []
+        for f in cand_freqs:
+            ov_sigs = [
+                float(n.get("signal", rrm.DEFAULT_NOISE_DBM))
+                for n in nbs
+                if rrm.overlap(f, width, int(n.get("freq") or 0), float(n.get("width") or 20)) > 0
+            ]
+            c_mw = rrm.channel_cost(f, width, nbs, rrm._noise_at(ap, f), rrm._util_at(ap, f))
+            rows.append({
+                "freq": f,
+                "is_current": f == cur_f,
+                "overlapping_neighbours": len(ov_sigs),
+                "strongest_dbm": round(max(ov_sigs), 1) if ov_sigs else None,
+                "usage_pct": round(rrm._util_at(ap, f), 1),
+                "noise_dbm": round(rrm._noise_at(ap, f), 1),
+                "cost_mw": float(f"{c_mw:.3g}"),
+            })
+        return rows
+
     scan_summary = [
         {
             "device": s.get("device"),
@@ -5772,23 +6061,38 @@ def plan_rrm_via_omniroute(
             "cur_ch": (s.get("current_channel") or {}).get("channel"),
             "cur_freq": (s.get("current_channel") or {}).get("freq"),
             "best_ch": s.get("best_channel"),
-            "neighbours": s.get("neighbours"),
+            "total_band_neighbours": s.get("neighbours"),
             "interference": s.get("interference_level"),
+            "per_channel": _per_channel_breakdown(s.get("device"), s.get("band")),
         }
         for s in (scans or [])
         if not s.get("error") and (not dev_filter or s.get("device") == dev_filter)
     ]
 
+    # Pada armada besar (~100 AP = 200 radio), prioritaskan maks 30 radio paling
+    # berinterferensi / yang diubah base_plan agar prompt LLM tidak meluap token.
+    base_ch_keys = {(c.get("device_id"), c.get("band")) for c in ((base_plan.get("dca") or {}).get("changes") or [])}
+    if len(scan_summary) > 30:
+        def _scan_priority(s):
+            cur_cost = next((c["cost_mw"] for c in (s.get("per_channel") or []) if c.get("is_current")), 0.0)
+            in_base = 1 if (s.get("device"), s.get("band")) in base_ch_keys else 0
+            return (-in_base, -cur_cost)
+        scan_summary = sorted(scan_summary, key=_scan_priority)[:30]
+        keep_devs = {s["device"] for s in scan_summary}
+        radios_for_prompt = [r for r in radios if r.get("device_id") in keep_devs][:30]
+    else:
+        radios_for_prompt = radios[:30]
+
     prompt_data = {
         "scope": dev_filter or "fleet",
         "allowed_freqs_mhz": allowed,
-        "radios": radios[:60],
-        "scans": scan_summary[:80],
+        "radios": radios_for_prompt,
+        "scans": scan_summary,
         "critical_aps": [
             {"device": c.get("device"), "clients": c.get("clients"), "cpu": c.get("cpu_load")}
             for c in (critical or [])
             if not c.get("error") and (not dev_filter or c.get("device") == dev_filter)
-        ][:60],
+        ][:30],
         "roaming_issues_count": len(issues or []),
     }
 
@@ -5799,9 +6103,9 @@ def plan_rrm_via_omniroute(
         "1. Balas HANYA dengan objek JSON valid tanpa teks lain.\n"
         "2. Setiap to_freq WAJIB ada di dalam supported_freqs milik radio tersebut (jika tidak kosong) "
         "DAN ada di allowed_freqs_mhz untuk band-nya (2g atau 5g). JANGAN pernah memilih frekuensi di luar supported_freqs AP.\n"
-        "3. Usulkan perubahan HANYA jika memang mengurangi interferensi / memperbaiki kanal; "
-        "jika AP sudah optimal, jangan masukkan ke channel_changes.\n"
-        "4. txpower_changes opsional (to_dbm antara 10 dan 22).\n"
+        "3. Perhatikan data scans[].per_channel: `cost_mw` makin kecil = makin bersih, `overlapping_neighbours` = jumlah tetangga di channel itu (bukan `total_band_neighbours`). "
+        "JANGAN pindah dari channel saat ini jika `cost_mw`-nya sudah paling rendah.\n"
+        "4. txpower_changes opsional (to_dbm antara 10 dan 22; untuk 2.4 GHz padat maks 17 dBm).\n"
         "Format JSON:\n"
         '{"rationale":"ringkasan singkat bahasa Indonesia","expected_gain_pct":15,'
         '"channel_changes":[{"device_id":"...","interface":"wlan1","band":"2g","to_freq":2437,"reason":"..."}],'
@@ -5815,7 +6119,8 @@ def plan_rrm_via_omniroute(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
         ],
-        "max_tokens": max(int(cfg.get("max_tokens", 750) or 750), 2200),
+        # 4096 memberi ruang cukup bagi model thinking/reasoning agar JSON tidak terpotong
+        "max_tokens": max(int(cfg.get("max_tokens", 750) or 750), 4096),
         "temperature": 0.2,
     }
 
@@ -5834,16 +6139,68 @@ def plan_rrm_via_omniroute(
             )
             with urllib.request.urlopen(req, timeout=60) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
-                content = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                msg_obj = (body.get("choices") or [{}])[0].get("message") or {}
+                content = msg_obj.get("content") or ""
                 parsed = _extract_json_object(content)
+                if parsed is None and msg_obj.get("reasoning_content"):
+                    parsed = _extract_json_object(msg_obj.get("reasoning_content") or "")
                 if parsed is not None:
                     break
+                preview = (content or "").replace("\n", " ")[:180]
+                print(f"[RRM-OmniRoute] attempt {attempt}/2 invalid JSON ({model_name}): {preview!r}")
                 last_err = "respons OmniRoute bukan JSON valid"
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             print(f"[RRM-OmniRoute] attempt {attempt}/2 failed ({model_name}): {e}")
 
+    base_dca = base_plan.get("dca") or {}
+    rrm_changes = [
+        c for c in (base_dca.get("changes") or [])
+        if not dev_filter or c.get("device_id") == dev_filter
+    ]
+    rrm_tpc = [
+        t for t in (base_plan.get("tpc") or [])
+        if not dev_filter or t.get("device_id") == dev_filter
+    ]
+    aps_graph = [
+        a for a in (base_plan.get("_aps") or [])
+        if not dev_filter or a.get("device_id") == dev_filter
+    ]
+    rrm_eval = rrm.evaluate_plan(aps_graph, rrm_changes) if aps_graph else {
+        "cost_before": float(base_dca.get("cost_before") or 0.0),
+        "cost_after": float(base_dca.get("cost_after") or 0.0),
+        "gain_pct": float(base_dca.get("gain_pct") or 0.0),
+        "per_change": {},
+    }
+    rrm_summary = {
+        "engine": "rrm_engine.py",
+        "cost_before_mw": rrm_eval["cost_before"],
+        "cost_after_mw": rrm_eval["cost_after"],
+        "gain_pct": rrm_eval["gain_pct"],
+        "channel_changes": rrm_changes,
+        "txpower_changes": rrm_tpc,
+    }
+
     if parsed is None:
+        compare = {
+            "rrm": rrm_summary,
+            "omniroute": {
+                "engine": f"OmniRoute ({model_name})",
+                "model": model_name,
+                "available": False,
+                "error": last_err,
+                "rationale": None,
+                "cost_before_mw": None,
+                "cost_after_mw": None,
+                "gain_pct": None,
+                "channel_changes": [],
+                "txpower_changes": [],
+                "rejected": [],
+            },
+            "winner": "rrm_engine",
+            "omniroute_rejected_by_math": False,
+            "verdict": f"OmniRoute ({model_name}) tidak dapat dihubungi ({last_err}) — fallback otomatis ke rrm_engine.py.",
+        }
         meta = {
             "engine": f"rrm_engine.py (fallback OmniRoute: {last_err})",
             "used_omniroute": False,
@@ -5851,6 +6208,7 @@ def plan_rrm_via_omniroute(
             "error": last_err,
             "rationale": None,
             "rejected": [],
+            "compare": compare,
         }
         return base_plan, meta
 
@@ -5883,7 +6241,7 @@ def plan_rrm_via_omniroute(
         if to_freq not in valid_pool:
             # Jika LLM mengirim nomor channel (mis. 6 atau 149), konversi ke MHz
             try:
-                conv = rrm.ch_to_freq(to_freq, band)
+                conv = ch_to_freq(band, to_freq)
                 if conv in valid_pool:
                     to_freq = conv
             except Exception:
@@ -5892,12 +6250,15 @@ def plan_rrm_via_omniroute(
             rejected.append(f"{did}/{iface}: freq {raw_freq} tidak didukung regulatory domain AP ini ({valid_pool[:6]})")
             continue
         from_freq = int(radio.get("freq") or 0)
-        if to_freq == from_freq and from_freq > 0:
+        wide_2g = str(band).startswith("2") and float(radio.get("width") or 20) > 20
+        wide_dense_5g = (not str(band).startswith("2")) and bool(radio.get("dense_5g")) and float(radio.get("width") or 20) >= 80
+        needs_narrow = wide_2g or wide_dense_5g
+        if to_freq == from_freq and from_freq > 0 and not needs_narrow:
             continue
         if (did, iface) in seen_ch:
             continue
         seen_ch.add((did, iface))
-        valid_ch.append({
+        ch_entry = {
             "device_id": did,
             "interface": iface,
             "band": band,
@@ -5905,13 +6266,16 @@ def plan_rrm_via_omniroute(
             "to_freq": to_freq,
             "reason": str(item.get("reason") or f"Rekomendasi OmniRoute ({model_name})"),
             "omniroute": True,
-            "repair": from_freq == 0,
+            "repair": from_freq == 0 or needs_narrow,
             "interference_before_mw": 0.0,
             "interference_after_mw": 0.0,
             "relief_pct": 0.0,
-        })
+        }
+        if needs_narrow:
+            ch_entry["fix_width"] = "20mhz"
+        valid_ch.append(ch_entry)
 
-    # Pertahankan perbaikan wajib untuk radio unhealthy yang tidak running
+    # Pertahankan perbaikan wajib untuk radio unhealthy / 2.4 GHz >20 MHz
     for c in (base_plan.get("dca") or {}).get("changes") or []:
         if c.get("repair") and (c.get("device_id"), c.get("interface")) not in seen_ch:
             if not dev_filter or c.get("device_id") == dev_filter:
@@ -5932,8 +6296,9 @@ def plan_rrm_via_omniroute(
             to_dbm = int(round(float(item.get("to_dbm"))))
         except (TypeError, ValueError):
             continue
-        if not (8 <= to_dbm <= 24):
-            rejected.append(f"{did}/{iface}: tx-power {to_dbm} dBm di luar batas aman 8..24")
+        max_dbm = int(rrm.TPC_2G_DENSE_MAX_DBM) if radio.get("dense_2g") else 23
+        if not (10 <= to_dbm <= max_dbm):
+            rejected.append(f"{did}/{iface}: tx-power {to_dbm} dBm di luar batas aman 10..{max_dbm}")
             continue
         from_dbm = radio.get("tx_power")
         if from_dbm is not None and int(round(float(from_dbm))) == to_dbm:
@@ -5951,20 +6316,104 @@ def plan_rrm_via_omniroute(
             "omniroute": True,
         })
 
-    try:
-        gain_pct = float(parsed.get("expected_gain_pct"))
-    except (TypeError, ValueError):
-        gain_pct = float((base_plan.get("dca") or {}).get("gain_pct") or 0.0)
-    if valid_ch and gain_pct <= 0:
-        gain_pct = max(float(load_rrm_cfg().get("min_gain_pct", 15)), 15.0)
+    # Jangan hapus TPC dari rrm_engine jika OmniRoute tidak mengusulkan txpower_changes
+    if not valid_tpc and base_plan.get("tpc"):
+        valid_tpc = [
+            t for t in base_plan.get("tpc") or []
+            if not dev_filter or t.get("device_id") == dev_filter
+        ]
+
+    # Evaluasi matematis rencana OmniRoute pada graf RF yang SAMA dengan rrm_engine.py
+    omni_eval = rrm.evaluate_plan(aps_graph, valid_ch) if aps_graph else {
+        "cost_before": rrm_summary["cost_before_mw"],
+        "cost_after": rrm_summary["cost_after_mw"],
+        "gain_pct": 0.0,
+        "per_change": {},
+    }
+    for ch in valid_ch:
+        stat = (omni_eval.get("per_change") or {}).get((ch["device_id"], ch["interface"]))
+        if stat:
+            ch["interference_before_mw"] = stat["interference_before_mw"]
+            ch["interference_after_mw"] = stat["interference_after_mw"]
+            ch["relief_pct"] = stat["relief_pct"]
+
+    rrm_cost_after = float(rrm_summary["cost_after_mw"] or 0.0)
+    omni_cost_after = float(omni_eval["cost_after"] or 0.0)
+    rrm_gain = float(rrm_summary["gain_pct"] or 0.0)
+    omni_gain = float(omni_eval["gain_pct"] or 0.0)
+    omni_rationale = str(parsed.get("rationale") or "").strip()
+
+    # Validasi matematis otomatis: tolak rencana OmniRoute jika interferensinya lebih buruk dari rrm_engine.py
+    worse_than_rrm = bool(aps_graph) and (omni_cost_after > rrm_cost_after * (1.0 + 1e-9))
+    better_than_rrm = bool(aps_graph) and (omni_cost_after < rrm_cost_after * (1.0 - 1e-9))
+
+    omni_summary = {
+        "engine": f"OmniRoute ({model_name})",
+        "model": model_name,
+        "available": True,
+        "error": None,
+        "rationale": omni_rationale,
+        "cost_before_mw": omni_eval["cost_before"],
+        "cost_after_mw": omni_eval["cost_after"],
+        "gain_pct": omni_gain,
+        "channel_changes": valid_ch,
+        "txpower_changes": valid_tpc,
+        "rejected": rejected,
+    }
+
+    if worse_than_rrm:
+        verdict = (
+            f"Rencana OmniRoute ({model_name}) ditolak otomatis: cost interferensi lebih buruk "
+            f"({omni_cost_after:.3g} mW, gain {omni_gain}%) dibanding rrm_engine.py "
+            f"({rrm_cost_after:.3g} mW, gain {rrm_gain}%). Memakai rencana rrm_engine.py."
+        )
+        compare = {
+            "rrm": rrm_summary,
+            "omniroute": omni_summary,
+            "winner": "rrm_engine",
+            "omniroute_rejected_by_math": True,
+            "verdict": verdict,
+        }
+        meta = {
+            "engine": f"rrm_engine.py (OmniRoute ditolak: interferensi lebih buruk)",
+            "used_omniroute": False,
+            "model": model_name,
+            "error": None,
+            "rationale": omni_rationale,
+            "rejected": rejected,
+            "compare": compare,
+        }
+        return base_plan, meta
+
+    if better_than_rrm:
+        verdict = (
+            f"OmniRoute ({model_name}) menang secara matematis: cost interferensi lebih rendah "
+            f"({omni_cost_after:.3g} mW, gain {omni_gain}%) dibanding rrm_engine.py "
+            f"({rrm_cost_after:.3g} mW, gain {rrm_gain}%)."
+        )
+    else:
+        verdict = (
+            f"Skor interferensi setara ({omni_cost_after:.3g} mW, gain {omni_gain}%). "
+            f"Rencana OmniRoute ({model_name}) lolos validasi matematis."
+        )
+
+    compare = {
+        "rrm": rrm_summary,
+        "omniroute": omni_summary,
+        "winner": "omniroute",
+        "omniroute_rejected_by_math": False,
+        "verdict": verdict,
+    }
 
     new_plan = dict(base_plan)
     new_plan["engine"] = f"OmniRoute ({model_name})"
-    new_plan["omniroute_rationale"] = str(parsed.get("rationale") or "").strip()
+    new_plan["omniroute_rationale"] = omni_rationale
     new_plan["dca"] = {
         **(base_plan.get("dca") or {}),
         "changes": valid_ch,
-        "gain_pct": round(gain_pct, 1),
+        "cost_before": omni_eval["cost_before"],
+        "cost_after": omni_eval["cost_after"],
+        "gain_pct": omni_gain,
         "engine": f"OmniRoute ({model_name})",
     }
     new_plan["tpc"] = valid_tpc
@@ -5973,7 +6422,7 @@ def plan_rrm_via_omniroute(
         "channel_changes": len(valid_ch),
         "repairs": len([c for c in valid_ch if c.get("repair")]),
         "txpower_changes": len(valid_tpc),
-        "expected_gain_pct": round(gain_pct, 1),
+        "expected_gain_pct": omni_gain,
         "actionable": bool(valid_ch or valid_tpc or base_plan.get("steering") or base_plan.get("roam")),
     }
     meta = {
@@ -5981,8 +6430,9 @@ def plan_rrm_via_omniroute(
         "used_omniroute": True,
         "model": model_name,
         "error": None,
-        "rationale": new_plan["omniroute_rationale"],
+        "rationale": omni_rationale,
         "rejected": rejected,
+        "compare": compare,
     }
     return new_plan, meta
 
@@ -6156,7 +6606,20 @@ def _apply_steering_rules(rules: list[dict]) -> list[dict]:
                     acl.add(interface=r["interface"], signal_range=r["signal_range"],
                             authentication="no", forwarding="no", comment=r["comment"])
                 created = acl.get(comment=r["comment"])
-                done.append({**r, "applied": True, "acl_ids": [x["id"] for x in created]})
+                kicked = []
+                weak_macs = {m.upper() for m in (r.get("affected_macs") or []) if m}
+                if weak_macs:
+                    reg = mt.resource("/interface/wireless/registration-table")
+                    for entry in reg.get():
+                        mac = str(entry.get("mac-address") or "").upper()
+                        if mac in weak_macs and entry.get("interface") == r["interface"]:
+                            try:
+                                reg.remove(id=entry["id"])
+                                kicked.append(mac)
+                            except Exception:
+                                pass
+                done.append({**r, "applied": True, "acl_ids": [x["id"] for x in created],
+                             "kicked": kicked})
         except Exception as e:
             done.append({**r, "applied": False, "error": f"{type(e).__name__}: {e}"})
     return done
@@ -6166,9 +6629,9 @@ ROAM_PREFIX = "RRM-roam-"
 
 
 def _apply_roam_rules(rules: list[dict], expire_min: int = 10) -> list[dict]:
-    """Blokir MAC di AP yang salah, hanya selama sinyalnya lemah (mac-address + signal-range).
+    """Blokir & kick MAC di AP yang lemah (<= -75 dBm) agar langsung pindah ke AP terdekat.
 
-    Entry dicabut otomatis oleh `_roam_expire()` setelah `expire_min` menit, dan klien
+    Entry ACL dicabut otomatis oleh `_roam_expire()` setelah `expire_min` menit, dan klien
     otomatis boleh asosiasi lagi begitu sinyalnya di AP itu kembali di atas ambang.
     """
     done = []
@@ -6179,8 +6642,6 @@ def _apply_roam_rules(rules: list[dict], expire_min: int = 10) -> list[dict]:
         try:
             with get_device_lock(dev["host"]), MT(dev) as mt:
                 acl = mt.resource("/interface/wireless/access-list")
-                # Idempoten: entry lama untuk MAC yang sama dicabut dulu, kalau tidak
-                # tiap run menumpuk ACL ganda dengan expiry berbeda.
                 for old in acl.get():
                     if str(old.get("comment") or "").startswith(ROAM_PREFIX) and \
                             str(old.get("comment") or "").endswith(f"-{r['mac']}"):
@@ -6192,7 +6653,18 @@ def _apply_roam_rules(rules: list[dict], expire_min: int = 10) -> list[dict]:
                            "authentication": "no", "forwarding": "no",
                            "interface": r.get("interface") or "", "comment": comment})
                 created = acl.get(comment=comment)
-                done.append({**r, "applied": True, "comment": comment, "expires_ts": exp,
+                kicked = False
+                reg = mt.resource("/interface/wireless/registration-table")
+                target_mac = str(r["mac"]).upper()
+                for entry in reg.get():
+                    if str(entry.get("mac-address") or "").upper() == target_mac:
+                        try:
+                            reg.remove(id=entry["id"])
+                            kicked = True
+                        except Exception:
+                            pass
+                done.append({**r, "applied": True, "kicked": kicked,
+                             "comment": comment, "expires_ts": exp,
                              "acl_ids": [x["id"] for x in created]})
         except Exception as e:
             done.append({**r, "applied": False, "error": f"{type(e).__name__}: {e}"})
@@ -6229,7 +6701,8 @@ class RrmApplyReq(BaseModel):
     apply_roam: bool | None = None
     include_dfs: bool | None = None
     min_gain_pct: float | None = None
-    device: str | None = None   # batasi push ke satu AP (channel dikunci: milik plan fleet)
+    device: str | None = None           # batasi push ke satu AP (channel dikunci: milik plan fleet)
+    device_ids: list[str] | None = None  # batasi push ke daftar AP terpilih (AP lain dikunci & tidak disentuh)
     plan: dict | None = None
 
 
@@ -6254,8 +6727,16 @@ def api_rrm_apply(req: RrmApplyReq):
 
     dca = plan.get("dca") or {}
     only = req.device
+    target_set = set(req.device_ids) if req.device_ids else None
+    def _allowed_dev(did: str | None) -> bool:
+        if only and did != only:
+            return False
+        if target_set is not None and did not in target_set:
+            return False
+        return True
+
     ch_skip = None
-    changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
+    changes = [c for c in (dca.get("changes") or []) if _allowed_dev(c.get("device_id"))]
     if only:
         # Optimasi channel default-nya fleet-only, kecuali perbaikan atau
         # rekomendasi eksplisit dari OmniRoute untuk AP ini.
@@ -6274,18 +6755,16 @@ def api_rrm_apply(req: RrmApplyReq):
         do_ch = False
     elif do_ch and repairs:
         ch_skip = f"{len(repairs)} radio tanpa channel eksplisit — dipulihkan tanpa gate gain"
-    tpc = [t for t in (plan.get("tpc") or []) if not only or t.get("device_id") == only]
-    steer = [s for s in (plan.get("steering") or []) if not only or s.get("device_id") == only]
-    roam = [r for r in (plan.get("roam") or []) if not only or r.get("device_id") == only]
+    tpc = [t for t in (plan.get("tpc") or []) if _allowed_dev(t.get("device_id"))]
+    steer = [s for s in (plan.get("steering") or []) if _allowed_dev(s.get("device_id"))]
+    roam = [r for r in (plan.get("roam") or []) if _allowed_dev(r.get("device_id"))]
     if not (do_ch and changes) and not (do_tpc and tpc) and not (do_steer and steer) \
             and not (do_roam and roam):
         return {"ok": False, "skipped": True,
                 "reason": ch_skip or "tidak ada aksi yang lolos guard — jaringan tidak disentuh",
                 "channel_skipped": ch_skip}
 
-    devs = {d["id"]: d for d in load_devices()}
-    if only:
-        devs = {k: v for k, v in devs.items() if k == only}
+    devs = {d["id"]: d for d in load_devices() if _allowed_dev(d["id"])}
     max_drop = int(cfg.get("max_client_drop") or 0)
     roam_expire = int(cfg.get("roam_expire_min") or 10)
     clients_before: dict = {}
@@ -6298,58 +6777,88 @@ def api_rrm_apply(req: RrmApplyReq):
             return len(mt.resource("/interface/wireless/registration-table").get())
 
 
-    # push sekuensial per AP — satu-satunya blast radius; abort kalau klien hilang melebihi batas
-    for did, dev in devs.items():
+    # Push paralel terkendali (maks 6 AP serentak di fleet besar) agar 60-100 AP
+    # selesai dalam ~1-2 menit, bukan 60 menit. Tetap hentikan fleet jika >= 3 AP blackout.
+    skipped_unreachable: list[dict] = []
+    rolled_back_aps: list[dict] = []
+    is_multi_ap = len(devs) > 1
+    apply_lock = threading.Lock()
+    abort_flag = threading.Event()
+
+    def _apply_one_ap(item):
+        nonlocal aborted
+        did, dev = item
+        if abort_flag.is_set():
+            return
         slice_ch = [c for c in changes if c.get("device_id") == did]
         slice_tp = [t for t in tpc if t.get("device_id") == did]
         slice_st = [s for s in steer if s.get("device_id") == did]
         slice_rm = [r for r in roam if r.get("device_id") == did]
         if not ((do_ch and slice_ch) or (do_tpc and slice_tp) or (do_steer and slice_st)
                 or (do_roam and slice_rm)):
-            continue
+            return
         try:
             with get_device_lock(dev["host"]), MT(dev) as mt:
-                snapshot.extend(_snapshot_wireless(dev, mt))
+                ap_snap = _snapshot_wireless(dev, mt)
             before = _clients(dev)
         except Exception as e:
-            aborted = {"device": did, "reason": f"tidak bisa dihubungi: {type(e).__name__}: {e}"}
-            break
-        clients_before[did] = before
+            with apply_lock:
+                skipped_unreachable.append({"device": did, "reason": f"tidak bisa dihubungi: {type(e).__name__}: {e}"})
+            return
+        with apply_lock:
+            snapshot.extend(ap_snap)
+            clients_before[did] = before
         applied_now = 0
+        roam_kicked = 0
+        ch_got = tp_got = st_got = rm_got = []
         if do_ch and slice_ch:
-            got = _apply_channel_changes(slice_ch)
-            result["channel"] += got
-            applied_now += sum(1 for x in got if x.get("applied"))
+            ch_got = _apply_channel_changes(slice_ch)
+            applied_now += sum(1 for x in ch_got if x.get("applied"))
         if do_tpc and slice_tp:
-            got = _apply_tpc_changes(slice_tp)
-            result["txpower"] += got
-            applied_now += sum(1 for x in got if x.get("applied"))
+            tp_got = _apply_tpc_changes(slice_tp)
+            applied_now += sum(1 for x in tp_got if x.get("applied"))
         if do_steer and slice_st:
-            got = _apply_steering_rules(slice_st)
-            result["steering"] += got
-            applied_now += sum(1 for x in got if x.get("applied"))
+            st_got = _apply_steering_rules(slice_st)
+            applied_now += sum(1 for x in st_got if x.get("applied"))
         if do_roam and slice_rm:
-            got = _apply_roam_rules(slice_rm, roam_expire)
-            result["roam"] += got
-            applied_now += sum(1 for x in got if x.get("applied"))
+            rm_got = _apply_roam_rules(slice_rm, roam_expire)
+            applied_now += sum(1 for x in rm_got if x.get("applied"))
+            roam_kicked += sum(1 for x in rm_got if x.get("kicked"))
+        with apply_lock:
+            result["channel"] += ch_got
+            result["txpower"] += tp_got
+            result["steering"] += st_got
+            result["roam"] += rm_got
         if not applied_now:
-            continue
-        after = _settle_clients(before, lambda: _clients(dev), max_drop)
-        if before - after > max_drop:
-            aborted = {"device": did, "clients_before": before, "clients_after": after,
-                       "reason": f"klien turun {before - after} > batas {max_drop} — push dihentikan"}
-            # rollback AP ini saja dari snapshot
-            for entry in [e for e in snapshot if e.get("device_id") == did]:
+            return
+        effective_before = max(0, before - roam_kicked)
+        if effective_before == 0:
+            after = 0
+        elif is_multi_ap:
+            # Di fleet multi-AP, begitu >=1 klien konek kembali radio sudah terbukti sehat (2-4s)
+            after = _settle_clients(effective_before, lambda: _clients(dev), max_drop,
+                                    timeout=18.0, step=2.0, min_ok=1)
+        else:
+            after = _settle_clients(effective_before, lambda: _clients(dev), max_drop,
+                                    timeout=30.0, step=2.0)
+        failed_drop = (
+            (effective_before >= 3 and after == 0)
+            if is_multi_ap
+            else (effective_before - after > max_drop)
+        )
+        if failed_drop:
+            rb_info = {"device": did, "clients_before": before, "roam_kicked": roam_kicked,
+                       "clients_after": after,
+                       "reason": (f"radio blackout (0/{effective_before} klien kembali setelah 18s) — AP dikembalikan"
+                                  if is_multi_ap else
+                                  f"klien turun {effective_before - after} > batas {max_drop} — AP dikembalikan")}
+            for entry in ap_snap:
                 try:
                     with get_device_lock(dev["host"]), MT(dev) as mt:
                         wl = mt.resource("/interface/wireless")
                         cur = wl.get(name=entry["interface"])
                         if not cur:
                             continue
-                        # urutan penting: channel-width dulu, baru frequency
-                        # (set frequency ke kanal yang tak mendukung width lama
-                        #  ditolak 'bad band or frequency'), tx-power butuh mode
-                        # all-rates-fixed lebih dulu. Tiap langkah diverifikasi.
                         if entry.get("channel_width") and \
                                 str(cur[0].get("channel-width") or "") != str(entry["channel_width"]):
                             wl.set(id=cur[0]["id"], channel_width=entry["channel_width"])
@@ -6363,7 +6872,7 @@ def api_rrm_apply(req: RrmApplyReq):
                         now = (wl.get(name=entry["interface"]) or [{}])[0]
                         if entry.get("frequency") and \
                                 str(now.get("frequency") or "") != str(entry["frequency"]):
-                            aborted.setdefault("rollback_errors", []).append(
+                            rb_info.setdefault("rollback_errors", []).append(
                                 f"{did}/{entry['interface']}: frequency tetap {now.get('frequency')}")
                         acl = mt.resource("/interface/wireless/access-list")
                         for r in acl.get():
@@ -6371,10 +6880,18 @@ def api_rrm_apply(req: RrmApplyReq):
                                     str(r.get("comment") or "").startswith(ROAM_PREFIX):
                                 acl.remove(id=r["id"])
                 except Exception as e:
-                    aborted.setdefault("rollback_errors", []).append(
+                    rb_info.setdefault("rollback_errors", []).append(
                         f"{did}/{entry.get('interface')}: {type(e).__name__}: {e}")
                     continue
-            break
+            with apply_lock:
+                rolled_back_aps.append(rb_info)
+                if (not is_multi_ap) or len(rolled_back_aps) >= 3:
+                    aborted = rb_info
+                    abort_flag.set()
+
+    workers = min(len(devs), 6) if is_multi_ap else 1
+    with ThreadPoolExecutor(max_workers=workers or 1) as ex:
+        list(ex.map(_apply_one_ap, list(devs.items())))
 
     run = {
         "id": f"rrm_{secrets.token_hex(4)}", "ts": time.time(), "mode": "manual",
@@ -6386,7 +6903,9 @@ def api_rrm_apply(req: RrmApplyReq):
     applied = sum(1 for k in result for x in result[k] if x.get("applied"))
     return {"ok": True, "run_id": run["id"], "applied_actions": applied,
             "gain_pct": run["gain_pct"], "result": result, "channel_skipped": ch_skip,
-            "aborted": aborted, "clients_before": clients_before,
+            "aborted": aborted, "rolled_back_aps": rolled_back_aps,
+            "skipped_unreachable": skipped_unreachable,
+            "clients_before": clients_before,
             "rollback_hint": f"POST /api/rrm/rollback {{'run_id': '{run['id']}'}}"}
 
 
@@ -6665,10 +7184,13 @@ def _mean(vals):
     return round(sum(vals) / len(vals), 1) if vals else None
 
 
-def _settle_clients(before, sample, max_drop, timeout=45.0, step=3.0):
+def _settle_clients(before, sample, max_drop, timeout=45.0, step=3.0, min_ok=None):
     """Tunggu klien re-associate (radio restart 10-30 s), kembalikan hitungan
     terakhir. Berhenti cepat begitu pulih; timeout -> nilai terakhir (drop nyata
     tetap terdeteksi). Semua sample gagal -> before (tak ada bukti drop)."""
+    if before <= 0:
+        return 0
+    target = (before - max_drop) if min_ok is None else min_ok
     last = None
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -6677,7 +7199,7 @@ def _settle_clients(before, sample, max_drop, timeout=45.0, step=3.0):
             last = sample()
         except Exception:
             continue
-        if last >= before - max_drop:
+        if last >= target:
             return last
     return before if last is None else last
 
@@ -7089,17 +7611,28 @@ def _opt_worker(job_id: str, opts: dict):
     if not job:
         return
     dev_filter = opts.get("device")
+    target_ids: list[str] | None = opts.get("device_ids") or None
+    target_set = set(target_ids) if target_ids else None
     history_min = int(opts.get("history_window_min") or 1440)
     scan_s = int(opts.get("scan_duration") or 8)
     dry_run = bool(opts.get("dry_run"))
     try:
-        # --- 1. identify critical APs ---
+        # --- 1. identify critical APs (paralel untuk skala ~100 AP) ---
         _opt_set_stage(job, 0, "running")
-        devs = load_devices()
+        all_devs = load_devices()
+        total_fleet_devices = len(all_devs)
+        devs = all_devs
         if dev_filter:
             devs = [d for d in devs if d["id"] == dev_filter]
-        critical = []
-        for d in devs:
+        elif target_set is not None:
+            devs = [d for d in devs if d["id"] in target_set]
+        if not devs:
+            raise RuntimeError("Tidak ada AP target yang cocok untuk dioptimalkan.")
+        job["details"]["target_devices"] = [d["id"] for d in devs]
+        job["details"]["total_fleet_devices"] = total_fleet_devices
+        job["details"]["locked_devices_count"] = max(0, total_fleet_devices - len(devs))
+
+        def _probe_crit(d):
             entry = {"device": d["id"], "name": d.get("name")}
             try:
                 with get_device_lock(d["host"]), MT(d) as mt:
@@ -7110,7 +7643,10 @@ def _opt_worker(job_id: str, opts: dict):
             except Exception as e:
                 entry.update({"clients": None, "cpu_load": None, "critical": False,
                               "error": f"{type(e).__name__}: {e}"})
-            critical.append(entry)
+            return entry
+
+        with ThreadPoolExecutor(max_workers=min(len(devs), 16) or 1) as ex:
+            critical = list(ex.map(_probe_crit, devs))
         job["details"]["critical_aps"] = critical
         # Semua AP tidak terjangkau = tidak ada yang bisa dioptimasi. Tanpa ini job
         # selesai "done" padahal nol data terkumpul (false success di UI).
@@ -7125,6 +7661,8 @@ def _opt_worker(job_id: str, opts: dict):
         rows = db_rf_samples(limit=60000)
         if dev_filter:
             rows = [r for r in rows if r.get("device_id") == dev_filter]
+        elif target_set is not None:
+            rows = [r for r in rows if r.get("device_id") in target_set]
         window = [r for r in rows if (r.get("ts") or 0) >= cutoff]
         issues = _opt_roaming_issues(window)
         _ts = [float(r.get("ts") or 0) for r in window if r.get("ts")]
@@ -7137,15 +7675,22 @@ def _opt_worker(job_id: str, opts: dict):
         }
         _opt_set_stage(job, 1, "done")
 
-        # --- 3. scan the WLAN environment ---
+        # --- 3. scan the WLAN environment (paralel untuk skala ~100 AP) ---
         _opt_set_stage(job, 2, "running")
+        cfg = load_rrm_cfg()
+        quiet_now = _in_quiet_window(cfg)
+        busy_thr = int(cfg.get("scan_busy_clients") or 5)
+        clients_by_dev = {e["device"]: (e.get("clients") or 0) for e in critical}
         scans = []
-        for d in devs:
+        scan_cache: dict[tuple[str, str], dict] = {}
+        scan_lock = threading.Lock()
+
+        def _scan_one_dev(d):
+            dev_scans = []
             bands = set()
             try:
                 with get_device_lock(d["host"]), MT(d) as mt:
                     for w in mt.resource("/interface/wireless").get():
-                        # frequency bisa 'auto' -> int() meledak dan tahap Scan mati.
                         try:
                             f = int(float(str(w.get("frequency") or 0)))
                         except (TypeError, ValueError):
@@ -7157,31 +7702,42 @@ def _opt_worker(job_id: str, opts: dict):
                         elif str(w.get("band") or "").startswith("5ghz"):
                             bands.add("5g")
             except Exception as e:
-                scans.append({"device": d["id"], "error": f"{type(e).__name__}: {e}"})
-                continue
+                return [{"device": d["id"], "error": f"{type(e).__name__}: {e}"}]
+            use_non_disruptive = (not quiet_now) and (clients_by_dev.get(d["id"], 0) >= busy_thr)
             for band in sorted(bands):
                 try:
-                    sc = api_rf_scan(device=d["id"], band=band, duration=scan_s)
+                    sc = api_rf_scan(device=d["id"], band=band, duration=scan_s,
+                                     non_disruptive=use_non_disruptive)
+                    with scan_lock:
+                        scan_cache[(d["id"], band)] = sc
                     chans = sc.get("channels") or []
-                    best = chans[0] if chans else {}
+                    best_list = sc.get("best_channels") or chans
+                    best = best_list[0] if best_list else {}
                     known = sc.get("bss_list") or []
                     noisy = [c for c in chans
-                             if float(c.get("utilization_pct") or 0) >= 50
+                             if float(c.get("usage_pct") or c.get("utilization_pct") or 0) >= 50
                              and not any(b.get("channel") in (c.get("channel"), c.get("frequency"))
                                          for b in known)]
-                    scans.append({
+                    dev_scans.append({
                         "device": d["id"], "band": band,
                         "scanned_at": sc.get("scanned_at") or time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "scan_mode": sc.get("scan_mode"),
+                        "non_disruptive": bool(use_non_disruptive),
                         "current_channel": sc.get("current_channel"),
                         "best_channel": best.get("channel"),
-                        "best_score": best.get("score"),
+                        "best_score": best.get("score") or best.get("quality"),
                         "neighbours": len(known),
                         "external_interference": noisy[:6],
                         "interference_level": ("high" if noisy else "low"),
                     })
                 except Exception as e:
-                    scans.append({"device": d["id"], "band": band,
-                                  "error": f"{type(e).__name__}: {e}"})
+                    dev_scans.append({"device": d["id"], "band": band,
+                                      "error": f"{type(e).__name__}: {e}"})
+            return dev_scans
+
+        with ThreadPoolExecutor(max_workers=min(len(devs), 12) or 1) as ex:
+            for dev_scans in ex.map(_scan_one_dev, devs):
+                scans.extend(dev_scans)
         job["details"]["scan"] = {"bands": scans,
                                   "neighbour_links": sum(s.get("neighbours") or 0 for s in scans),
                                   "external_interference_hits": sum(
@@ -7190,15 +7746,27 @@ def _opt_worker(job_id: str, opts: dict):
 
         # --- 4. compute optimal configuration ---
         _opt_set_stage(job, 3, "running")
-        cfg = load_rrm_cfg()
-        base_plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"), duration=scan_s)
+        base_plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"), duration=scan_s,
+                                   scan_cache=scan_cache, device_ids=target_ids)
         use_omniroute = opts.get("use_omniroute", True)
         if use_omniroute:
             plan, omni_meta = plan_rrm_via_omniroute(
-                base_plan, scans, critical, issues, dev_filter=dev_filter
+                base_plan, scans, critical, issues, dev_filter=dev_filter,
+                model_override=opts.get("omniroute_model"),
             )
+            # Double-lock guard: pastikan OmniRoute tidak pernah menyentuh AP di luar target_set
+            if target_set is not None:
+                if isinstance(plan.get("dca"), dict):
+                    plan["dca"]["changes"] = [
+                        c for c in (plan["dca"].get("changes") or [])
+                        if c.get("device_id") in target_set
+                    ]
+                plan["tpc"] = [t for t in (plan.get("tpc") or []) if t.get("device_id") in target_set]
+                plan["steering"] = [s for s in (plan.get("steering") or []) if s.get("device_id") in target_set]
+                plan["roam"] = [r for r in (plan.get("roam") or []) if r.get("device_id") in target_set]
         else:
             plan = base_plan
+            base_dca = base_plan.get("dca") or {}
             omni_meta = {
                 "engine": "rrm_engine.py",
                 "used_omniroute": False,
@@ -7206,7 +7774,35 @@ def _opt_worker(job_id: str, opts: dict):
                 "error": None,
                 "rationale": None,
                 "rejected": [],
+                "compare": {
+                    "rrm": {
+                        "engine": "rrm_engine.py",
+                        "cost_before_mw": float(base_dca.get("cost_before") or 0.0),
+                        "cost_after_mw": float(base_dca.get("cost_after") or 0.0),
+                        "gain_pct": float(base_dca.get("gain_pct") or 0.0),
+                        "channel_changes": base_dca.get("changes") or [],
+                        "txpower_changes": base_plan.get("tpc") or [],
+                    },
+                    "omniroute": {
+                        "engine": "OmniRoute AI",
+                        "model": None,
+                        "available": False,
+                        "error": "Dinonaktifkan oleh pengguna",
+                        "rationale": None,
+                        "cost_before_mw": None,
+                        "cost_after_mw": None,
+                        "gain_pct": None,
+                        "channel_changes": [],
+                        "txpower_changes": [],
+                        "rejected": [],
+                    },
+                    "winner": "rrm_engine",
+                    "omniroute_rejected_by_math": False,
+                    "verdict": "OmniRoute AI tidak diaktifkan — menggunakan perhitungan deterministik rrm_engine.py.",
+                },
             }
+        # Buang graf mentah _aps sebelum disimpan ke SQLite agar JSON ringkas
+        plan = {k: v for k, v in plan.items() if k != "_aps"}
         rssi_all = [r["rssi"] for r in window if r.get("rssi") is not None]
         weak_rssi = sorted(v for v in rssi_all if v < -70)
         sensitivity = -72.0
@@ -7220,6 +7816,7 @@ def _opt_worker(job_id: str, opts: dict):
             "omniroute_rationale": omni_meta.get("rationale"),
             "omniroute_error": omni_meta.get("error"),
             "omniroute_rejected": omni_meta.get("rejected") or [],
+            "compare": omni_meta.get("compare"),
             "channel": {"changes": plan.get("dca", {}).get("changes", []),
                         "gain_pct": plan.get("dca", {}).get("gain_pct"),
                         "iterations": plan.get("dca", {}).get("iterations")},
@@ -7244,9 +7841,9 @@ def _opt_worker(job_id: str, opts: dict):
                               apply_txpower=cfg.get("apply_txpower"),
                               apply_steering=cfg.get("apply_steering"),
                               min_gain_pct=cfg.get("min_gain_pct"),
-                              device=dev_filter, plan=plan)
+                              device=dev_filter, device_ids=target_ids, plan=plan)
             res = api_rrm_apply(req)
-            if opts.get("ai_auto_push", True):
+            if opts.get("ai_auto_push", False):
                 targets = [dev_filter] if dev_filter else [d["id"] for d in devs]
                 ai_runs = []
                 for t in targets:
@@ -7315,20 +7912,36 @@ def _opt_worker(job_id: str, opts: dict):
 
 class OptStartReq(BaseModel):
     device: str | None = None
-    fleet: bool = False        # true = optimalkan semua AP sekaligus (channel joint)
+    fleet: bool = False                  # true = optimalkan armada (semua AP atau subset device_ids)
+    device_ids: list[str] | None = None  # opsional: daftar AP terpilih agar AP lain dikunci & tidak tertimpa
     history_window_min: int | None = None
     scan_duration: int | None = None
     dry_run: bool = False
-    ai_auto_push: bool = True
+    ai_auto_push: bool = False
     use_omniroute: bool = True
+    omniroute_model: str | None = None   # opsional: pilih model spesifik dari daftar /api/ai/models OmniRoute
 
 
 @app.post("/api/optimize/start")
 def api_optimize_start(req: OptStartReq):
+    target_ids: list[str] | None = None
     if req.fleet:
         dev = {"id": "fleet"}
         dev_filter = None
         lock_key = "fleet"
+        if req.device_ids is not None:
+            valid_ids = {d["id"] for d in load_devices()}
+            cleaned = []
+            seen_ids = set()
+            for x in req.device_ids:
+                if x in valid_ids and x not in seen_ids:
+                    seen_ids.add(x)
+                    cleaned.append(x)
+            if not cleaned:
+                return {"ok": False, "message": "Pilih minimal 1 AP yang valid untuk dioptimalkan."}
+            # Jika semua AP dipilih, perlakukan sebagai full fleet (None); selain itu kunci AP lain
+            if len(cleaned) < len(valid_ids):
+                target_ids = cleaned
     else:
         dev = get_device(req.device)
         dev_filter = dev["id"]
@@ -7346,7 +7959,8 @@ def api_optimize_start(req: OptStartReq):
             "stage": "identify", "stage_index": 0,
             "stages": _opt_stages(int(req.history_window_min or 1440),
                                   int(req.scan_duration or cfg.get("scan_duration", 8))),
-            "details": {}, "started": time.time(), "updated": time.time(), "run_id": None,
+            "details": {"target_devices": target_ids} if target_ids else {},
+            "started": time.time(), "updated": time.time(), "run_id": None,
         }
         OPT_JOBS[job["id"]] = job
         for old_id, old in list(OPT_JOBS.items()):
@@ -7356,13 +7970,20 @@ def api_optimize_start(req: OptStartReq):
     threading.Thread(target=_opt_worker, daemon=True,
                      args=(job["id"], {"device": dev_filter,
                                        "fleet": bool(req.fleet),
+                                       "device_ids": target_ids,
                                        "history_window_min": req.history_window_min,
                                        "scan_duration": req.scan_duration,
                                        "dry_run": req.dry_run,
                                        "ai_auto_push": req.ai_auto_push,
-                                       "use_omniroute": bool(req.use_omniroute)})).start()
+                                       "use_omniroute": bool(req.use_omniroute),
+                                       "omniroute_model": (req.omniroute_model or "").strip() or None})).start()
+    scope_note = (
+        f"({len(target_ids)} AP terpilih; AP lain dikunci & tidak diubah)"
+        if target_ids else "(seluruh armada)"
+    )
     return {"ok": True, "job_id": job["id"], "status": "running",
-            "message": "Optimasi berjalan di background — aman keluar dari halaman ini"}
+            "target_devices": target_ids,
+            "message": f"Optimasi berjalan di background {scope_note} — aman keluar dari halaman ini"}
 
 
 _LIVE_CH_CACHE: dict[str, tuple[float, dict]] = {}
@@ -7785,6 +8406,332 @@ def api_fleet_wifi_sync(req: FleetWifiSyncReq):
             "skipped": skip_cnt,
             "failed": err_cnt,
         },
+        "results": results,
+    }
+
+
+# ==============================================================================
+# FLEET RF NEIGHBOR & DISTANCE ESTIMATION (LOG-DISTANCE PATH LOSS)
+# ==============================================================================
+_RF_ENV_PROFILES = {
+    "corridor": {"label": "Koridor Terbuka", "n": 2.4},
+    "hospital": {"label": "Gedung RS Bertembok", "n": 3.0},
+    "heavy_wall": {"label": "Tembok Beton / Sekat Tebal", "n": 3.5},
+}
+
+
+def _rf_estimate_distance_m(rssi_dbm: float, freq_mhz: int, env: str = "hospital") -> float:
+    """Estimasi jarak indoor antar-AP (meter) dengan model Log-Distance Path Loss."""
+    import math
+    prof = _RF_ENV_PROFILES.get(env) or _RF_ENV_PROFILES["hospital"]
+    n = float(prof["n"])
+    f = float(freq_mhz or 2437)
+    # Effective EIRP rata-rata MikroTik cAP ac indoor (TX + antenna gain)
+    tx_eirp = 18.0 if f < 3000 else 22.0
+    # Free-space path loss pada jarak referensi d0 = 1 meter
+    fspl_1m = 20.0 * math.log10(max(f, 2400.0)) - 27.55
+    exp_val = (tx_eirp - float(rssi_dbm) - fspl_1m) / (10.0 * n)
+    dist = 10.0 ** exp_val
+    return round(max(0.5, min(120.0, dist)), 1)
+
+
+def _freq_to_ch_label(freq: int | None) -> str:
+    if not freq:
+        return "-"
+    f = int(freq)
+    if 2412 <= f <= 2484:
+        ch = 14 if f == 2484 else round((f - 2407) / 5)
+        return f"Ch {ch} ({f})"
+    if 5000 <= f <= 5900:
+        return f"Ch {(f - 5000) // 5} ({f})"
+    return f"{f} MHz"
+
+
+class FleetRfDistanceScanReq(BaseModel):
+    device_ids: list[str] = Field(default_factory=list)
+    band: str = "all"     # "all" | "2g" | "5g"
+    duration: int = Field(5, ge=4, le=12)
+
+
+@app.get("/api/fleet/rf-distances")
+def api_fleet_rf_distances(
+    band: str = Query("all"),
+    env: str = Query("hospital"),
+    window_h: int = Query(168, ge=1, le=720),
+    device: str | None = Query(None),
+):
+    """Hitung estimasi jarak RF antar-AP armada dari riwayat scan RF SQLite + pemetaan BSSID armada."""
+    env_key = env if env in _RF_ENV_PROFILES else "hospital"
+    band_filter = band if band in ("all", "2g", "5g") else "all"
+    devs = load_devices()
+    dev_by_id = {d["id"]: d for d in devs}
+    known_bssids = get_fleet_known_bssids()
+    cutoff = time.time() - window_h * 3600
+
+    # Ambil scan terbaru per (device_id, band) dari rf_scan_history
+    latest_scans: dict[tuple[str, str], dict] = {}
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT ts, device_id, band, channels_json, bss_json FROM rf_scan_history "
+                "WHERE ts >= ? ORDER BY ts DESC",
+                (cutoff,),
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                did = r["device_id"]
+                b = r["band"]
+                if did not in dev_by_id:
+                    continue
+                if band_filter != "all" and b != band_filter:
+                    continue
+                key = (did, b)
+                if key in latest_scans:
+                    continue
+                latest_scans[key] = {
+                    "ts": float(r["ts"]),
+                    "device_id": did,
+                    "band": b,
+                    "bss_list": json.loads(r["bss_json"] or "[]"),
+                }
+        except Exception as e:
+            raise HTTPException(500, f"Gagal membaca riwayat scan RF: {e}")
+
+    # Kumpulkan link terarah (scanner_id -> heard_owner_id, band), ambil RSSI terkuat dari Virtual AP
+    directed: dict[tuple[str, str, str], dict] = {}
+    scanned_dev_ids: set[str] = set()
+    for (scanner_id, b), sc in latest_scans.items():
+        scanned_dev_ids.add(scanner_id)
+        for item in sc["bss_list"]:
+            bssid = str(item.get("bssid") or "").upper().strip()
+            owner = known_bssids.get(bssid)
+            if not owner:
+                continue
+            target_id = owner["device_id"]
+            if target_id == scanner_id or target_id not in dev_by_id:
+                continue
+            try:
+                sig = float(item.get("signal"))
+            except (TypeError, ValueError):
+                continue
+            freq = int(item.get("freq") or 0)
+            dkey = (scanner_id, target_id, b)
+            prev = directed.get(dkey)
+            if not prev or sig > prev["rssi"]:
+                directed[dkey] = {
+                    "rssi": sig,
+                    "freq": freq,
+                    "width": int(item.get("width") or 20),
+                    "ssid": item.get("ssid") or owner.get("ssid") or "",
+                    "ts": sc["ts"],
+                }
+
+    # Gabungkan pasangan simetris (A <-> B) per band
+    pair_map: dict[tuple[str, str, str], dict] = {}
+    for (src, dst, b), info in directed.items():
+        a, c = (src, dst) if src < dst else (dst, src)
+        pkey = (a, c, b)
+        entry = pair_map.setdefault(
+            pkey,
+            {
+                "ap_a_id": a,
+                "ap_b_id": c,
+                "band": b,
+                "rssi_ab": None,
+                "rssi_ba": None,
+                "freq_heard_b": None,
+                "freq_heard_a": None,
+                "ts": 0.0,
+            },
+        )
+        if src == a:
+            entry["rssi_ab"] = round(info["rssi"], 1)
+            entry["freq_heard_b"] = info["freq"]
+        else:
+            entry["rssi_ba"] = round(info["rssi"], 1)
+            entry["freq_heard_a"] = info["freq"]
+        entry["ts"] = max(entry["ts"], info["ts"])
+
+    pairs: list[dict] = []
+    per_ap_links: dict[str, list[dict]] = {d["id"]: [] for d in devs}
+
+    for p in pair_map.values():
+        a_id = p["ap_a_id"]
+        b_id = p["ap_b_id"]
+        if device and device not in (a_id, b_id):
+            continue
+        r_ab = p["rssi_ab"]
+        r_ba = p["rssi_ba"]
+        bidir = (r_ab is not None) and (r_ba is not None)
+        rssi_avg = round((r_ab + r_ba) / 2.0, 1) if bidir else float(r_ab if r_ab is not None else r_ba)
+        ref_freq = p["freq_heard_b"] or p["freq_heard_a"] or (2437 if p["band"] == "2g" else 5745)
+        dist_m = _rf_estimate_distance_m(rssi_avg, ref_freq, env_key)
+
+        fa = p["freq_heard_a"]
+        fb = p["freq_heard_b"]
+        co_channel = bool(fa and fb and abs(int(fa) - int(fb)) < 20)
+
+        if dist_m < 7.0 or rssi_avg >= -52.0:
+            proximity = "too_close"
+        elif dist_m <= 18.0:
+            proximity = "ideal"
+        else:
+            proximity = "far"
+
+        da = dev_by_id[a_id]
+        db = dev_by_id[b_id]
+        row = {
+            "ap_a_id": a_id,
+            "ap_a_name": da.get("name") or a_id,
+            "ap_a_host": da.get("host") or "",
+            "ap_a_group": da.get("group") or "Default",
+            "ap_b_id": b_id,
+            "ap_b_name": db.get("name") or b_id,
+            "ap_b_host": db.get("host") or "",
+            "ap_b_group": db.get("group") or "Default",
+            "band": p["band"],
+            "rssi_dbm": rssi_avg,
+            "rssi_ab": r_ab,
+            "rssi_ba": r_ba,
+            "bidirectional": bidir,
+            "freq_a": fa,
+            "freq_b": fb,
+            "channel_label": _freq_to_ch_label(ref_freq),
+            "co_channel": co_channel,
+            "distance_m": dist_m,
+            "proximity": proximity,
+            "scanned_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(p["ts"])) if p["ts"] else "-",
+        }
+        pairs.append(row)
+        per_ap_links[a_id].append(
+            {
+                "peer_id": b_id,
+                "peer_name": row["ap_b_name"],
+                "peer_host": row["ap_b_host"],
+                "band": p["band"],
+                "rssi_dbm": rssi_avg,
+                "distance_m": dist_m,
+                "proximity": proximity,
+                "co_channel": co_channel,
+                "bidirectional": bidir,
+            }
+        )
+        per_ap_links[b_id].append(
+            {
+                "peer_id": a_id,
+                "peer_name": row["ap_a_name"],
+                "peer_host": row["ap_a_host"],
+                "band": p["band"],
+                "rssi_dbm": rssi_avg,
+                "distance_m": dist_m,
+                "proximity": proximity,
+                "co_channel": co_channel,
+                "bidirectional": bidir,
+            }
+        )
+
+    pairs.sort(key=lambda x: (x["distance_m"], -x["rssi_dbm"]))
+
+    per_ap: list[dict] = []
+    unscanned_aps: list[dict] = []
+    for d in devs:
+        did = d["id"]
+        if device and did != device:
+            continue
+        links = sorted(per_ap_links.get(did) or [], key=lambda x: (x["distance_m"], -x["rssi_dbm"]))
+        has_scan = did in scanned_dev_ids
+        if not has_scan and not links:
+            unscanned_aps.append({"id": did, "name": d.get("name") or did, "host": d.get("host") or "", "group": d.get("group") or "Default"})
+            continue
+        nearest = links[0] if links else None
+        per_ap.append(
+            {
+                "device_id": did,
+                "device_name": d.get("name") or did,
+                "host": d.get("host") or "",
+                "group": d.get("group") or "Default",
+                "scanned": has_scan,
+                "neighbour_count": len(links),
+                "too_close_count": sum(1 for x in links if x["proximity"] == "too_close"),
+                "co_channel_count": sum(1 for x in links if x["co_channel"]),
+                "nearest": nearest,
+                "neighbours": links[:12],
+            }
+        )
+
+    per_ap.sort(key=lambda x: (x["nearest"]["distance_m"] if x["nearest"] else 999.0, x["device_name"]))
+
+    return {
+        "ok": True,
+        "env": env_key,
+        "env_label": _RF_ENV_PROFILES[env_key]["label"],
+        "path_loss_n": _RF_ENV_PROFILES[env_key]["n"],
+        "band": band_filter,
+        "window_h": window_h,
+        "summary": {
+            "total_devices": len(devs),
+            "scanned_devices": len(scanned_dev_ids),
+            "unscanned_devices": len(unscanned_aps),
+            "total_pairs": len(pairs),
+            "too_close_pairs": sum(1 for p in pairs if p["proximity"] == "too_close"),
+            "ideal_pairs": sum(1 for p in pairs if p["proximity"] == "ideal"),
+            "far_pairs": sum(1 for p in pairs if p["proximity"] == "far"),
+            "co_channel_pairs": sum(1 for p in pairs if p["co_channel"]),
+        },
+        "pairs": pairs,
+        "per_ap": per_ap,
+        "unscanned_aps": unscanned_aps,
+    }
+
+
+@app.post("/api/fleet/rf-distances/scan")
+def api_fleet_rf_distances_scan(req: FleetRfDistanceScanReq):
+    """Pindai RF on-demand untuk 1 atau beberapa AP terpilih agar jarak tetangga RF terbarui."""
+    if not req.device_ids:
+        raise HTTPException(400, "Pilih minimal 1 AP untuk dipindai")
+    if len(req.device_ids) > 12:
+        raise HTTPException(400, "Maksimal 12 AP per scan manual agar jaringan tetap ringan")
+    all_devs = {d["id"]: d for d in load_devices()}
+    targets = [all_devs[did] for did in req.device_ids if did in all_devs]
+    if not targets:
+        raise HTTPException(404, "Perangkat target tidak ditemukan")
+
+    bands = ["2g", "5g"] if req.band == "all" else [req.band if req.band in ("2g", "5g") else "5g"]
+    # Refresh fleet BSSID cache so newly scanned BSSIDs map accurately
+    try:
+        get_fleet_known_bssids()
+    except Exception:
+        pass
+
+    results: list[dict] = []
+
+    def _scan_dev(d: dict) -> dict:
+        ok_bands = []
+        errs = []
+        for b in bands:
+            try:
+                api_rf_scan(device=d["id"], band=b, duration=req.duration, non_disruptive=False)
+                ok_bands.append(b)
+            except Exception as e:
+                errs.append(f"{b}: {e}")
+        return {
+            "device_id": d["id"],
+            "device_name": d.get("name") or d["id"],
+            "ok": len(ok_bands) > 0,
+            "bands_ok": ok_bands,
+            "errors": errs,
+        }
+
+    with ThreadPoolExecutor(max_workers=min(6, len(targets))) as ex:
+        for r in ex.map(_scan_dev, targets):
+            results.append(r)
+
+    return {
+        "ok": any(r["ok"] for r in results),
+        "scanned": sum(1 for r in results if r["ok"]),
+        "failed": sum(1 for r in results if not r["ok"]),
         "results": results,
     }
 

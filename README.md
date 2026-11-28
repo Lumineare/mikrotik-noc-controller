@@ -21,9 +21,10 @@ REST API router, tanpa SSH, tanpa Telnet.
 
 ### Monitoring, Telemetri & Manajemen Armada
 - **Probe armada paralel** — 80+ AP diprobe serentak (30 worker, timeout 1.8 s) dan membaca data nyata dari `/system/resource` (`cpu-load`, `board-name`, `version`, `uptime`) sekaligus **jumlah klien Wi-Fi live** dari `/interface/wireless/registration-table` (dengan fallback `/interface/wifi/registration-table`).
-- **Tampilan Grid & Tabel Padat** — kartu perangkat ringkas (klik kartu langsung buka dashboard router) atau mode tabel padat dengan preferensi tersimpan lokal.
+- **Layout Hairline & Tampilan Grid / Tabel Padat** — Telemetry Strip terpadu (`divide-x`), Direktori Perangkat menyatu tanpa kotak-dalam-kotak, aksesibilitas keyboard (`:focus-visible`), `prefers-reduced-motion`, dan preferensi tampilan tersimpan lokal.
+- **Pop-Up Loading Anti-Close (`ActionProgressModal`)** — setiap operasi **tambah / hapus** (Router, SSID/Virtual AP, Security Profile, Denah/Pin AP, dan Fleet Wi-Fi Sync) menampilkan pop-up loading yang tidak bisa ditutup manual, otomatis tertutup saat berhasil, dan menampilkan detail pesan error jika gagal.
 - **Filter & Pengurutan Cepat** — filter **Semua / Online / High CPU / 0 Klien / Offline**, filter ruangan/grup, serta pengurutan **Bermasalah dulu**, **Klien terbanyak**, **Klien tersedikit (0 dulu)**, **CPU tertinggi**, **Nama A-Z**, dan **IP Address**.
-- **Riwayat SQLite** — `noc_history.db` menyimpan `alert_history`, `fleet_telemetry`, dan `rf_samples` sehingga tren CPU, uptime, kualitas sinyal, dan riwayat alert tetap ada setelah restart.
+- **Riwayat SQLite** — `noc_history.db` menyimpan `alert_history`, `fleet_telemetry`, `rf_samples`, dan `rf_scan_history` (7 hari) sehingga tren CPU, uptime, kualitas sinyal, dan riwayat scan tetap ada setelah restart.
 - **Alert Telegram** — notifikasi down / recovery / CPU tinggi / RF conflict, dengan bot token yang **tidak pernah dikirim ke browser** (hanya versi masked).
 
 ### Fleet Wi-Fi Sync (Sinkronisasi SSID & Password Massal)
@@ -39,10 +40,16 @@ REST API router, tanpa SSH, tanpa Telnet.
 - **AI Diagnose & ML Anomaly** — pemindaian masalah otomatis + aksi perbaikan cepat (`/api/ai/diagnose`, `/api/ai/apply`) serta deteksi anomali berbasis `scikit-learn` (`/api/ai/ml/anomaly`).
 
 ### AI Optimize & Auto-RRM (OmniRoute + DCA / TPC)
-- **Optimasi Radio Lintas Armada** — menggabungkan perhitungan channel/power bersama (**DCA / TPC / Band Steering**) dengan perencanaan **OmniRoute AI** (endpoint OpenAI-compatible).
+- **Pemilih AP Target & Penguncian AP** (`device_ids`) — pilih seluruh armada atau hanya AP tertentu (baik dari modal AI Optimize maupun langsung dari checkbox bulk bar Armada); AP yang tidak dipilih **dikunci penuh** (tidak di-scan dan tidak mungkin tertimpa) agar hasil optimasi yang sudah bagus tetap aman.
+- **Pemilih Model OmniRoute Live** (`omniroute_model`) — seluruh model aktif dari server OmniRoute (`GET /api/ai/models`) dapat dicari dan dipilih langsung di modal AI Optimize, dikelompokkan per provider, dan tersimpan di `localStorage`.
+- **Compare Engine (`rrm_engine.py` vs OmniRoute AI)** — membandingkan skor biaya interferensi (mW) dan otomatis menolak rencana LLM jika lebih buruk dari kalkulasi matematis lokal; dilengkapi auto-narrow 5 GHz padat (`80 MHz → 20 MHz`), DFS off by default, dan roam kick `-75 dBm`.
 - **Validasi Regulatory Domain & Auto-Fallback** — setiap kandidat frekuensi diverifikasi terhadap `supported_freqs` per AP; jika router menolak frekuensi (`bad band or frequency`), sistem otomatis fallback ke channel valid terdekat dari router.
-- **Safety Guard & Rollback** — push dilakukan sekuensial per AP; jika jumlah klien turun melebihi batas (`max_client_drop`), proses berhenti dan konfigurasi AP dikembalikan otomatis.
-- **Detail Transparan** — modal **AI Optimize** menampilkan ringkasan hasil yang bisa dilipat, detail perubahan per radio, serta alasan mengapa AP tertentu tidak diubah.
+- **Safety Guard & Rollback Multi-AP** — push sekuensial per AP dengan toleransi *cross-AP roaming* normal, auto-rollback jika radio blackout, serta lanjut ke AP berikutnya agar 1 AP bermasalah tidak menghentikan seluruh armada.
+
+### Estimasi Jarak & Tetangga RF Antar-AP (`Jarak AP`)
+- **Deteksi Otomatis dari Sinyal RF** (`GET /api/fleet/rf-distances`) — menghitung estimasi jarak indoor antar-AP (`~meter`) dari riwayat scan RF (`rf_scan_history`) + peta BSSID armada tanpa perlu input koordinat denah.
+- **Kalibrasi Redaman Gedung** — memakai model *Log-Distance Path Loss* dengan 3 profil lingkungan: **Koridor Terbuka (`n=2.4`)**, **Gedung RS Bertembok (`n=3.0`)**, dan **Tembok Beton Tebal (`n=3.5`)**.
+- **Analisis Kedekatan & Konflik** — menandai pasangan **Terlalu Dekat (`< 7 m`)**, **Ideal (`7–18 m`)**, **Jauh (`> 18 m`)**, deteksi link 2 arah (`↔`), dan konflik **Co-Channel**, tersedia dalam tampilan **Pasangan AP** dan **Per AP (Tetangga Terdekat)**, plus tombol **Scan 1 AP** on-demand (`POST /api/fleet/rf-distances/scan`).
 
 ### Diagnostik Wi-Fi Armada
 - **Link Quality (`100 - CCQ`)** — mendukung mode **Semua AP (Armada)** maupun per-AP dengan filter band (`2.4 GHz`, `5 GHz`, `Semua`) dan daftar klien dengan tekanan link tertinggi.
@@ -188,7 +195,7 @@ Cek channel yang didukung:
 └── frontend/
     └── src/
         ├── api/client.ts      # typed API client
-        ├── components/        # FleetView, DeviceCard, FleetWifiSyncModal, WifiDiagnostics, tabs/, map/
+        ├── components/        # FleetView, DeviceCard, FleetWifiSyncModal, FleetRfDistanceModal, ActionProgressModal, WifiDiagnostics, tabs/, map/
         └── types/index.ts
 ```
 
@@ -202,11 +209,13 @@ Cek channel yang didukung:
 | POST | `/api/fleet/probe` | Paksa probe ulang seluruh armada paralel |
 | GET | `/api/fleet/wifi/ssids` | Pindai paralel seluruh SSID aktif lintas armada |
 | POST | `/api/fleet/wifi/sync` | Rotasi password, tambah SSID, atau rename SSID massal (+ `dry_run`) |
+| GET | `/api/fleet/rf-distances` | Estimasi jarak & daftar tetangga RF antar-AP (Log-Distance Path Loss) |
+| POST | `/api/fleet/rf-distances/scan` | Scan RF on-demand untuk 1–12 AP terpilih agar jarak tetangga terbarui |
 | GET | `/api/wifi/diagnostics` | Link Quality (`100 - CCQ`) & AP Deployment Density (`device=all` atau per-AP) |
 | POST | `/api/ai/chat` | Chatbot AI NOC dengan konteks telemetri live router |
 | GET | `/api/ai/diagnose` | Diagnosa otomatis kesehatan & keamanan router |
 | GET | `/api/ai/models` | Daftar model LLM tersedia dari OmniRoute |
-| POST | `/api/optimize/fleet` | Jalankan AI Optimize / Auto-RRM lintas armada |
+| POST | `/api/optimize/start` | Jalankan AI Optimize / Auto-RRM (dukung `device_ids` & `omniroute_model`) |
 | GET | `/api/wireless/interfaces` | Daftar SSID / virtual AP per router |
 | GET | `/api/wireless/supported-channels` | Channel valid menurut regulatory domain router |
 | POST | `/api/wireless/interfaces/update` | Simpan konfigurasi wireless |

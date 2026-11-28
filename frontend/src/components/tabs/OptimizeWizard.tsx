@@ -1,17 +1,19 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
   ChevronDown,
+  Lock,
   Play,
   RefreshCw,
   RotateCcw,
+  Search,
   Sliders,
   Sparkles,
   XCircle,
 } from 'lucide-react';
 import { api } from '../../api/client';
-import { OptimizeJob } from '../../types';
+import { FleetDevice, OptimizeJob } from '../../types';
 
 const BASE = (import.meta as any).env?.VITE_API_URL || '';
 const call = async <T,>(path: string, method = 'GET', body?: any): Promise<T> => {
@@ -57,8 +59,10 @@ const pill = (job: OptimizeJob | null) => {
 export const OptimizeWizard: React.FC<{
   deviceId?: string;
   fleet?: boolean;
+  fleetDevices?: FleetDevice[];
+  initialSelectedIds?: string[];
   onApplied?: () => void;
-}> = ({ deviceId, fleet = false, onApplied }) => {
+}> = ({ deviceId, fleet = false, fleetDevices, initialSelectedIds, onApplied }) => {
   const [job, setJob] = useState<OptimizeJob | null>(null);
   const [cfg, setCfg] = useState<RrmConfig | null>(null);
   const [busy, setBusy] = useState(false);
@@ -70,9 +74,101 @@ export const OptimizeWizard: React.FC<{
   const [historyMin, setHistoryMin] = useState(1440);
   const [scanS, setScanS] = useState(8);
   const [dryRun, setDryRun] = useState(false);
-  const [aiPush, setAiPush] = useState(true);
   const [useOmniroute, setUseOmniroute] = useState(true);
+  const [omniModels, setOmniModels] = useState<string[]>([]);
+  const [selectedOmniModel, setSelectedOmniModel] = useState<string>(() => {
+    try {
+      return localStorage.getItem('rsam_optimize_omniroute_model') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [modelSearch, setModelSearch] = useState('');
   const notified = useRef<string | null>(null);
+
+  // Target AP selector state (for fleet mode so user-optimized APs are never overwritten)
+  const [loadedDevices, setLoadedDevices] = useState<FleetDevice[]>(fleetDevices || []);
+  const [selectedApIds, setSelectedApIds] = useState<Set<string>>(() => {
+    if (initialSelectedIds && initialSelectedIds.length > 0) return new Set(initialSelectedIds);
+    return new Set((fleetDevices || []).map((d) => d.id));
+  });
+  const [showTargetPicker, setShowTargetPicker] = useState<boolean>(
+    Boolean(initialSelectedIds && initialSelectedIds.length > 0)
+  );
+  const [targetSearch, setTargetSearch] = useState('');
+  const [targetGroup, setTargetGroup] = useState('ALL');
+  const initializedTargets = useRef<boolean>(
+    Boolean((initialSelectedIds && initialSelectedIds.length > 0) || (fleetDevices && fleetDevices.length > 0))
+  );
+
+  useEffect(() => {
+    if (fleetDevices && fleetDevices.length > 0) {
+      setLoadedDevices(fleetDevices);
+      if (!initializedTargets.current) {
+        initializedTargets.current = true;
+        setSelectedApIds(new Set(fleetDevices.map((d) => d.id)));
+      }
+    }
+  }, [fleetDevices]);
+
+  useEffect(() => {
+    if (!fleet || (fleetDevices && fleetDevices.length > 0)) return;
+    let alive = true;
+    api
+      .getFleet()
+      .then((res) => {
+        if (!alive) return;
+        const devs = res.devices || [];
+        setLoadedDevices(devs);
+        if (!initializedTargets.current && devs.length > 0) {
+          initializedTargets.current = true;
+          setSelectedApIds(new Set(devs.map((d) => d.id)));
+        }
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [fleet, fleetDevices]);
+
+  const targetGroups = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const d of loadedDevices) {
+      const g = d.group || 'Default';
+      map.set(g, (map.get(g) || 0) + 1);
+    }
+    return Array.from(map.entries()).sort((a, b) => b[1] - a[1]);
+  }, [loadedDevices]);
+
+  const filteredTargetDevices = useMemo(() => {
+    const q = targetSearch.trim().toLowerCase();
+    return loadedDevices.filter((d) => {
+      const matchGroup = targetGroup === 'ALL' || (d.group || 'Default') === targetGroup;
+      const matchSearch =
+        !q ||
+        d.name.toLowerCase().includes(q) ||
+        d.host.toLowerCase().includes(q) ||
+        (d.group || '').toLowerCase().includes(q);
+      return matchGroup && matchSearch;
+    });
+  }, [loadedDevices, targetSearch, targetGroup]);
+
+  const toggleTargetAp = (id: string) => {
+    setSelectedApIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const totalFleetCount = loadedDevices.length;
+  const selectedCount = selectedApIds.size;
+  const lockedCount = Math.max(0, totalFleetCount - selectedCount);
+  const isPartialFleet = fleet && totalFleetCount > 0 && selectedCount > 0 && selectedCount < totalFleetCount;
 
   const load = useCallback(async () => {
     const key = fleet ? 'fleet' : deviceId;
@@ -94,10 +190,52 @@ export const OptimizeWizard: React.FC<{
     }
   }, []);
 
+  const loadOmniModels = useCallback(async () => {
+    setLoadingModels(true);
+    try {
+      const res = await call<{ current_model?: string; available_models?: string[] }>('/api/ai/models');
+      const list = Array.isArray(res.available_models) ? res.available_models : [];
+      setOmniModels(list);
+      setSelectedOmniModel((prev) => {
+        if (prev && (list.length === 0 || list.includes(prev))) return prev;
+        return res.current_model || list[0] || '';
+      });
+    } catch {
+      /* ignore */
+    } finally {
+      setLoadingModels(false);
+    }
+  }, []);
+
   useEffect(() => {
     load();
     loadCfg();
-  }, [load, loadCfg]);
+    loadOmniModels();
+  }, [load, loadCfg, loadOmniModels]);
+
+  const handleSelectOmniModel = (modelId: string) => {
+    setSelectedOmniModel(modelId);
+    try {
+      if (modelId) localStorage.setItem('rsam_optimize_omniroute_model', modelId);
+      else localStorage.removeItem('rsam_optimize_omniroute_model');
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const groupedOmniModels = useMemo(() => {
+    const q = modelSearch.trim().toLowerCase();
+    const filtered = q ? omniModels.filter((m) => m.toLowerCase().includes(q)) : omniModels;
+    const groups = new Map<string, string[]>();
+    for (const m of filtered) {
+      const slashIdx = m.indexOf('/');
+      const groupName = slashIdx > 0 ? m.slice(0, slashIdx) : 'Lainnya';
+      const arr = groups.get(groupName) || [];
+      arr.push(m);
+      groups.set(groupName, arr);
+    }
+    return Array.from(groups.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [omniModels, modelSearch]);
 
   useEffect(() => {
     if (job?.status !== 'running') return;
@@ -114,15 +252,19 @@ export const OptimizeWizard: React.FC<{
 
   const start = async () => {
     if (busy) return;
-    if (
-      !dryRun &&
-      !window.confirm(
-        fleet
-          ? 'Optimalkan SEMUA AP dan kirim perubahan?\n\nChannel dihitung bersama antar-AP. Push dilakukan satu AP per satu AP; kalau klien di sebuah AP turun melebihi batas, push berhenti dan AP itu dikembalikan otomatis. Radio bisa restart singkat (klien terputus 10–30 detik per AP).'
-          : 'Optimalkan AP ini dan kirim perbaikan ke AP?\n\nOptimasi channel tetap dikelola global (fleet), tetapi PERBAIKAN (radio mati, frequency=auto, channel di luar rencana) tetap dikirim. TX power & steering ikut. Radio bisa restart singkat (klien terputus 10–30 detik).'
-      )
-    )
+    if (fleet && totalFleetCount > 0 && selectedCount === 0) {
+      setMsg('Pilih minimal 1 AP target untuk dioptimalkan.');
+      setShowTargetPicker(true);
       return;
+    }
+    const targetIdsList = fleet && totalFleetCount > 0 ? Array.from(selectedApIds) : undefined;
+    const confirmText = fleet
+      ? isPartialFleet
+        ? `Optimalkan ${selectedCount} AP terpilih dan kirim perubahan?\n\n${lockedCount} AP lainnya DIKUNCI (tidak akan discan maupun diubah konfigurasinya). Push dilakukan satu AP per satu AP. Radio AP terpilih bisa restart singkat (10–30 detik).`
+        : `Optimalkan SEMUA AP (${totalFleetCount || 'armada'}) dan kirim perubahan?\n\nChannel dihitung bersama antar-AP. Push dilakukan satu AP per satu AP; kalau klien di sebuah AP turun melebihi batas, AP itu dikembalikan otomatis. Radio bisa restart singkat (klien terputus 10–30 detik per AP).`
+      : 'Optimalkan AP ini dan kirim perbaikan ke AP?\n\nOptimasi channel tetap dikelola global (fleet), tetapi PERBAIKAN (radio mati, frequency=auto, channel di luar rencana) tetap dikirim. TX power & steering ikut. Radio bisa restart singkat (klien terputus 10–30 detik).';
+
+    if (!dryRun && !window.confirm(confirmText)) return;
     setBusy(true);
     setMsg(null);
     try {
@@ -130,10 +272,11 @@ export const OptimizeWizard: React.FC<{
         history_window_min: historyMin,
         scan_duration: scanS,
         dry_run: dryRun,
-        ai_auto_push: aiPush,
         use_omniroute: useOmniroute,
+        omniroute_model: useOmniroute && selectedOmniModel ? selectedOmniModel : undefined,
         fleet,
-      } as any);
+        device_ids: targetIdsList,
+      });
       setMsg(r.ok ? null : r.message || 'Optimasi lain masih berjalan');
       await load();
     } catch (e: any) {
@@ -192,7 +335,12 @@ export const OptimizeWizard: React.FC<{
           <span className="font-bold text-slate-800">{fleet ? 'AI Optimize · Semua AP' : 'AI Optimize'}</span>
           <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${p.cls}`}>{p.text}</span>
           <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border border-indigo-200 bg-indigo-50 text-indigo-700">
-            {compute?.engine || (useOmniroute ? 'OmniRoute AI' : 'rrm_engine.py')}
+            {compute?.engine ||
+              (useOmniroute
+                ? selectedOmniModel
+                  ? `OmniRoute (${selectedOmniModel})`
+                  : 'OmniRoute AI'
+                : 'rrm_engine.py')}
           </span>
         </div>
         <div className="flex items-center gap-3">
@@ -213,24 +361,259 @@ export const OptimizeWizard: React.FC<{
 
       <p className="text-slate-500 mt-1 text-[11px]">
         {fleet
-          ? 'Satu job untuk seluruh fleet: cek AP → riwayat → scan WLAN → hitung channel bersama antar-AP → kirim sekuensial per AP (abort otomatis kalau klien turun). Tetap jalan walau halaman ditutup.'
+          ? 'Pilih seluruh armada atau hanya AP tertentu (AP yang tidak dipilih otomatis dikunci agar hasil optimasi sebelumnya tidak tertimpa). Tetap jalan walau halaman ditutup.'
           : 'Cek AP → riwayat → scan WLAN → hitung → kirim ke AP ini. Channel dikunci (dikelola global); yang dikirim hanya TX power & steering.'}
       </p>
+
+      {/* OmniRoute Model Selector Bar */}
+      {!running && (
+        <div className="mt-3 border border-slate-200 rounded-lg px-3 py-2.5 bg-slate-50/70 space-y-2">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <label className="inline-flex items-center gap-2 text-[11px] font-mono font-semibold text-slate-800 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={useOmniroute}
+                onChange={(e) => setUseOmniroute(e.target.checked)}
+                className="w-3.5 h-3.5 rounded accent-blue-600"
+              />
+              <span>Model OmniRoute AI</span>
+              {omniModels.length > 0 && (
+                <span className="text-[10px] font-normal text-slate-500">
+                  ({omniModels.length} tersedia)
+                </span>
+              )}
+            </label>
+            <button
+              type="button"
+              onClick={loadOmniModels}
+              disabled={loadingModels}
+              className="inline-flex items-center gap-1 text-[10.5px] font-mono text-blue-600 hover:text-blue-800 disabled:opacity-50"
+              title="Muat ulang daftar model langsung dari server OmniRoute"
+            >
+              <RefreshCw className={`w-3 h-3 ${loadingModels ? 'animate-spin' : ''}`} aria-hidden="true" />
+              <span>Sync Model</span>
+            </button>
+          </div>
+
+          {useOmniroute ? (
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+              <div className="relative sm:w-44 shrink-0">
+                <Search className="w-3 h-3 text-slate-400 absolute left-2.5 top-2.5" aria-hidden="true" />
+                <input
+                  type="text"
+                  value={modelSearch}
+                  onChange={(e) => setModelSearch(e.target.value)}
+                  aria-label="Filter daftar model OmniRoute"
+                  placeholder="Cari model..."
+                  className="w-full pl-7 pr-2 py-1.5 text-[11px] font-mono bg-white border border-slate-300 rounded-md text-slate-800 placeholder:text-slate-400 focus:border-blue-600"
+                />
+              </div>
+              <select
+                value={selectedOmniModel}
+                onChange={(e) => handleSelectOmniModel(e.target.value)}
+                aria-label="Pilih model OmniRoute untuk AI Optimize"
+                className="flex-1 min-w-0 px-2.5 py-1.5 text-[11px] font-mono font-semibold bg-white border border-slate-300 rounded-md text-slate-800 focus:border-blue-600"
+              >
+                {selectedOmniModel && !omniModels.includes(selectedOmniModel) && (
+                  <option value={selectedOmniModel}>{selectedOmniModel}</option>
+                )}
+                {groupedOmniModels.length > 0 ? (
+                  groupedOmniModels.map(([grp, models]) => (
+                    <optgroup key={grp} label={`${grp} (${models.length})`}>
+                      {models.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))
+                ) : (
+                  <option value={selectedOmniModel || 'auto/best-chat'}>
+                    {loadingModels
+                      ? 'Memuat daftar model OmniRoute...'
+                      : modelSearch
+                      ? 'Tidak ada model yang cocok'
+                      : selectedOmniModel || 'auto/best-chat'}
+                  </option>
+                )}
+              </select>
+            </div>
+          ) : (
+            <div className="text-[11px] font-mono text-slate-500">
+              OmniRoute nonaktif: optimasi menggunakan kalkulasi matematis lokal <span className="font-semibold text-slate-700">rrm_engine.py</span>.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Selective AP Target Picker (Fleet mode) */}
+      {fleet && totalFleetCount > 0 && !running && (
+        <div className="mt-3 border border-slate-200 rounded-lg overflow-hidden bg-white">
+          <div className="px-3 py-2 bg-slate-50 flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap">
+              <Lock
+                className={`w-3.5 h-3.5 shrink-0 ${
+                  selectedCount === 0
+                    ? 'text-rose-600'
+                    : isPartialFleet
+                    ? 'text-emerald-600'
+                    : 'text-slate-400'
+                }`}
+                aria-hidden="true"
+              />
+              {selectedCount === 0 ? (
+                <span className="font-semibold text-rose-700">
+                  Belum ada AP dipilih (0 / {totalFleetCount})
+                </span>
+              ) : isPartialFleet ? (
+                <span className="text-slate-700">
+                  Target: <strong className="text-blue-700">{selectedCount} AP</strong> ·{' '}
+                  <strong className="text-emerald-700">{lockedCount} AP lain dikunci</strong> (tidak akan diubah)
+                </span>
+              ) : (
+                <span className="text-slate-700">
+                  Target: <strong className="text-slate-900">Semua AP ({totalFleetCount})</strong>
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowTargetPicker((v) => !v)}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-[11px] font-mono font-semibold text-slate-700 transition-colors"
+            >
+              <span>{showTargetPicker ? 'Tutup Pemilih AP' : 'Pilih AP Target'}</span>
+              <ChevronDown
+                className={`w-3 h-3 transition-transform ${showTargetPicker ? 'rotate-180' : ''}`}
+                aria-hidden="true"
+              />
+            </button>
+          </div>
+
+          {showTargetPicker && (
+            <div className="p-3 border-t border-slate-200 space-y-2.5 bg-white">
+              <div className="flex flex-col sm:flex-row gap-2">
+                <div className="relative flex-1">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" aria-hidden="true" />
+                  <input
+                    type="text"
+                    value={targetSearch}
+                    onChange={(e) => setTargetSearch(e.target.value)}
+                    placeholder="Cari nama AP, IP, atau ruangan..."
+                    className="w-full pl-8 pr-2.5 py-1.5 text-[11px] font-mono bg-slate-50 border border-slate-300 rounded-md text-slate-800 placeholder:text-slate-400 focus:bg-white focus:border-blue-600"
+                  />
+                </div>
+                <select
+                  value={targetGroup}
+                  onChange={(e) => setTargetGroup(e.target.value)}
+                  aria-label="Filter lokasi AP target"
+                  className="px-2.5 py-1.5 text-[11px] font-mono bg-slate-50 border border-slate-300 rounded-md text-slate-700"
+                >
+                  <option value="ALL">Semua Lokasi ({totalFleetCount})</option>
+                  {targetGroups.map(([g, cnt]) => (
+                    <option key={g} value={g}>
+                      {g} ({cnt})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 flex-wrap text-[11px] font-mono">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedApIds((prev) => {
+                        const next = new Set(prev);
+                        filteredTargetDevices.forEach((d) => next.add(d.id));
+                        return next;
+                      })
+                    }
+                    className="px-2 py-1 rounded border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700"
+                  >
+                    Pilih Hasil Filter ({filteredTargetDevices.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedApIds(new Set(loadedDevices.filter((d) => d.online).map((d) => d.id)))
+                    }
+                    className="px-2 py-1 rounded border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700"
+                  >
+                    Online Saja ({loadedDevices.filter((d) => d.online).length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedApIds(new Set())}
+                    className="px-2 py-1 rounded border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700"
+                  >
+                    Kosongkan
+                  </button>
+                </div>
+                <span className="text-[10.5px] text-slate-500">
+                  Centang hanya AP yang ingin dioptimalkan
+                </span>
+              </div>
+
+              <div className="max-h-52 overflow-y-auto border border-slate-200 rounded-md grid grid-cols-1 sm:grid-cols-2 divide-y divide-slate-100">
+                {filteredTargetDevices.map((d) => {
+                  const checked = selectedApIds.has(d.id);
+                  return (
+                    <label
+                      key={d.id}
+                      className={`flex items-center justify-between gap-2 px-2.5 py-1.5 text-[11px] font-mono border-r border-slate-100 cursor-pointer transition-colors ${
+                        checked ? 'bg-blue-50/40 text-slate-900' : 'bg-white text-slate-500 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleTargetAp(d.id)}
+                          className="w-3.5 h-3.5 rounded accent-blue-600 shrink-0"
+                        />
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                            d.online ? 'bg-emerald-500' : 'bg-rose-400'
+                          }`}
+                          aria-hidden="true"
+                        />
+                        <span className="truncate font-semibold" title={`${d.name} (${d.host})`}>
+                          {d.name}
+                        </span>
+                      </span>
+                      <span className="text-[10px] text-slate-400 shrink-0 tabular-nums">
+                        {d.host}
+                      </span>
+                    </label>
+                  );
+                })}
+                {filteredTargetDevices.length === 0 && (
+                  <div className="col-span-2 py-4 text-center text-[11px] font-mono text-slate-400">
+                    Tidak ada AP yang cocok dengan pencarian.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {!running && (
         <div className="mt-3 flex items-center justify-between gap-3 flex-wrap">
           <button
             type="button"
             onClick={start}
-            disabled={busy || (!fleet && !deviceId)}
-            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800 px-4 py-2 text-white text-xs font-bold shadow-xs transition-colors disabled:opacity-60 cursor-pointer"
+            disabled={busy || (!fleet && !deviceId) || (fleet && totalFleetCount > 0 && selectedCount === 0)}
+            className="inline-flex items-center gap-2 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 px-4 py-2 text-white text-xs font-bold transition-colors disabled:opacity-50"
           >
             {busy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
             <span>
               {fleet
-                ? job?.status === 'done'
-                  ? 'Optimalkan Ulang Semua AP'
-                  : 'Optimalkan Semua AP'
+                ? isPartialFleet
+                  ? `Optimalkan ${selectedCount} AP Terpilih`
+                  : job?.status === 'done'
+                  ? `Optimalkan Ulang Semua AP (${totalFleetCount || 'Armada'})`
+                  : `Optimalkan Semua AP (${totalFleetCount || 'Armada'})`
                 : job?.status === 'done'
                 ? 'Optimalkan Ulang'
                 : 'Optimalkan AP Ini'}
@@ -504,6 +887,182 @@ export const OptimizeWizard: React.FC<{
         );
       })()}
 
+      {compute?.compare && (() => {
+        const cmp = compute.compare as any;
+        const rrmSide = cmp.rrm || {};
+        const omniSide = cmp.omniroute || {};
+        const rrmWon = cmp.winner !== 'omniroute';
+        const mathRejected = Boolean(cmp.omniroute_rejected_by_math);
+        const fmtMw = (v: any) => {
+          if (v == null || Number.isNaN(Number(v))) return '—';
+          const n = Number(v);
+          if (n === 0) return '0 mW';
+          return `${n.toExponential(2)} mW`;
+        };
+        const renderChanges = (chs: any[], tpcs: any[]) => {
+          if (!chs?.length && !tpcs?.length) {
+            return <div className="text-[11px] text-slate-500 italic">Tidak ada perubahan — sudah optimal.</div>;
+          }
+          return (
+            <ul className="space-y-1 text-[11px]">
+              {(chs || []).map((c: any, idx: number) => (
+                <li key={`ch-${idx}`} className="flex items-center justify-between gap-2 bg-slate-50 rounded px-2 py-1">
+                  <span className="font-mono text-slate-700 truncate">
+                    {c.device_id}/{c.interface}: {c.from_freq || 'auto'} → <b>{c.to_freq} MHz</b>
+                    {c.fix_width ? ` (${c.fix_width})` : ''}
+                  </span>
+                  {c.relief_pct != null && c.relief_pct !== 0 && (
+                    <span className={`font-bold shrink-0 ${c.relief_pct > 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
+                      {c.relief_pct > 0 ? `-${c.relief_pct}%` : `+${Math.abs(c.relief_pct)}%`}
+                    </span>
+                  )}
+                </li>
+              ))}
+              {(tpcs || []).map((t: any, idx: number) => (
+                <li key={`tp-${idx}`} className="flex items-center justify-between gap-2 bg-slate-50 rounded px-2 py-1">
+                  <span className="font-mono text-slate-700 truncate">
+                    {t.device_id}/{t.interface}: TX {t.from_dbm ?? '?'} → <b>{t.to_dbm} dBm</b>
+                  </span>
+                  <span className="text-[10px] text-slate-500 shrink-0">TPC</span>
+                </li>
+              ))}
+            </ul>
+          );
+        };
+
+        return (
+          <div className="mt-3 rounded-xl border border-slate-200 bg-white overflow-hidden">
+            <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[12px] font-bold text-slate-800">
+                Compare Engine: <span className="font-mono">rrm_engine.py</span> vs OmniRoute AI
+              </div>
+              <span
+                className={`text-[10.5px] font-bold px-2 py-0.5 rounded-full border ${
+                  mathRejected
+                    ? 'bg-rose-50 text-rose-700 border-rose-200'
+                    : rrmWon
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                }`}
+              >
+                {mathRejected
+                  ? 'OmniRoute Ditolak (Interferensi Lebih Buruk) → Pakai rrm_engine.py'
+                  : rrmWon
+                  ? 'Dipakai: rrm_engine.py'
+                  : `Dipakai: ${omniSide.engine || 'OmniRoute AI'}`}
+              </span>
+            </div>
+
+            {cmp.verdict && (
+              <div
+                className={`px-3 py-1.5 text-[11px] border-b ${
+                  mathRejected
+                    ? 'bg-rose-50/70 text-rose-800 border-rose-100'
+                    : 'bg-slate-50/50 text-slate-600 border-slate-100'
+                }`}
+              >
+                {cmp.verdict}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-slate-200">
+              {/* Left: rrm_engine.py */}
+              <div className={`p-3 space-y-2 ${rrmWon ? 'bg-emerald-50/20' : ''}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[12px] font-bold text-slate-800">rrm_engine.py (Matematis)</div>
+                  {rrmWon && (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">
+                      Terpilih
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                    <div className="text-[10px] text-slate-400">Interferensi (mW)</div>
+                    <div className="font-mono font-bold text-slate-800">
+                      {fmtMw(rrmSide.cost_before_mw)} → {fmtMw(rrmSide.cost_after_mw)}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                    <div className="text-[10px] text-slate-400">Gain Interferensi</div>
+                    <div className={`font-mono font-bold ${(rrmSide.gain_pct ?? 0) > 0 ? 'text-emerald-700' : 'text-slate-700'}`}>
+                      {rrmSide.gain_pct ?? 0}%
+                    </div>
+                  </div>
+                </div>
+                {renderChanges(rrmSide.channel_changes, rrmSide.txpower_changes)}
+              </div>
+
+              {/* Right: OmniRoute AI */}
+              <div className={`p-3 space-y-2 ${!rrmWon ? 'bg-indigo-50/20' : mathRejected ? 'bg-rose-50/20' : ''}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[12px] font-bold text-slate-800 truncate">
+                    {omniSide.engine || 'OmniRoute AI'}
+                  </div>
+                  {!rrmWon ? (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 shrink-0">
+                      Terpilih
+                    </span>
+                  ) : mathRejected ? (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 shrink-0">
+                      Ditolak Validasi
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 shrink-0">
+                      Fallback
+                    </span>
+                  )}
+                </div>
+
+                {omniSide.available ? (
+                  <>
+                    <div className="grid grid-cols-2 gap-2 text-[11px]">
+                      <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                        <div className="text-[10px] text-slate-400">Interferensi (mW)</div>
+                        <div className="font-mono font-bold text-slate-800">
+                          {fmtMw(omniSide.cost_before_mw)} → {fmtMw(omniSide.cost_after_mw)}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
+                        <div className="text-[10px] text-slate-400">Gain Interferensi</div>
+                        <div
+                          className={`font-mono font-bold ${
+                            (omniSide.gain_pct ?? 0) > 0
+                              ? 'text-emerald-700'
+                              : (omniSide.gain_pct ?? 0) < 0
+                              ? 'text-rose-600'
+                              : 'text-slate-700'
+                          }`}
+                        >
+                          {omniSide.gain_pct ?? 0}%
+                        </div>
+                      </div>
+                    </div>
+                    {renderChanges(omniSide.channel_changes, omniSide.txpower_changes)}
+                    {omniSide.rationale && (
+                      <div className="text-[11px] text-slate-600 bg-slate-50 rounded px-2 py-1.5 leading-relaxed">
+                        <span className="font-semibold text-slate-700">Alasan AI: </span>
+                        {omniSide.rationale}
+                      </div>
+                    )}
+                    {omniSide.rejected?.length > 0 && (
+                      <div className="text-[10.5px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                        Ditolak filter legalitas: {omniSide.rejected.join('; ')}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-2">
+                    <span className="font-semibold text-slate-700">Tidak tersedia: </span>
+                    {omniSide.error || 'OmniRoute tidak aktif'}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {job?.status === 'done' && s && (
         <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50/60 px-3 py-2.5">
           <div className="text-[12px] font-bold text-emerald-800">
@@ -749,7 +1308,6 @@ export const OptimizeWizard: React.FC<{
             {([
               ['omni', 'Gunakan OmniRoute AI', useOmniroute, setUseOmniroute],
               ['dry', 'Dry-run (jangan kirim)', dryRun, setDryRun],
-              ['ai', 'Sekalian perbaikan AI', aiPush, setAiPush],
               ['ch', 'Atur channel', cfg?.apply_channel ?? true, (v: boolean) => saveCfg({ apply_channel: v })],
               ['tp', 'Atur tx-power', cfg?.apply_txpower ?? false, (v: boolean) => saveCfg({ apply_txpower: v })],
               [

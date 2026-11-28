@@ -40,6 +40,7 @@ import {
 import { api } from '../../api/client';
 import { ConfirmModal } from '../ConfirmModal';
 import { AlertModal } from '../AlertModal';
+import { ActionProgressModal, useActionProgress } from '../ActionProgressModal';
 
 interface TabWirelessProps {
   deviceId?: string;
@@ -118,6 +119,7 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
   const [editSecModeVal, setEditSecModeVal] = useState('dynamic-keys');
   const [editSecAuthVal, setEditSecAuthVal] = useState('wpa2-psk');
   const [isUpdatingSec, setIsUpdatingSec] = useState(false);
+  const { progress: actionProgress, runAction, closeProgress } = useActionProgress();
 
   // Modern Confirmation & Alert Modal States
   const [confirmModal, setConfirmModal] = useState<{
@@ -220,13 +222,23 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
       confirmText: 'Ya, Hapus Virtual AP',
       onConfirm: async () => {
         setConfirmModal((prev) => ({ ...prev, isOpen: false }));
-        try {
-          await api.deleteWirelessInterface(deviceId, iface.id, iface.name);
+        const res = await runAction(
+          {
+            loadingTitle: 'Menghapus Virtual AP...',
+            loadingMessage: `Menghapus "${iface.name}" (SSID: ${iface.ssid || '-'}) dari MikroTik...`,
+            successTitle: 'Virtual AP Dihapus!',
+            errorTitle: 'Gagal Menghapus Virtual AP',
+          },
+          async () => {
+            await api.deleteWirelessInterface(deviceId, iface.id, iface.name);
+            await loadInterfaces();
+            if (onRefresh) onRefresh();
+          }
+        );
+        if (res.ok) {
           showFeedback('ok', `Virtual AP ${iface.name} berhasil dihapus`);
-          loadInterfaces();
-          if (onRefresh) onRefresh();
-        } catch (err: any) {
-          showFeedback('err', `Gagal menghapus SSID: ${err.message}`);
+        } else {
+          showFeedback('err', `Gagal menghapus SSID: ${res.error}`);
         }
       },
     });
@@ -366,31 +378,44 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
 
     setIsSubmitting(true);
     try {
-      await api.addWirelessInterface({
-        device: deviceId,
-        master_interface: masterIface,
-        name: customName.trim() || undefined,
-        ssid: ssidName.trim(),
-        security_mode: secMode,
-        password: secMode === 'password' ? secPassword : undefined,
-        security_profile: secMode === 'existing' ? selectedProfile : undefined,
-        vlan_mode: vlanMode,
-        vlan_id: vlanMode === 'use-tag' ? vlanId : undefined,
-        add_bridge: addBridge,
-        bridge_name: 'bridge1',
-        hide_ssid: hideSsid,
-      });
+      const targetSsid = ssidName.trim();
+      const res = await runAction(
+        {
+          loadingTitle: 'Menambahkan Virtual AP / SSID...',
+          loadingMessage: `Membuat SSID "${targetSsid}" pada interface ${masterIface} di MikroTik...`,
+          successTitle: 'SSID Berhasil Ditambahkan!',
+          errorTitle: 'Gagal Membuat SSID',
+        },
+        async () => {
+          await api.addWirelessInterface({
+            device: deviceId,
+            master_interface: masterIface,
+            name: customName.trim() || undefined,
+            ssid: targetSsid,
+            security_mode: secMode,
+            password: secMode === 'password' ? secPassword : undefined,
+            security_profile: secMode === 'existing' ? selectedProfile : undefined,
+            vlan_mode: vlanMode,
+            vlan_id: vlanMode === 'use-tag' ? vlanId : undefined,
+            add_bridge: addBridge,
+            bridge_name: 'bridge1',
+            hide_ssid: hideSsid,
+          });
+          await loadInterfaces();
+          await loadSecProfiles();
+          if (onRefresh) onRefresh();
+        }
+      );
 
-      showFeedback('ok', `Virtual AP SSID "${ssidName}" berhasil ditambahkan ke MikroTik!`);
-      setShowAddModal(false);
-      setSsidName('');
-      setSecPassword('');
-      setCustomName('');
-      loadInterfaces();
-      loadSecProfiles();
-      if (onRefresh) onRefresh();
-    } catch (err: any) {
-      showFeedback('err', `Gagal membuat SSID: ${err.message}`);
+      if (res.ok) {
+        showFeedback('ok', `Virtual AP SSID "${targetSsid}" berhasil ditambahkan ke MikroTik!`);
+        setShowAddModal(false);
+        setSsidName('');
+        setSecPassword('');
+        setCustomName('');
+      } else {
+        showFeedback('err', `Gagal membuat SSID: ${res.error}`);
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -406,15 +431,28 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
     }
     setIsSavingSec(true);
     try {
-      await api.addSecurityProfile(deviceId, newSecName.trim(), newSecKey, newSecMode, newSecAuth);
-      showFeedback('ok', `Security Profile "${newSecName.trim()}" berhasil dibuat`);
-      setShowAddSecModal(false);
-      setNewSecName('');
-      setNewSecKey('');
-      loadSecProfiles();
-      loadInterfaces();
-    } catch (err: any) {
-      showFeedback('err', `Gagal membuat security profile: ${err.message}`);
+      const profName = newSecName.trim();
+      const res = await runAction(
+        {
+          loadingTitle: 'Menambahkan Security Profile...',
+          loadingMessage: `Membuat profil keamanan "${profName}" di MikroTik...`,
+          successTitle: 'Security Profile Dibuat!',
+          errorTitle: 'Gagal Membuat Security Profile',
+        },
+        async () => {
+          await api.addSecurityProfile(deviceId, profName, newSecKey, newSecMode, newSecAuth);
+          await loadSecProfiles();
+          await loadInterfaces();
+        }
+      );
+      if (res.ok) {
+        showFeedback('ok', `Security Profile "${profName}" berhasil dibuat`);
+        setShowAddSecModal(false);
+        setNewSecName('');
+        setNewSecKey('');
+      } else {
+        showFeedback('err', `Gagal membuat security profile: ${res.error}`);
+      }
     } finally {
       setIsSavingSec(false);
     }
@@ -464,13 +502,23 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
       confirmText: 'Ya, Hapus Profil',
       onConfirm: async () => {
         setConfirmModal((prev) => ({ ...prev, isOpen: false }));
-        try {
-          await api.deleteSecurityProfile(deviceId, prof.id, prof.name);
+        const res = await runAction(
+          {
+            loadingTitle: 'Menghapus Security Profile...',
+            loadingMessage: `Menghapus profil "${prof.name}" dari MikroTik...`,
+            successTitle: 'Security Profile Dihapus!',
+            errorTitle: 'Gagal Menghapus Security Profile',
+          },
+          async () => {
+            await api.deleteSecurityProfile(deviceId, prof.id, prof.name);
+            await loadSecProfiles();
+            await loadInterfaces();
+          }
+        );
+        if (res.ok) {
           showFeedback('ok', `Security Profile "${prof.name}" berhasil dihapus`);
-          loadSecProfiles();
-          loadInterfaces();
-        } catch (err: any) {
-          showFeedback('err', `Gagal menghapus security profile: ${err.message}`);
+        } else {
+          showFeedback('err', `Gagal menghapus security profile: ${res.error}`);
         }
       },
     });
@@ -1938,6 +1986,9 @@ export const TabWireless: React.FC<TabWirelessProps> = ({
         mac={selectedMacForTrail}
         onClose={() => setSelectedMacForTrail(null)}
       />
+
+      {/* Non-closable Blocking Loading / Error Modal */}
+      <ActionProgressModal state={actionProgress} onClose={closeProgress} />
     </div>
   );
 };

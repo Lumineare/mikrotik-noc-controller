@@ -10,6 +10,7 @@ import { BatchScriptModal } from './components/BatchScriptModal';
 import { LoginPage } from './components/LoginPage';
 import { ConfirmModal } from './components/ConfirmModal';
 import { AlertModal } from './components/AlertModal';
+import { ActionProgressModal, useActionProgress } from './components/ActionProgressModal';
 import { FloorMapView } from './components/map/FloorMapView';
 import { ClientLocatorView } from './components/locator/ClientLocatorView';
 import { TelegramSettingsModal } from './components/TelegramSettingsModal';
@@ -60,6 +61,7 @@ export default function App() {
     isOpen: false,
     title: '',
   });
+  const { progress: actionProgress, runAction, closeProgress } = useActionProgress();
 
   // Fleet summary stats
   const [fleetSummary, setFleetSummary] = useState({
@@ -220,13 +222,30 @@ export default function App() {
   };
 
   const handleSaveDevice = async (data: DeviceCreate) => {
-    if (data.id) {
-      await api.updateDevice(data.id, data);
-    } else {
-      await api.createDevice(data);
+    const isEdit = Boolean(data.id);
+    const label = data.name?.trim() || data.host;
+    const res = await runAction(
+      {
+        loadingTitle: isEdit ? 'Memperbarui Router...' : 'Menambahkan Router...',
+        loadingMessage: isEdit
+          ? `Menyimpan perubahan perangkat "${label}" dan menyegarkan armada...`
+          : `Mendaftarkan router "${label}" (${data.host}) dan mengecek status armada...`,
+        successTitle: isEdit ? 'Router Diperbarui!' : 'Router Berhasil Ditambahkan!',
+        errorTitle: isEdit ? 'Gagal Memperbarui Router' : 'Gagal Menambahkan Router',
+      },
+      async () => {
+        if (data.id) {
+          await api.updateDevice(data.id, data);
+        } else {
+          await api.createDevice(data);
+        }
+        await loadDevices();
+        await loadFleet();
+      }
+    );
+    if (!res.ok) {
+      throw new Error(res.error || 'Gagal menyimpan perangkat');
     }
-    await loadDevices();
-    await loadFleet();
   };
 
   const handleDeleteDevice = (id: string, name: string) => {
@@ -238,27 +257,28 @@ export default function App() {
       confirmText: 'Ya, Hapus Router',
       onConfirm: async () => {
         setConfirmModal((prev) => ({ ...prev, isOpen: false }));
-        try {
-          await api.deleteDevice(id);
-          await loadDevices();
-          await loadFleet();
-          if (activeDeviceId === id) {
-            const remaining = devices.filter((d) => d.id !== id);
-            if (remaining.length > 0) {
-              setActiveDeviceId(remaining[0].id);
-            } else {
-              setActiveDeviceId('');
-              setActiveView('fleet');
+        await runAction(
+          {
+            loadingTitle: 'Menghapus Router...',
+            loadingMessage: `Menghapus "${name}" (${id}) dari daftar controller dan menyegarkan armada...`,
+            successTitle: 'Router Berhasil Dihapus!',
+            errorTitle: 'Gagal Menghapus Router',
+          },
+          async () => {
+            await api.deleteDevice(id);
+            await loadDevices();
+            await loadFleet();
+            if (activeDeviceId === id) {
+              const remaining = devices.filter((d) => d.id !== id);
+              if (remaining.length > 0) {
+                setActiveDeviceId(remaining[0].id);
+              } else {
+                setActiveDeviceId('');
+                setActiveView('fleet');
+              }
             }
           }
-        } catch (err: any) {
-          setAlertModal({
-            isOpen: true,
-            title: 'Gagal Menghapus Router',
-            message: err.message,
-            type: 'error',
-          });
-        }
+        );
       },
     });
   };
@@ -480,6 +500,9 @@ export default function App() {
         details={alertModal.details}
         onClose={() => setAlertModal((prev) => ({ ...prev, isOpen: false }))}
       />
+
+      {/* Non-closable Blocking Loading / Error Modal for Add & Delete */}
+      <ActionProgressModal state={actionProgress} onClose={closeProgress} />
     </div>
   );
 }

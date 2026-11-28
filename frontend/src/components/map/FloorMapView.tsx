@@ -28,6 +28,7 @@ import { ApMarker } from './ApMarker';
 import { ChannelAnalyzerDrawer } from './ChannelAnalyzerDrawer';
 import { RfScanDrawer } from './RfScanDrawer';
 import { ApClientsModal } from './ApClientsModal';
+import { ActionProgressModal, useActionProgress } from '../ActionProgressModal';
 
 interface FloorMapViewProps {
   onSelectDevice?: (deviceId: string) => void;
@@ -41,6 +42,7 @@ export const FloorMapView: React.FC<FloorMapViewProps> = ({ onSelectDevice }) =>
   const [loading, setLoading] = useState(true);
   const [heatmapMode, setHeatmapMode] = useState<'none' | '2.4ghz' | '5ghz' | 'density'>('2.4ghz');
   const [selectedClientsAp, setSelectedClientsAp] = useState<ApPlacement | null>(null);
+  const { progress: actionProgress, runAction, closeProgress } = useActionProgress();
 
   // Zoom & Pan
   const [zoom, setZoom] = useState(1);
@@ -166,12 +168,22 @@ export const FloorMapView: React.FC<FloorMapViewProps> = ({ onSelectDevice }) =>
 
   // Remove placement
   const handleRemovePlacement = async (deviceId: string) => {
-    setPlacements((prev) => prev.filter((p) => p.device_id !== deviceId));
-    try {
-      await api.removeDevicePlacement(deviceId);
-      fetchAnalysis();
-    } catch (err) {
-      console.error('Failed to remove placement:', err);
+    const prevPlacements = placements;
+    const res = await runAction(
+      {
+        loadingTitle: 'Menghapus Pin AP...',
+        loadingMessage: 'Melepas perangkat AP dari denah lantai...',
+        successTitle: 'Pin AP Dihapus!',
+        errorTitle: 'Gagal Menghapus Pin AP',
+      },
+      async () => {
+        await api.removeDevicePlacement(deviceId);
+        setPlacements((prev) => prev.filter((p) => p.device_id !== deviceId));
+        fetchAnalysis();
+      }
+    );
+    if (!res.ok) {
+      setPlacements(prevPlacements);
     }
   };
 
@@ -439,25 +451,38 @@ export const FloorMapView: React.FC<FloorMapViewProps> = ({ onSelectDevice }) =>
     if (!newFloorName.trim()) return;
     setUploading(true);
     try {
-      let imageUrl = '/uploads/floor_1_blueprint.svg';
-      if (newFloorFile) {
-        const uploadRes = await api.uploadFloorBlueprint(newFloorFile);
-        imageUrl = uploadRes.image_url;
+      const floorTitle = newFloorName.trim();
+      const res = await runAction(
+        {
+          loadingTitle: 'Menambahkan Denah Lantai...',
+          loadingMessage: newFloorFile
+            ? `Mengunggah blueprint dan membuat denah "${floorTitle}"...`
+            : `Membuat denah lantai "${floorTitle}"...`,
+          successTitle: 'Denah Berhasil Ditambahkan!',
+          errorTitle: 'Gagal Menambahkan Denah',
+        },
+        async () => {
+          let imageUrl = '/uploads/floor_1_blueprint.svg';
+          if (newFloorFile) {
+            const uploadRes = await api.uploadFloorBlueprint(newFloorFile);
+            imageUrl = uploadRes.image_url;
+          }
+          const created = await api.createFloor({
+            name: floorTitle,
+            building: newFloorBuilding.trim(),
+            image_url: imageUrl,
+            width_meters: Number(newFloorWidth) || 60,
+            height_meters: Number(newFloorHeight) || 40,
+          });
+          setFloors((prev) => [...prev, created.floor]);
+          setSelectedFloorId(created.floor.id);
+        }
+      );
+      if (res.ok) {
+        setShowAddFloorModal(false);
+        setNewFloorName('');
+        setNewFloorFile(null);
       }
-      const res = await api.createFloor({
-        name: newFloorName.trim(),
-        building: newFloorBuilding.trim(),
-        image_url: imageUrl,
-        width_meters: Number(newFloorWidth) || 60,
-        height_meters: Number(newFloorHeight) || 40,
-      });
-      setFloors((prev) => [...prev, res.floor]);
-      setSelectedFloorId(res.floor.id);
-      setShowAddFloorModal(false);
-      setNewFloorName('');
-      setNewFloorFile(null);
-    } catch (err) {
-      alert('Gagal menambah lantai: ' + err);
     } finally {
       setUploading(false);
     }
@@ -475,20 +500,26 @@ export const FloorMapView: React.FC<FloorMapViewProps> = ({ onSelectDevice }) =>
     if (!window.confirm(msg)) {
       return;
     }
-    try {
-      const res = await api.deleteFloor(floorId);
-      if (res.floors && res.floors.length > 0) {
-        setFloors(res.floors);
-        setSelectedFloorId(res.floors[0].id);
-      } else {
-        const remaining = floors.filter((f) => f.id !== floorId);
-        setFloors(remaining);
-        if (remaining.length > 0) setSelectedFloorId(remaining[0].id);
+    await runAction(
+      {
+        loadingTitle: 'Menghapus Denah Lantai...',
+        loadingMessage: `Menghapus denah "${target.name}" dan memperbarui penempatan AP...`,
+        successTitle: 'Denah Berhasil Dihapus!',
+        errorTitle: 'Gagal Menghapus Denah',
+      },
+      async () => {
+        const res = await api.deleteFloor(floorId);
+        if (res.floors && res.floors.length > 0) {
+          setFloors(res.floors);
+          setSelectedFloorId(res.floors[0].id);
+        } else {
+          const remaining = floors.filter((f) => f.id !== floorId);
+          setFloors(remaining);
+          if (remaining.length > 0) setSelectedFloorId(remaining[0].id);
+        }
+        setPlacements((prev) => prev.filter((p) => p.floor_id !== floorId));
       }
-      setPlacements((prev) => prev.filter((p) => p.floor_id !== floorId));
-    } catch (err) {
-      alert('Gagal menghapus denah: ' + err);
-    }
+    );
   };
 
   // Remove / Clear floor blueprint image
@@ -499,12 +530,22 @@ export const FloorMapView: React.FC<FloorMapViewProps> = ({ onSelectDevice }) =>
     }
     setUploading(true);
     try {
-      await api.removeFloorImage(currentFloor.id);
-      const updated = floors.map((f) => (f.id === currentFloor.id ? { ...f, image_url: '' } : f));
-      setFloors(updated);
-      setShowUploadModal(false);
-    } catch (err) {
-      alert('Gagal menghapus gambar denah: ' + err);
+      const res = await runAction(
+        {
+          loadingTitle: 'Menghapus Gambar Denah...',
+          loadingMessage: `Menghapus gambar blueprint dari "${currentFloor.name}"...`,
+          successTitle: 'Gambar Denah Dihapus!',
+          errorTitle: 'Gagal Menghapus Gambar Denah',
+        },
+        async () => {
+          await api.removeFloorImage(currentFloor.id);
+          const updated = floors.map((f) => (f.id === currentFloor.id ? { ...f, image_url: '' } : f));
+          setFloors(updated);
+        }
+      );
+      if (res.ok) {
+        setShowUploadModal(false);
+      }
     } finally {
       setUploading(false);
     }
@@ -1099,6 +1140,9 @@ export const FloorMapView: React.FC<FloorMapViewProps> = ({ onSelectDevice }) =>
         onClose={() => setSelectedClientsAp(null)}
         placement={selectedClientsAp}
       />
+
+      {/* Non-closable Blocking Loading / Error Modal */}
+      <ActionProgressModal state={actionProgress} onClose={closeProgress} />
     </div>
   );
 };

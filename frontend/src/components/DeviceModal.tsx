@@ -124,8 +124,9 @@ export const DeviceModal: React.FC<DeviceModalProps> = ({
             <span>{editDevice ? 'Edit Perangkat MikroTik' : 'Tambah Router MikroTik Baru'}</span>
           </div>
           <button
-            onClick={onClose}
-            className="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg transition-colors cursor-pointer"
+            onClick={() => !saving && onClose()}
+            disabled={saving}
+            className="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <X className="w-4 h-4" />
           </button>
@@ -273,8 +274,9 @@ export const DeviceModal: React.FC<DeviceModalProps> = ({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={onClose}
-                className="px-4 py-2 text-slate-600 hover:text-slate-900 transition-colors font-medium cursor-pointer font-sans"
+                onClick={() => !saving && onClose()}
+                disabled={saving}
+                className="px-4 py-2 text-slate-600 hover:text-slate-900 transition-colors font-medium cursor-pointer font-sans disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Batal
               </button>

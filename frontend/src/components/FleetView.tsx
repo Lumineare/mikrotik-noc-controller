@@ -20,12 +20,14 @@ import {
   Edit2,
   Trash2,
   Users,
+  Ruler,
 } from 'lucide-react';
 import { FleetDevice, Device } from '../types';
 import { DeviceCard } from './DeviceCard';
 import { WifiDiagnostics } from './WifiDiagnostics';
 import { OptimizeWizard } from './tabs/OptimizeWizard';
 import { FleetWifiSyncModal } from './FleetWifiSyncModal';
+import { FleetRfDistanceModal } from './FleetRfDistanceModal';
 
 interface FleetViewProps {
   fleet: FleetDevice[];
@@ -56,6 +58,7 @@ export const FleetView: React.FC<FleetViewProps> = ({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showOptimizeModal, setShowOptimizeModal] = useState(false);
   const [showWifiSyncModal, setShowWifiSyncModal] = useState(false);
+  const [showRfDistanceModal, setShowRfDistanceModal] = useState(false);
   const [viewMode, setViewMode] = useState<'grid' | 'table'>(() => {
     try {
       return localStorage.getItem('rsam_fleet_view_mode') === 'table' ? 'table' : 'grid';
@@ -182,178 +185,238 @@ export const FleetView: React.FC<FleetViewProps> = ({
     [fleet]
   );
 
+  const onlineCount = useMemo(() => fleet.filter((d) => d.online).length, [fleet]);
+  const offlineCount = useMemo(() => fleet.filter((d) => !d.online).length, [fleet]);
+  const highCpuCount = useMemo(
+    () => fleet.filter((d) => d.online && (d.cpu_load || 0) >= 70).length,
+    [fleet]
+  );
+
   return (
-    <div className="space-y-4 pb-24">
-      {/* Top Banner KPI */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        <div className="bg-white border border-slate-200/90 rounded-2xl p-4 flex items-center gap-3.5 shadow-sm">
-          <div className="w-11 h-11 rounded-xl bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600 shrink-0">
-            <Layers className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="text-[11px] font-mono text-slate-500 uppercase font-semibold">Total Perangkat</div>
-            <div className="text-xl font-bold font-mono text-slate-900">{fleet.length} Unit</div>
-          </div>
-        </div>
-
-        <div className="bg-white border border-slate-200/90 rounded-2xl p-4 flex items-center gap-3.5 shadow-sm">
-          <div className="w-11 h-11 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-600 shrink-0">
-            <Server className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="text-[11px] font-mono text-slate-500 uppercase font-semibold">Online</div>
-            <div className="text-xl font-bold font-mono text-emerald-600">
-              {fleet.filter((d) => d.online).length}
+    <div className="space-y-5 pb-24">
+      {/* Unified Architectural Telemetry Strip (1 hairline bar, zero orphan cells on mobile) */}
+      <section
+        aria-label="Ringkasan telemetri armada"
+        className="bg-white border border-slate-200 rounded-lg overflow-hidden"
+      >
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 divide-y sm:divide-y-0 divide-x divide-slate-200">
+          <div className="px-4 py-3.5 flex items-center justify-between gap-3">
+            <div>
+              <div className="text-[10.5px] font-mono text-slate-500 uppercase font-semibold tracking-wide">
+                Total Perangkat
+              </div>
+              <div className="text-xl font-bold font-mono text-slate-900 tabular-nums mt-0.5">
+                {fleet.length} <span className="text-xs font-medium text-slate-500">Unit</span>
+              </div>
             </div>
+            <Layers className="w-4 h-4 text-slate-400 shrink-0" aria-hidden="true" />
           </div>
-        </div>
 
-        <div className="bg-white border border-slate-200/90 rounded-2xl p-4 flex items-center gap-3.5 shadow-sm">
-          <div className="w-11 h-11 rounded-xl bg-indigo-50 border border-indigo-200 flex items-center justify-center text-indigo-600 shrink-0">
-            <Users className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="text-[11px] font-mono text-slate-500 uppercase font-semibold">Klien Wi-Fi Live</div>
-            <div className="text-xl font-bold font-mono text-indigo-700">{totalLiveClients}</div>
-          </div>
-        </div>
-
-        <div className="bg-white border border-slate-200/90 rounded-2xl p-4 flex items-center gap-3.5 shadow-sm">
-          <div className="w-11 h-11 rounded-xl bg-rose-50 border border-rose-200 flex items-center justify-center text-rose-600 shrink-0">
-            <AlertTriangle className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="text-[11px] font-mono text-slate-500 uppercase font-semibold">Offline / Error</div>
-            <div className="text-xl font-bold font-mono text-rose-600">
-              {fleet.filter((d) => !d.online).length}
+          <div className="px-4 py-3.5 flex items-center justify-between gap-3">
+            <div>
+              <div className="text-[10.5px] font-mono text-slate-500 uppercase font-semibold tracking-wide">
+                Online
+              </div>
+              <div className="text-xl font-bold font-mono text-emerald-700 tabular-nums mt-0.5">
+                {onlineCount}
+              </div>
             </div>
+            <Server className="w-4 h-4 text-emerald-600 shrink-0" aria-hidden="true" />
           </div>
-        </div>
 
-        <div className="bg-white border border-slate-200/90 rounded-2xl p-4 flex items-center gap-3.5 shadow-sm">
-          <div className="w-11 h-11 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-center text-amber-600 shrink-0">
-            <Cpu className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="text-[11px] font-mono text-slate-500 uppercase font-semibold">High Load (&gt;70%)</div>
-            <div className="text-xl font-bold font-mono text-amber-600">
-              {fleet.filter((d) => d.online && (d.cpu_load || 0) >= 70).length} Unit
+          <div className="px-4 py-3.5 flex items-center justify-between gap-3">
+            <div>
+              <div className="text-[10.5px] font-mono text-slate-500 uppercase font-semibold tracking-wide">
+                Klien Wi-Fi Live
+              </div>
+              <div className="text-xl font-bold font-mono text-blue-700 tabular-nums mt-0.5">
+                {totalLiveClients}
+              </div>
             </div>
+            <Users className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
+          </div>
+
+          <div
+            className={`px-4 py-3.5 flex items-center justify-between gap-3 ${
+              offlineCount > 0 ? 'bg-rose-50/40' : ''
+            }`}
+          >
+            <div>
+              <div className="text-[10.5px] font-mono text-slate-500 uppercase font-semibold tracking-wide">
+                Offline / Error
+              </div>
+              <div
+                className={`text-xl font-bold font-mono tabular-nums mt-0.5 ${
+                  offlineCount > 0 ? 'text-rose-700' : 'text-slate-400'
+                }`}
+              >
+                {offlineCount}
+              </div>
+            </div>
+            <AlertTriangle
+              className={`w-4 h-4 shrink-0 ${offlineCount > 0 ? 'text-rose-600' : 'text-slate-300'}`}
+              aria-hidden="true"
+            />
+          </div>
+
+          <div
+            className={`col-span-2 sm:col-span-1 px-4 py-3.5 flex items-center justify-between gap-3 ${
+              highCpuCount > 0 ? 'bg-amber-50/40' : ''
+            }`}
+          >
+            <div>
+              <div className="text-[10.5px] font-mono text-slate-500 uppercase font-semibold tracking-wide">
+                High Load (&gt;70%)
+              </div>
+              <div
+                className={`text-xl font-bold font-mono tabular-nums mt-0.5 ${
+                  highCpuCount > 0 ? 'text-amber-700' : 'text-slate-700'
+                }`}
+              >
+                {highCpuCount} <span className="text-xs font-medium text-slate-500">Unit</span>
+              </div>
+            </div>
+            <Cpu
+              className={`w-4 h-4 shrink-0 ${highCpuCount > 0 ? 'text-amber-600' : 'text-slate-400'}`}
+              aria-hidden="true"
+            />
           </div>
         </div>
-      </div>
+      </section>
 
       <WifiDiagnostics fleet />
 
-      {/* Filter & Search Bar */}
-      <div className="bg-white border border-slate-200/90 rounded-2xl p-4 space-y-3 shadow-sm">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+      {/* Unified Fleet Directory Shell: Toolbar + Location Strip + Grid/Table */}
+      <section
+        aria-label="Direktori perangkat armada"
+        className="bg-white border border-slate-200 rounded-lg overflow-hidden"
+      >
+        {/* Top Filter & Action Toolbar */}
+        <div className="px-4 py-3 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
           {/* Search Input */}
           <div className="relative flex-1 max-w-md">
-            <Search className="absolute left-3.5 top-3 w-4 h-4 text-slate-400" />
+            <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" aria-hidden="true" />
             <input
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
+              aria-label="Filter perangkat armada"
               placeholder="Filter nama, IP host, ruangan, atau model board..."
-              className="w-full bg-slate-50 border border-slate-300 rounded-xl pl-10 pr-3.5 py-2 text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:bg-white focus:border-blue-600 focus:ring-2 focus:ring-blue-500/20 font-mono transition-all"
+              className="w-full bg-slate-50 border border-slate-300 rounded-md pl-9 pr-3 py-1.5 text-xs text-slate-900 placeholder-slate-400 focus:bg-white focus:border-blue-600 font-mono transition-colors"
             />
           </div>
 
           {/* Status Tabs */}
-          <div className="flex items-center gap-1 bg-slate-100 p-1 border border-slate-200 rounded-xl text-xs font-mono">
+          <div className="flex items-center gap-0.5 bg-slate-100 p-0.5 border border-slate-200 rounded-md text-xs font-mono overflow-x-auto max-w-full">
             <button
+              type="button"
               onClick={() => setStatusFilter('ALL')}
-              className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
-                statusFilter === 'ALL' ? 'bg-white text-slate-900 font-bold shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              className={`px-2.5 py-1 rounded transition-colors shrink-0 ${
+                statusFilter === 'ALL' ? 'bg-white text-slate-900 font-bold border border-slate-200' : 'text-slate-600 hover:text-slate-900 border border-transparent'
               }`}
             >
               Semua ({fleet.length})
             </button>
             <button
+              type="button"
               onClick={() => setStatusFilter('ONLINE')}
-              className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
-                statusFilter === 'ONLINE' ? 'bg-emerald-50 text-emerald-700 font-bold border border-emerald-200 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              className={`px-2.5 py-1 rounded transition-colors shrink-0 ${
+                statusFilter === 'ONLINE' ? 'bg-emerald-50 text-emerald-700 font-bold border border-emerald-200' : 'text-slate-600 hover:text-slate-900 border border-transparent'
               }`}
             >
-              Online ({fleet.filter((d) => d.online).length})
+              Online ({onlineCount})
             </button>
             <button
+              type="button"
               onClick={() => setStatusFilter('WARNING')}
-              className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
-                statusFilter === 'WARNING' ? 'bg-amber-50 text-amber-700 font-bold border border-amber-200 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              className={`px-2.5 py-1 rounded transition-colors shrink-0 ${
+                statusFilter === 'WARNING' ? 'bg-amber-50 text-amber-700 font-bold border border-amber-200' : 'text-slate-600 hover:text-slate-900 border border-transparent'
               }`}
             >
-              High CPU ({fleet.filter((d) => d.online && (d.cpu_load || 0) >= 70).length})
+              High CPU ({highCpuCount})
             </button>
             <button
+              type="button"
               onClick={() => setStatusFilter('ZERO_CLIENTS')}
-              className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
-                statusFilter === 'ZERO_CLIENTS' ? 'bg-indigo-50 text-indigo-700 font-bold border border-indigo-200 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              className={`px-2.5 py-1 rounded transition-colors shrink-0 ${
+                statusFilter === 'ZERO_CLIENTS' ? 'bg-blue-50 text-blue-700 font-bold border border-blue-200' : 'text-slate-600 hover:text-slate-900 border border-transparent'
               }`}
               title="AP Online tetapi 0 klien Wi-Fi terhubung"
             >
               0 Klien ({zeroClientCount})
             </button>
             <button
+              type="button"
               onClick={() => setStatusFilter('OFFLINE')}
-              className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
-                statusFilter === 'OFFLINE' ? 'bg-rose-50 text-rose-700 font-bold border border-rose-200 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              className={`px-2.5 py-1 rounded transition-colors shrink-0 ${
+                statusFilter === 'OFFLINE' ? 'bg-rose-50 text-rose-700 font-bold border border-rose-200' : 'text-slate-600 hover:text-slate-900 border border-transparent'
               }`}
             >
-              Offline ({fleet.filter((d) => !d.online).length})
+              Offline ({offlineCount})
             </button>
           </div>
 
           {/* Action buttons */}
-          <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center gap-1.5 flex-wrap">
             <button
               type="button"
               onClick={() => setShowOptimizeModal(true)}
-              className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-mono font-semibold transition-colors cursor-pointer shadow-xs"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-xs font-mono font-semibold transition-colors"
               title="Buka AI Optimize (OmniRoute) untuk seluruh AP"
             >
-              <SlidersHorizontal className="w-3.5 h-3.5" />
+              <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
               <span>AI Optimize</span>
             </button>
 
             <button
               type="button"
               onClick={() => setShowWifiSyncModal(true)}
-              className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-mono font-semibold transition-colors cursor-pointer shadow-xs"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md text-xs font-mono font-semibold transition-colors"
               title="Sinkronisasi SSID & Ganti Password Wi-Fi Massal"
             >
-              <Wifi className="w-3.5 h-3.5" />
+              <Wifi className="w-3.5 h-3.5" aria-hidden="true" />
               <span>Wi-Fi Sync</span>
             </button>
 
             <button
-              onClick={onRefreshFleet}
-              className={`flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200/80 border border-slate-300 text-slate-700 rounded-xl text-xs font-mono font-medium transition-colors cursor-pointer shadow-xs ${
-                isRefreshing ? 'animate-pulse text-blue-600' : ''
-              }`}
-              title="Refresh status perangkat"
+              type="button"
+              onClick={() => setShowRfDistanceModal(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-900 text-white rounded-md text-xs font-mono font-semibold transition-colors"
+              title="Estimasi Jarak & Daftar Tetangga RF Antar-AP"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-blue-600' : ''}`} />
-              <span>Probe Perangkat</span>
+              <Ruler className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Jarak AP</span>
             </button>
 
             <button
-              onClick={handleSelectAllFiltered}
-              className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200/80 border border-slate-300 text-slate-700 rounded-xl text-xs font-mono font-medium transition-colors cursor-pointer shadow-xs"
+              type="button"
+              onClick={onRefreshFleet}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 rounded-md text-xs font-mono font-medium transition-colors ${
+                isRefreshing ? 'text-blue-600 border-blue-200' : ''
+              }`}
+              title="Refresh status perangkat"
             >
-              <CheckSquare className="w-3.5 h-3.5 text-blue-600" />
-              <span>Pilih Semua ({filtered.length})</span>
+              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-blue-600' : ''}`} aria-hidden="true" />
+              <span>Probe</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleSelectAllFiltered}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 rounded-md text-xs font-mono font-medium transition-colors"
+            >
+              <CheckSquare className="w-3.5 h-3.5 text-blue-600" aria-hidden="true" />
+              <span>Pilih ({filtered.length})</span>
             </button>
 
             {/* Sort selector */}
-            <div className="flex items-center gap-1 bg-slate-100 border border-slate-300 rounded-xl px-2 py-1.5 text-xs font-mono">
+            <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-md px-2 py-1.5 text-xs font-mono">
               <ArrowUpDown className="w-3.5 h-3.5 text-slate-500 shrink-0" aria-hidden="true" />
               <select
                 value={sortBy}
                 onChange={(e) => setSortBy(e.target.value as any)}
                 aria-label="Urutkan daftar AP"
-                className="bg-transparent text-xs text-slate-700 font-medium focus:outline-none cursor-pointer"
+                className="bg-transparent text-xs text-slate-700 font-medium"
               >
                 <option value="status">Bermasalah dulu</option>
                 <option value="clients_desc">Klien terbanyak</option>
@@ -365,14 +428,14 @@ export const FleetView: React.FC<FleetViewProps> = ({
             </div>
 
             {/* Grid / Table view switch */}
-            <div className="flex items-center p-0.5 bg-slate-100 border border-slate-300 rounded-xl">
+            <div className="flex items-center p-0.5 bg-slate-100 border border-slate-200 rounded-md">
               <button
                 type="button"
                 onClick={() => setViewMode('grid')}
                 aria-label="Tampilan kartu"
                 title="Tampilan Kartu"
-                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                  viewMode === 'grid' ? 'bg-white text-blue-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                className={`p-1.5 rounded transition-colors ${
+                  viewMode === 'grid' ? 'bg-white text-blue-600 border border-slate-200' : 'text-slate-500 hover:text-slate-800 border border-transparent'
                 }`}
               >
                 <LayoutGrid className="w-3.5 h-3.5" aria-hidden="true" />
@@ -382,8 +445,8 @@ export const FleetView: React.FC<FleetViewProps> = ({
                 onClick={() => setViewMode('table')}
                 aria-label="Tampilan tabel padat"
                 title="Tampilan Tabel Padat"
-                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                  viewMode === 'table' ? 'bg-white text-blue-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                className={`p-1.5 rounded transition-colors ${
+                  viewMode === 'table' ? 'bg-white text-blue-600 border border-slate-200' : 'text-slate-500 hover:text-slate-800 border border-transparent'
                 }`}
               >
                 <List className="w-3.5 h-3.5" aria-hidden="true" />
@@ -392,47 +455,47 @@ export const FleetView: React.FC<FleetViewProps> = ({
           </div>
         </div>
 
-        {/* Group / Location Pills */}
-        <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs font-mono border-t border-slate-100 pt-2.5">
-          <span className="text-slate-500 text-[11px] shrink-0 uppercase pr-1 font-semibold">Lokasi / Ruangan:</span>
+        {/* Group / Location Strip */}
+        <div className="px-4 py-2 bg-slate-50/70 border-b border-slate-200 flex items-center gap-1.5 overflow-x-auto text-xs font-mono">
+          <span className="text-slate-500 text-[10.5px] shrink-0 uppercase pr-1 font-semibold">Lokasi:</span>
           <button
+            type="button"
             onClick={() => setSelectedGroup('ALL')}
-            className={`px-3 py-1 rounded-full text-[11px] border shrink-0 transition-colors cursor-pointer ${
+            className={`px-2.5 py-0.5 rounded-md text-[11px] border shrink-0 transition-colors ${
               selectedGroup === 'ALL'
-                ? 'bg-blue-50 text-blue-700 border-blue-200 font-bold shadow-xs'
-                : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200/70 hover:text-slate-900'
+                ? 'bg-blue-50 text-blue-700 border-blue-200 font-bold'
+                : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300 hover:text-slate-900'
             }`}
           >
             Semua ({fleet.length})
           </button>
           {groups.map(([grp, count]) => (
             <button
+              type="button"
               key={grp}
               onClick={() => setSelectedGroup(grp)}
-              className={`px-3 py-1 rounded-full text-[11px] border shrink-0 transition-colors cursor-pointer ${
+              className={`px-2.5 py-0.5 rounded-md text-[11px] border shrink-0 transition-colors ${
                 selectedGroup === grp
-                  ? 'bg-blue-50 text-blue-700 border-blue-200 font-bold shadow-xs'
-                  : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200/70 hover:text-slate-900'
+                  ? 'bg-blue-50 text-blue-700 border-blue-200 font-bold'
+                  : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300 hover:text-slate-900'
               }`}
             >
               {grp} ({count})
             </button>
           ))}
         </div>
-      </div>
 
-      {/* Fleet Cards Grid or Compact Table */}
-      {filtered.length === 0 ? (
-        <div className="py-20 text-center bg-white border border-slate-200 rounded-2xl text-slate-500 text-sm shadow-sm">
-          Tidak ada router yang sesuai dengan kriteria filter.
-        </div>
-      ) : viewMode === 'table' ? (
-        <div className="bg-white border border-slate-200/90 rounded-2xl shadow-sm overflow-hidden">
+        {/* Fleet Cards Grid or Flush Compact Table */}
+        {filtered.length === 0 ? (
+          <div className="py-16 text-center text-slate-500 text-sm">
+            Tidak ada router yang sesuai dengan kriteria filter.
+          </div>
+        ) : viewMode === 'table' ? (
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs font-mono">
               <thead className="bg-slate-50 text-slate-500 text-[10px] uppercase border-b border-slate-200">
                 <tr>
-                  <th className="py-2.5 pl-3.5 pr-2 w-8">
+                  <th className="py-2.5 pl-4 pr-2 w-8">
                     <span className="sr-only">Pilih</span>
                   </th>
                   <th className="py-2.5 px-2">Status</th>
@@ -442,10 +505,10 @@ export const FleetView: React.FC<FleetViewProps> = ({
                   <th className="py-2.5 px-2 text-center">Klien</th>
                   <th className="py-2.5 px-2 w-32">CPU</th>
                   <th className="py-2.5 px-2">Uptime</th>
-                  <th className="py-2.5 pl-2 pr-3.5 text-right">Aksi</th>
+                  <th className="py-2.5 pl-2 pr-4 text-right">Aksi</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100">
+              <tbody className="divide-y divide-slate-200/80">
                 {filtered.map((d) => {
                   const isSel = selectedIds.has(d.id);
                   const cpu = d.cpu_load ?? 0;
@@ -465,18 +528,18 @@ export const FleetView: React.FC<FleetViewProps> = ({
                           : 'hover:bg-slate-50'
                       }`}
                     >
-                      <td className="py-2.5 pl-3.5 pr-2" onClick={(e) => e.stopPropagation()}>
+                      <td className="py-2.5 pl-4 pr-2" onClick={(e) => e.stopPropagation()}>
                         <input
                           type="checkbox"
                           checked={isSel}
                           onChange={() => handleToggleSelect(d.id)}
                           aria-label={`Pilih ${d.name}`}
-                          className="w-4 h-4 rounded border-slate-300 accent-blue-600 cursor-pointer"
+                          className="w-4 h-4 rounded border-slate-300 accent-blue-600"
                         />
                       </td>
                       <td className="py-2.5 px-2 whitespace-nowrap">
                         <span
-                          className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[10px] font-semibold border ${
+                          className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-semibold border ${
                             d.online
                               ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                               : 'bg-rose-50 text-rose-700 border-rose-200'
@@ -489,7 +552,16 @@ export const FleetView: React.FC<FleetViewProps> = ({
                         </span>
                       </td>
                       <td className="py-2.5 px-2 min-w-[200px]">
-                        <div className="font-bold text-slate-900 hover:text-blue-700">{d.name}</div>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onSelectDevice(d.id);
+                          }}
+                          className="font-bold text-slate-900 hover:text-blue-700 text-left block"
+                        >
+                          {d.name}
+                        </button>
                         <div className="text-[10.5px] text-slate-500">{d.host}</div>
                       </td>
                       <td className="py-2.5 px-2 whitespace-nowrap">
@@ -512,7 +584,7 @@ export const FleetView: React.FC<FleetViewProps> = ({
                           <span className="text-slate-400" title="Bukan interface Wi-Fi">-</span>
                         ) : (
                           <span
-                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold border ${
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-bold border tabular-nums ${
                               d.clients_count === 0
                                 ? 'bg-slate-50 text-slate-500 border-slate-200'
                                 : d.clients_count >= 35
@@ -538,16 +610,16 @@ export const FleetView: React.FC<FleetViewProps> = ({
                             <div className="flex-1 bg-slate-100 h-1.5 rounded-full overflow-hidden">
                               <div className={`h-full ${cpuBar}`} style={{ width: `${Math.min(100, Math.max(2, cpu))}%` }} />
                             </div>
-                            <span className={`text-[11px] font-bold w-8 text-right ${cpuTxt}`}>{cpu}%</span>
+                            <span className={`text-[11px] font-bold w-8 text-right tabular-nums ${cpuTxt}`}>{cpu}%</span>
                           </div>
                         ) : (
                           <span className="text-[10px] text-rose-600">offline</span>
                         )}
                       </td>
-                      <td className="py-2.5 px-2 whitespace-nowrap text-[11px] text-slate-600">
+                      <td className="py-2.5 px-2 whitespace-nowrap text-[11px] text-slate-600 tabular-nums">
                         {d.online ? d.uptime || '-' : '-'}
                       </td>
-                      <td className="py-2.5 pl-2 pr-3.5 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+                      <td className="py-2.5 pl-2 pr-4 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                         <div className="inline-flex items-center gap-1">
                           <button
                             type="button"
@@ -555,27 +627,27 @@ export const FleetView: React.FC<FleetViewProps> = ({
                             disabled={testingDeviceId === d.id}
                             aria-label={`Tes koneksi ${d.name}`}
                             title="Tes Koneksi"
-                            className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors cursor-pointer"
+                            className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors"
                           >
-                            <RefreshCw className={`w-3.5 h-3.5 ${testingDeviceId === d.id ? 'animate-spin text-blue-600' : ''}`} />
+                            <RefreshCw className={`w-3.5 h-3.5 ${testingDeviceId === d.id ? 'animate-spin text-blue-600' : ''}`} aria-hidden="true" />
                           </button>
                           <button
                             type="button"
                             onClick={() => onEditDevice(d as Device)}
                             aria-label={`Edit ${d.name}`}
                             title="Edit"
-                            className="p-1.5 text-slate-500 hover:text-amber-700 hover:bg-amber-50 rounded-md transition-colors cursor-pointer"
+                            className="p-1.5 text-slate-500 hover:text-amber-700 hover:bg-amber-50 rounded-md transition-colors"
                           >
-                            <Edit2 className="w-3.5 h-3.5" />
+                            <Edit2 className="w-3.5 h-3.5" aria-hidden="true" />
                           </button>
                           <button
                             type="button"
                             onClick={() => onDeleteDevice(d.id, d.name)}
                             aria-label={`Hapus ${d.name}`}
                             title="Hapus"
-                            className="p-1.5 text-slate-500 hover:text-rose-700 hover:bg-rose-50 rounded-md transition-colors cursor-pointer"
+                            className="p-1.5 text-slate-500 hover:text-rose-700 hover:bg-rose-50 rounded-md transition-colors"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
                           </button>
                         </div>
                       </td>
@@ -585,24 +657,24 @@ export const FleetView: React.FC<FleetViewProps> = ({
               </tbody>
             </table>
           </div>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-          {filtered.map((device) => (
-            <DeviceCard
-              key={device.id}
-              device={device}
-              isSelected={selectedIds.has(device.id)}
-              onToggleSelect={handleToggleSelect}
-              onOpenDashboard={onSelectDevice}
-              onEdit={onEditDevice}
-              onDelete={onDeleteDevice}
-              onTestConnection={onTestConnection}
-              isTesting={testingDeviceId === device.id}
-            />
-          ))}
-        </div>
-      )}
+        ) : (
+          <div className="p-3 bg-slate-50/50 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5">
+            {filtered.map((device) => (
+              <DeviceCard
+                key={device.id}
+                device={device}
+                isSelected={selectedIds.has(device.id)}
+                onToggleSelect={handleToggleSelect}
+                onOpenDashboard={onSelectDevice}
+                onEdit={onEditDevice}
+                onDelete={onDeleteDevice}
+                onTestConnection={onTestConnection}
+                isTesting={testingDeviceId === device.id}
+              />
+            ))}
+          </div>
+        )}
+      </section>
 
       {/* Floating Bulk Action Bar */}
       {selectedIds.size > 0 && (
@@ -616,10 +688,20 @@ export const FleetView: React.FC<FleetViewProps> = ({
           <div className="h-5 w-px bg-slate-200" />
 
           <button
-            onClick={() => setShowWifiSyncModal(true)}
-            className="flex items-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl text-xs transition-all shadow-sm cursor-pointer"
+            type="button"
+            onClick={() => setShowOptimizeModal(true)}
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-md text-xs transition-colors"
           >
-            <Wifi className="w-3.5 h-3.5" />
+            <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>AI Optimize ({selectedIds.size})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setShowWifiSyncModal(true)}
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-md text-xs transition-colors"
+          >
+            <Wifi className="w-3.5 h-3.5" aria-hidden="true" />
             <span>Sync Wi-Fi ({selectedIds.size})</span>
           </button>
 
@@ -665,7 +747,12 @@ export const FleetView: React.FC<FleetViewProps> = ({
               </button>
             </div>
             <div className="p-4">
-              <OptimizeWizard fleet onApplied={onRefreshFleet} />
+              <OptimizeWizard
+                fleet
+                fleetDevices={fleet}
+                initialSelectedIds={selectedIds.size > 0 ? Array.from(selectedIds) : undefined}
+                onApplied={onRefreshFleet}
+              />
             </div>
           </div>
         </div>
@@ -676,6 +763,13 @@ export const FleetView: React.FC<FleetViewProps> = ({
         onClose={() => setShowWifiSyncModal(false)}
         fleet={fleet}
         initialSelectedIds={selectedIds.size > 0 ? Array.from(selectedIds) : undefined}
+      />
+
+      {/* Fleet RF Neighbor & Distance Modal */}
+      <FleetRfDistanceModal
+        isOpen={showRfDistanceModal}
+        onClose={() => setShowRfDistanceModal(false)}
+        fleet={fleet}
       />
     </div>
   );
