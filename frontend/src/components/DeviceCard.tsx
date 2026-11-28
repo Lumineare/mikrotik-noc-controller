@@ -74,14 +74,14 @@ export const DeviceCard: React.FC<DeviceCardProps> = ({
   return (
     <article
       onClick={() => onOpenDashboard(device.id)}
-      className={`group relative bg-white border rounded-xl p-3.5 transition-all duration-150 flex flex-col justify-between cursor-pointer ${
+      className={`group relative bg-white border rounded-lg p-3.5 transition-colors duration-150 flex flex-col justify-between cursor-pointer focus-within:ring-2 focus-within:ring-blue-500/40 ${
         isSelected
-          ? 'border-blue-500 bg-blue-50/30 ring-2 ring-blue-500/20'
+          ? 'border-blue-500 bg-blue-50/30 ring-1 ring-blue-500/40'
           : !isOnline
-          ? 'border-rose-200 border-t-2 border-t-rose-500 bg-rose-50/25 hover:border-rose-300 hover:shadow-sm'
+          ? 'border-rose-200 border-t-2 border-t-rose-500 bg-rose-50/20 hover:border-rose-300'
           : isHighCpu
-          ? 'border-amber-200 border-t-2 border-t-amber-500 bg-amber-50/15 hover:border-amber-300 hover:shadow-sm'
-          : 'border-slate-200/90 hover:border-blue-300 hover:shadow-sm'
+          ? 'border-amber-200 border-t-2 border-t-amber-500 bg-amber-50/15 hover:border-amber-300'
+          : 'border-slate-200 hover:border-blue-400'
       }`}
     >
       <div>

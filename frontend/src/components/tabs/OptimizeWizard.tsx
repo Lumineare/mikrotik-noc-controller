@@ -1,17 +1,19 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
   ChevronDown,
+  Lock,
   Play,
   RefreshCw,
   RotateCcw,
+  Search,
   Sliders,
   Sparkles,
   XCircle,
 } from 'lucide-react';
 import { api } from '../../api/client';
-import { OptimizeJob } from '../../types';
+import { FleetDevice, OptimizeJob } from '../../types';
 
 const BASE = (import.meta as any).env?.VITE_API_URL || '';
 const call = async <T,>(path: string, method = 'GET', body?: any): Promise<T> => {
@@ -57,8 +59,10 @@ const pill = (job: OptimizeJob | null) => {
 export const OptimizeWizard: React.FC<{
   deviceId?: string;
   fleet?: boolean;
+  fleetDevices?: FleetDevice[];
+  initialSelectedIds?: string[];
   onApplied?: () => void;
-}> = ({ deviceId, fleet = false, onApplied }) => {
+}> = ({ deviceId, fleet = false, fleetDevices, initialSelectedIds, onApplied }) => {
   const [job, setJob] = useState<OptimizeJob | null>(null);
   const [cfg, setCfg] = useState<RrmConfig | null>(null);
   const [busy, setBusy] = useState(false);
@@ -71,7 +75,100 @@ export const OptimizeWizard: React.FC<{
   const [scanS, setScanS] = useState(8);
   const [dryRun, setDryRun] = useState(false);
   const [useOmniroute, setUseOmniroute] = useState(true);
+  const [omniModels, setOmniModels] = useState<string[]>([]);
+  const [selectedOmniModel, setSelectedOmniModel] = useState<string>(() => {
+    try {
+      return localStorage.getItem('rsam_optimize_omniroute_model') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [modelSearch, setModelSearch] = useState('');
   const notified = useRef<string | null>(null);
+
+  // Target AP selector state (for fleet mode so user-optimized APs are never overwritten)
+  const [loadedDevices, setLoadedDevices] = useState<FleetDevice[]>(fleetDevices || []);
+  const [selectedApIds, setSelectedApIds] = useState<Set<string>>(() => {
+    if (initialSelectedIds && initialSelectedIds.length > 0) return new Set(initialSelectedIds);
+    return new Set((fleetDevices || []).map((d) => d.id));
+  });
+  const [showTargetPicker, setShowTargetPicker] = useState<boolean>(
+    Boolean(initialSelectedIds && initialSelectedIds.length > 0)
+  );
+  const [targetSearch, setTargetSearch] = useState('');
+  const [targetGroup, setTargetGroup] = useState('ALL');
+  const initializedTargets = useRef<boolean>(
+    Boolean((initialSelectedIds && initialSelectedIds.length > 0) || (fleetDevices && fleetDevices.length > 0))
+  );
+
+  useEffect(() => {
+    if (fleetDevices && fleetDevices.length > 0) {
+      setLoadedDevices(fleetDevices);
+      if (!initializedTargets.current) {
+        initializedTargets.current = true;
+        setSelectedApIds(new Set(fleetDevices.map((d) => d.id)));
+      }
+    }
+  }, [fleetDevices]);
+
+  useEffect(() => {
+    if (!fleet || (fleetDevices && fleetDevices.length > 0)) return;
+    let alive = true;
+    api
+      .getFleet()
+      .then((res) => {
+        if (!alive) return;
+        const devs = res.devices || [];
+        setLoadedDevices(devs);
+        if (!initializedTargets.current && devs.length > 0) {
+          initializedTargets.current = true;
+          setSelectedApIds(new Set(devs.map((d) => d.id)));
+        }
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [fleet, fleetDevices]);
+
+  const targetGroups = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const d of loadedDevices) {
+      const g = d.group || 'Default';
+      map.set(g, (map.get(g) || 0) + 1);
+    }
+    return Array.from(map.entries()).sort((a, b) => b[1] - a[1]);
+  }, [loadedDevices]);
+
+  const filteredTargetDevices = useMemo(() => {
+    const q = targetSearch.trim().toLowerCase();
+    return loadedDevices.filter((d) => {
+      const matchGroup = targetGroup === 'ALL' || (d.group || 'Default') === targetGroup;
+      const matchSearch =
+        !q ||
+        d.name.toLowerCase().includes(q) ||
+        d.host.toLowerCase().includes(q) ||
+        (d.group || '').toLowerCase().includes(q);
+      return matchGroup && matchSearch;
+    });
+  }, [loadedDevices, targetSearch, targetGroup]);
+
+  const toggleTargetAp = (id: string) => {
+    setSelectedApIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const totalFleetCount = loadedDevices.length;
+  const selectedCount = selectedApIds.size;
+  const lockedCount = Math.max(0, totalFleetCount - selectedCount);
+  const isPartialFleet = fleet && totalFleetCount > 0 && selectedCount > 0 && selectedCount < totalFleetCount;
 
   const load = useCallback(async () => {
     const key = fleet ? 'fleet' : deviceId;
@@ -93,10 +190,52 @@ export const OptimizeWizard: React.FC<{
     }
   }, []);
 
+  const loadOmniModels = useCallback(async () => {
+    setLoadingModels(true);
+    try {
+      const res = await call<{ current_model?: string; available_models?: string[] }>('/api/ai/models');
+      const list = Array.isArray(res.available_models) ? res.available_models : [];
+      setOmniModels(list);
+      setSelectedOmniModel((prev) => {
+        if (prev && (list.length === 0 || list.includes(prev))) return prev;
+        return res.current_model || list[0] || '';
+      });
+    } catch {
+      /* ignore */
+    } finally {
+      setLoadingModels(false);
+    }
+  }, []);
+
   useEffect(() => {
     load();
     loadCfg();
-  }, [load, loadCfg]);
+    loadOmniModels();
+  }, [load, loadCfg, loadOmniModels]);
+
+  const handleSelectOmniModel = (modelId: string) => {
+    setSelectedOmniModel(modelId);
+    try {
+      if (modelId) localStorage.setItem('rsam_optimize_omniroute_model', modelId);
+      else localStorage.removeItem('rsam_optimize_omniroute_model');
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const groupedOmniModels = useMemo(() => {
+    const q = modelSearch.trim().toLowerCase();
+    const filtered = q ? omniModels.filter((m) => m.toLowerCase().includes(q)) : omniModels;
+    const groups = new Map<string, string[]>();
+    for (const m of filtered) {
+      const slashIdx = m.indexOf('/');
+      const groupName = slashIdx > 0 ? m.slice(0, slashIdx) : 'Lainnya';
+      const arr = groups.get(groupName) || [];
+      arr.push(m);
+      groups.set(groupName, arr);
+    }
+    return Array.from(groups.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [omniModels, modelSearch]);
 
   useEffect(() => {
     if (job?.status !== 'running') return;
@@ -113,15 +252,19 @@ export const OptimizeWizard: React.FC<{
 
   const start = async () => {
     if (busy) return;
-    if (
-      !dryRun &&
-      !window.confirm(
-        fleet
-          ? 'Optimalkan SEMUA AP dan kirim perubahan?\n\nChannel dihitung bersama antar-AP. Push dilakukan satu AP per satu AP; kalau klien di sebuah AP turun melebihi batas, push berhenti dan AP itu dikembalikan otomatis. Radio bisa restart singkat (klien terputus 10–30 detik per AP).'
-          : 'Optimalkan AP ini dan kirim perbaikan ke AP?\n\nOptimasi channel tetap dikelola global (fleet), tetapi PERBAIKAN (radio mati, frequency=auto, channel di luar rencana) tetap dikirim. TX power & steering ikut. Radio bisa restart singkat (klien terputus 10–30 detik).'
-      )
-    )
+    if (fleet && totalFleetCount > 0 && selectedCount === 0) {
+      setMsg('Pilih minimal 1 AP target untuk dioptimalkan.');
+      setShowTargetPicker(true);
       return;
+    }
+    const targetIdsList = fleet && totalFleetCount > 0 ? Array.from(selectedApIds) : undefined;
+    const confirmText = fleet
+      ? isPartialFleet
+        ? `Optimalkan ${selectedCount} AP terpilih dan kirim perubahan?\n\n${lockedCount} AP lainnya DIKUNCI (tidak akan discan maupun diubah konfigurasinya). Push dilakukan satu AP per satu AP. Radio AP terpilih bisa restart singkat (10–30 detik).`
+        : `Optimalkan SEMUA AP (${totalFleetCount || 'armada'}) dan kirim perubahan?\n\nChannel dihitung bersama antar-AP. Push dilakukan satu AP per satu AP; kalau klien di sebuah AP turun melebihi batas, AP itu dikembalikan otomatis. Radio bisa restart singkat (klien terputus 10–30 detik per AP).`
+      : 'Optimalkan AP ini dan kirim perbaikan ke AP?\n\nOptimasi channel tetap dikelola global (fleet), tetapi PERBAIKAN (radio mati, frequency=auto, channel di luar rencana) tetap dikirim. TX power & steering ikut. Radio bisa restart singkat (klien terputus 10–30 detik).';
+
+    if (!dryRun && !window.confirm(confirmText)) return;
     setBusy(true);
     setMsg(null);
     try {
@@ -130,8 +273,10 @@ export const OptimizeWizard: React.FC<{
         scan_duration: scanS,
         dry_run: dryRun,
         use_omniroute: useOmniroute,
+        omniroute_model: useOmniroute && selectedOmniModel ? selectedOmniModel : undefined,
         fleet,
-      } as any);
+        device_ids: targetIdsList,
+      });
       setMsg(r.ok ? null : r.message || 'Optimasi lain masih berjalan');
       await load();
     } catch (e: any) {
@@ -190,7 +335,12 @@ export const OptimizeWizard: React.FC<{
           <span className="font-bold text-slate-800">{fleet ? 'AI Optimize · Semua AP' : 'AI Optimize'}</span>
           <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${p.cls}`}>{p.text}</span>
           <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border border-indigo-200 bg-indigo-50 text-indigo-700">
-            {compute?.engine || (useOmniroute ? 'OmniRoute AI' : 'rrm_engine.py')}
+            {compute?.engine ||
+              (useOmniroute
+                ? selectedOmniModel
+                  ? `OmniRoute (${selectedOmniModel})`
+                  : 'OmniRoute AI'
+                : 'rrm_engine.py')}
           </span>
         </div>
         <div className="flex items-center gap-3">
@@ -211,24 +361,259 @@ export const OptimizeWizard: React.FC<{
 
       <p className="text-slate-500 mt-1 text-[11px]">
         {fleet
-          ? 'Satu job untuk seluruh fleet: cek AP → riwayat → scan WLAN → hitung channel bersama antar-AP → kirim sekuensial per AP (abort otomatis kalau klien turun). Tetap jalan walau halaman ditutup.'
+          ? 'Pilih seluruh armada atau hanya AP tertentu (AP yang tidak dipilih otomatis dikunci agar hasil optimasi sebelumnya tidak tertimpa). Tetap jalan walau halaman ditutup.'
           : 'Cek AP → riwayat → scan WLAN → hitung → kirim ke AP ini. Channel dikunci (dikelola global); yang dikirim hanya TX power & steering.'}
       </p>
+
+      {/* OmniRoute Model Selector Bar */}
+      {!running && (
+        <div className="mt-3 border border-slate-200 rounded-lg px-3 py-2.5 bg-slate-50/70 space-y-2">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <label className="inline-flex items-center gap-2 text-[11px] font-mono font-semibold text-slate-800 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={useOmniroute}
+                onChange={(e) => setUseOmniroute(e.target.checked)}
+                className="w-3.5 h-3.5 rounded accent-blue-600"
+              />
+              <span>Model OmniRoute AI</span>
+              {omniModels.length > 0 && (
+                <span className="text-[10px] font-normal text-slate-500">
+                  ({omniModels.length} tersedia)
+                </span>
+              )}
+            </label>
+            <button
+              type="button"
+              onClick={loadOmniModels}
+              disabled={loadingModels}
+              className="inline-flex items-center gap-1 text-[10.5px] font-mono text-blue-600 hover:text-blue-800 disabled:opacity-50"
+              title="Muat ulang daftar model langsung dari server OmniRoute"
+            >
+              <RefreshCw className={`w-3 h-3 ${loadingModels ? 'animate-spin' : ''}`} aria-hidden="true" />
+              <span>Sync Model</span>
+            </button>
+          </div>
+
+          {useOmniroute ? (
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+              <div className="relative sm:w-44 shrink-0">
+                <Search className="w-3 h-3 text-slate-400 absolute left-2.5 top-2.5" aria-hidden="true" />
+                <input
+                  type="text"
+                  value={modelSearch}
+                  onChange={(e) => setModelSearch(e.target.value)}
+                  aria-label="Filter daftar model OmniRoute"
+                  placeholder="Cari model..."
+                  className="w-full pl-7 pr-2 py-1.5 text-[11px] font-mono bg-white border border-slate-300 rounded-md text-slate-800 placeholder:text-slate-400 focus:border-blue-600"
+                />
+              </div>
+              <select
+                value={selectedOmniModel}
+                onChange={(e) => handleSelectOmniModel(e.target.value)}
+                aria-label="Pilih model OmniRoute untuk AI Optimize"
+                className="flex-1 min-w-0 px-2.5 py-1.5 text-[11px] font-mono font-semibold bg-white border border-slate-300 rounded-md text-slate-800 focus:border-blue-600"
+              >
+                {selectedOmniModel && !omniModels.includes(selectedOmniModel) && (
+                  <option value={selectedOmniModel}>{selectedOmniModel}</option>
+                )}
+                {groupedOmniModels.length > 0 ? (
+                  groupedOmniModels.map(([grp, models]) => (
+                    <optgroup key={grp} label={`${grp} (${models.length})`}>
+                      {models.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))
+                ) : (
+                  <option value={selectedOmniModel || 'auto/best-chat'}>
+                    {loadingModels
+                      ? 'Memuat daftar model OmniRoute...'
+                      : modelSearch
+                      ? 'Tidak ada model yang cocok'
+                      : selectedOmniModel || 'auto/best-chat'}
+                  </option>
+                )}
+              </select>
+            </div>
+          ) : (
+            <div className="text-[11px] font-mono text-slate-500">
+              OmniRoute nonaktif: optimasi menggunakan kalkulasi matematis lokal <span className="font-semibold text-slate-700">rrm_engine.py</span>.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Selective AP Target Picker (Fleet mode) */}
+      {fleet && totalFleetCount > 0 && !running && (
+        <div className="mt-3 border border-slate-200 rounded-lg overflow-hidden bg-white">
+          <div className="px-3 py-2 bg-slate-50 flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap">
+              <Lock
+                className={`w-3.5 h-3.5 shrink-0 ${
+                  selectedCount === 0
+                    ? 'text-rose-600'
+                    : isPartialFleet
+                    ? 'text-emerald-600'
+                    : 'text-slate-400'
+                }`}
+                aria-hidden="true"
+              />
+              {selectedCount === 0 ? (
+                <span className="font-semibold text-rose-700">
+                  Belum ada AP dipilih (0 / {totalFleetCount})
+                </span>
+              ) : isPartialFleet ? (
+                <span className="text-slate-700">
+                  Target: <strong className="text-blue-700">{selectedCount} AP</strong> ·{' '}
+                  <strong className="text-emerald-700">{lockedCount} AP lain dikunci</strong> (tidak akan diubah)
+                </span>
+              ) : (
+                <span className="text-slate-700">
+                  Target: <strong className="text-slate-900">Semua AP ({totalFleetCount})</strong>
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowTargetPicker((v) => !v)}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-[11px] font-mono font-semibold text-slate-700 transition-colors"
+            >
+              <span>{showTargetPicker ? 'Tutup Pemilih AP' : 'Pilih AP Target'}</span>
+              <ChevronDown
+                className={`w-3 h-3 transition-transform ${showTargetPicker ? 'rotate-180' : ''}`}
+                aria-hidden="true"
+              />
+            </button>
+          </div>
+
+          {showTargetPicker && (
+            <div className="p-3 border-t border-slate-200 space-y-2.5 bg-white">
+              <div className="flex flex-col sm:flex-row gap-2">
+                <div className="relative flex-1">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" aria-hidden="true" />
+                  <input
+                    type="text"
+                    value={targetSearch}
+                    onChange={(e) => setTargetSearch(e.target.value)}
+                    placeholder="Cari nama AP, IP, atau ruangan..."
+                    className="w-full pl-8 pr-2.5 py-1.5 text-[11px] font-mono bg-slate-50 border border-slate-300 rounded-md text-slate-800 placeholder:text-slate-400 focus:bg-white focus:border-blue-600"
+                  />
+                </div>
+                <select
+                  value={targetGroup}
+                  onChange={(e) => setTargetGroup(e.target.value)}
+                  aria-label="Filter lokasi AP target"
+                  className="px-2.5 py-1.5 text-[11px] font-mono bg-slate-50 border border-slate-300 rounded-md text-slate-700"
+                >
+                  <option value="ALL">Semua Lokasi ({totalFleetCount})</option>
+                  {targetGroups.map(([g, cnt]) => (
+                    <option key={g} value={g}>
+                      {g} ({cnt})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 flex-wrap text-[11px] font-mono">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedApIds((prev) => {
+                        const next = new Set(prev);
+                        filteredTargetDevices.forEach((d) => next.add(d.id));
+                        return next;
+                      })
+                    }
+                    className="px-2 py-1 rounded border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700"
+                  >
+                    Pilih Hasil Filter ({filteredTargetDevices.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedApIds(new Set(loadedDevices.filter((d) => d.online).map((d) => d.id)))
+                    }
+                    className="px-2 py-1 rounded border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700"
+                  >
+                    Online Saja ({loadedDevices.filter((d) => d.online).length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedApIds(new Set())}
+                    className="px-2 py-1 rounded border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700"
+                  >
+                    Kosongkan
+                  </button>
+                </div>
+                <span className="text-[10.5px] text-slate-500">
+                  Centang hanya AP yang ingin dioptimalkan
+                </span>
+              </div>
+
+              <div className="max-h-52 overflow-y-auto border border-slate-200 rounded-md grid grid-cols-1 sm:grid-cols-2 divide-y divide-slate-100">
+                {filteredTargetDevices.map((d) => {
+                  const checked = selectedApIds.has(d.id);
+                  return (
+                    <label
+                      key={d.id}
+                      className={`flex items-center justify-between gap-2 px-2.5 py-1.5 text-[11px] font-mono border-r border-slate-100 cursor-pointer transition-colors ${
+                        checked ? 'bg-blue-50/40 text-slate-900' : 'bg-white text-slate-500 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleTargetAp(d.id)}
+                          className="w-3.5 h-3.5 rounded accent-blue-600 shrink-0"
+                        />
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                            d.online ? 'bg-emerald-500' : 'bg-rose-400'
+                          }`}
+                          aria-hidden="true"
+                        />
+                        <span className="truncate font-semibold" title={`${d.name} (${d.host})`}>
+                          {d.name}
+                        </span>
+                      </span>
+                      <span className="text-[10px] text-slate-400 shrink-0 tabular-nums">
+                        {d.host}
+                      </span>
+                    </label>
+                  );
+                })}
+                {filteredTargetDevices.length === 0 && (
+                  <div className="col-span-2 py-4 text-center text-[11px] font-mono text-slate-400">
+                    Tidak ada AP yang cocok dengan pencarian.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {!running && (
         <div className="mt-3 flex items-center justify-between gap-3 flex-wrap">
           <button
             type="button"
             onClick={start}
-            disabled={busy || (!fleet && !deviceId)}
-            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800 px-4 py-2 text-white text-xs font-bold shadow-xs transition-colors disabled:opacity-60 cursor-pointer"
+            disabled={busy || (!fleet && !deviceId) || (fleet && totalFleetCount > 0 && selectedCount === 0)}
+            className="inline-flex items-center gap-2 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 px-4 py-2 text-white text-xs font-bold transition-colors disabled:opacity-50"
           >
             {busy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
             <span>
               {fleet
-                ? job?.status === 'done'
-                  ? 'Optimalkan Ulang Semua AP'
-                  : 'Optimalkan Semua AP'
+                ? isPartialFleet
+                  ? `Optimalkan ${selectedCount} AP Terpilih`
+                  : job?.status === 'done'
+                  ? `Optimalkan Ulang Semua AP (${totalFleetCount || 'Armada'})`
+                  : `Optimalkan Semua AP (${totalFleetCount || 'Armada'})`
                 : job?.status === 'done'
                 ? 'Optimalkan Ulang'
                 : 'Optimalkan AP Ini'}

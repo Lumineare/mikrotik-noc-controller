@@ -463,7 +463,15 @@ export const api = {
 
   async startOptimize(
     device: string | undefined,
-    opts?: { history_window_min?: number; scan_duration?: number; dry_run?: boolean; fleet?: boolean }
+    opts?: {
+      history_window_min?: number;
+      scan_duration?: number;
+      dry_run?: boolean;
+      fleet?: boolean;
+      use_omniroute?: boolean;
+      omniroute_model?: string;
+      device_ids?: string[];
+    }
   ): Promise<{ ok: boolean; job_id?: string; status?: string; message?: string; running?: boolean }> {
     const res = await fetch(`${BASE_URL}/api/optimize/start`, {
       method: 'POST',
@@ -804,6 +812,114 @@ export const api = {
     }[];
   }> {
     const res = await fetch(`${BASE_URL}/api/fleet/wifi/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify(payload),
+    });
+    return handleResponse(res);
+  },
+
+  // --- Fleet RF Neighbor & Distance Estimation ---
+  async getFleetRfDistances(params?: {
+    band?: 'all' | '2g' | '5g';
+    env?: 'corridor' | 'hospital' | 'heavy_wall';
+    window_h?: number;
+    device?: string;
+  }): Promise<{
+    ok: boolean;
+    env: string;
+    env_label: string;
+    path_loss_n: number;
+    band: string;
+    window_h: number;
+    summary: {
+      total_devices: number;
+      scanned_devices: number;
+      unscanned_devices: number;
+      total_pairs: number;
+      too_close_pairs: number;
+      ideal_pairs: number;
+      far_pairs: number;
+      co_channel_pairs: number;
+    };
+    pairs: {
+      ap_a_id: string;
+      ap_a_name: string;
+      ap_a_host: string;
+      ap_a_group: string;
+      ap_b_id: string;
+      ap_b_name: string;
+      ap_b_host: string;
+      ap_b_group: string;
+      band: string;
+      rssi_dbm: number;
+      rssi_ab: number | null;
+      rssi_ba: number | null;
+      bidirectional: boolean;
+      freq_a: number | null;
+      freq_b: number | null;
+      channel_label: string;
+      co_channel: boolean;
+      distance_m: number;
+      proximity: 'too_close' | 'ideal' | 'far';
+      scanned_at: string;
+    }[];
+    per_ap: {
+      device_id: string;
+      device_name: string;
+      host: string;
+      group: string;
+      scanned: boolean;
+      neighbour_count: number;
+      too_close_count: number;
+      co_channel_count: number;
+      nearest: {
+        peer_id: string;
+        peer_name: string;
+        peer_host: string;
+        band: string;
+        rssi_dbm: number;
+        distance_m: number;
+        proximity: 'too_close' | 'ideal' | 'far';
+        co_channel: boolean;
+        bidirectional: boolean;
+      } | null;
+      neighbours: {
+        peer_id: string;
+        peer_name: string;
+        peer_host: string;
+        band: string;
+        rssi_dbm: number;
+        distance_m: number;
+        proximity: 'too_close' | 'ideal' | 'far';
+        co_channel: boolean;
+        bidirectional: boolean;
+      }[];
+    }[];
+    unscanned_aps: { id: string; name: string; host: string; group: string }[];
+  }> {
+    const q = new URLSearchParams();
+    if (params?.band) q.append('band', params.band);
+    if (params?.env) q.append('env', params.env);
+    if (params?.window_h) q.append('window_h', String(params.window_h));
+    if (params?.device) q.append('device', params.device);
+    const res = await fetch(`${BASE_URL}/api/fleet/rf-distances?${q.toString()}`, {
+      headers: { ...getAuthHeaders() },
+    });
+    return handleResponse(res);
+  },
+
+  async scanFleetRfDistances(payload: {
+    device_ids: string[];
+    band?: 'all' | '2g' | '5g';
+    duration?: number;
+  }): Promise<{
+    ok: boolean;
+    scanned: number;
+    failed: number;
+    results: { device_id: string; device_name: string; ok: boolean; bands_ok: string[]; errors: string[] }[];
+  }> {
+    const res = await fetch(`${BASE_URL}/api/fleet/rf-distances/scan`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify(payload),

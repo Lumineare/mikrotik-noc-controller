@@ -5740,13 +5740,17 @@ def _gather_ap(dev: dict, duration: int, scan_cache: dict | None = None,
 
 
 def build_rrm_plan(include_dfs: bool | None = None, duration: int | None = None,
-                   scan_cache: dict | None = None) -> dict:
+                   scan_cache: dict | None = None,
+                   device_ids: list[str] | None = None) -> dict:
     cfg = load_rrm_cfg()
     if include_dfs is None:
         include_dfs = bool(cfg.get("include_dfs"))
     if duration is None:
         duration = int(cfg.get("scan_duration", 8))
     devs = load_devices()
+    target_set = set(device_ids) if device_ids else None
+    if target_set is not None:
+        devs = [d for d in devs if d["id"] in target_set]
     aps: list[dict] = []
     samples = 0
     unhealthy: list[dict] = []
@@ -5998,11 +6002,12 @@ def plan_rrm_via_omniroute(
     critical: list[dict],
     issues: list[dict],
     dev_filter: str | None = None,
+    model_override: str | None = None,
 ) -> tuple[dict, dict]:
     """Minta OmniRoute LLM menyusun rencana optimasi channel & TX power dari data scan real,
     lalu validasi ketat terhadap daftar frekuensi legal perangkat agar aman di-push ke MikroTik."""
     cfg = load_ai_config()
-    model_name = (cfg.get("model") or "auto/best-chat").strip()
+    model_name = ((model_override or "").strip() or (cfg.get("model") or "auto/best-chat").strip())
     base_url = cfg.get("base_url", "https://api.example.com/v1").rstrip("/")
     api_key = cfg.get("api_key") or DEFAULT_AI_CONFIG["api_key"]
     endpoint = f"{base_url}/chat/completions"
@@ -6696,7 +6701,8 @@ class RrmApplyReq(BaseModel):
     apply_roam: bool | None = None
     include_dfs: bool | None = None
     min_gain_pct: float | None = None
-    device: str | None = None   # batasi push ke satu AP (channel dikunci: milik plan fleet)
+    device: str | None = None           # batasi push ke satu AP (channel dikunci: milik plan fleet)
+    device_ids: list[str] | None = None  # batasi push ke daftar AP terpilih (AP lain dikunci & tidak disentuh)
     plan: dict | None = None
 
 
@@ -6721,8 +6727,16 @@ def api_rrm_apply(req: RrmApplyReq):
 
     dca = plan.get("dca") or {}
     only = req.device
+    target_set = set(req.device_ids) if req.device_ids else None
+    def _allowed_dev(did: str | None) -> bool:
+        if only and did != only:
+            return False
+        if target_set is not None and did not in target_set:
+            return False
+        return True
+
     ch_skip = None
-    changes = [c for c in (dca.get("changes") or []) if not only or c.get("device_id") == only]
+    changes = [c for c in (dca.get("changes") or []) if _allowed_dev(c.get("device_id"))]
     if only:
         # Optimasi channel default-nya fleet-only, kecuali perbaikan atau
         # rekomendasi eksplisit dari OmniRoute untuk AP ini.
@@ -6741,18 +6755,16 @@ def api_rrm_apply(req: RrmApplyReq):
         do_ch = False
     elif do_ch and repairs:
         ch_skip = f"{len(repairs)} radio tanpa channel eksplisit — dipulihkan tanpa gate gain"
-    tpc = [t for t in (plan.get("tpc") or []) if not only or t.get("device_id") == only]
-    steer = [s for s in (plan.get("steering") or []) if not only or s.get("device_id") == only]
-    roam = [r for r in (plan.get("roam") or []) if not only or r.get("device_id") == only]
+    tpc = [t for t in (plan.get("tpc") or []) if _allowed_dev(t.get("device_id"))]
+    steer = [s for s in (plan.get("steering") or []) if _allowed_dev(s.get("device_id"))]
+    roam = [r for r in (plan.get("roam") or []) if _allowed_dev(r.get("device_id"))]
     if not (do_ch and changes) and not (do_tpc and tpc) and not (do_steer and steer) \
             and not (do_roam and roam):
         return {"ok": False, "skipped": True,
                 "reason": ch_skip or "tidak ada aksi yang lolos guard — jaringan tidak disentuh",
                 "channel_skipped": ch_skip}
 
-    devs = {d["id"]: d for d in load_devices()}
-    if only:
-        devs = {k: v for k, v in devs.items() if k == only}
+    devs = {d["id"]: d for d in load_devices() if _allowed_dev(d["id"])}
     max_drop = int(cfg.get("max_client_drop") or 0)
     roam_expire = int(cfg.get("roam_expire_min") or 10)
     clients_before: dict = {}
@@ -7579,15 +7591,26 @@ def _opt_worker(job_id: str, opts: dict):
     if not job:
         return
     dev_filter = opts.get("device")
+    target_ids: list[str] | None = opts.get("device_ids") or None
+    target_set = set(target_ids) if target_ids else None
     history_min = int(opts.get("history_window_min") or 1440)
     scan_s = int(opts.get("scan_duration") or 8)
     dry_run = bool(opts.get("dry_run"))
     try:
         # --- 1. identify critical APs (paralel untuk skala ~100 AP) ---
         _opt_set_stage(job, 0, "running")
-        devs = load_devices()
+        all_devs = load_devices()
+        total_fleet_devices = len(all_devs)
+        devs = all_devs
         if dev_filter:
             devs = [d for d in devs if d["id"] == dev_filter]
+        elif target_set is not None:
+            devs = [d for d in devs if d["id"] in target_set]
+        if not devs:
+            raise RuntimeError("Tidak ada AP target yang cocok untuk dioptimalkan.")
+        job["details"]["target_devices"] = [d["id"] for d in devs]
+        job["details"]["total_fleet_devices"] = total_fleet_devices
+        job["details"]["locked_devices_count"] = max(0, total_fleet_devices - len(devs))
 
         def _probe_crit(d):
             entry = {"device": d["id"], "name": d.get("name")}
@@ -7618,6 +7641,8 @@ def _opt_worker(job_id: str, opts: dict):
         rows = db_rf_samples(limit=60000)
         if dev_filter:
             rows = [r for r in rows if r.get("device_id") == dev_filter]
+        elif target_set is not None:
+            rows = [r for r in rows if r.get("device_id") in target_set]
         window = [r for r in rows if (r.get("ts") or 0) >= cutoff]
         issues = _opt_roaming_issues(window)
         _ts = [float(r.get("ts") or 0) for r in window if r.get("ts")]
@@ -7702,12 +7727,23 @@ def _opt_worker(job_id: str, opts: dict):
         # --- 4. compute optimal configuration ---
         _opt_set_stage(job, 3, "running")
         base_plan = build_rrm_plan(include_dfs=cfg.get("include_dfs"), duration=scan_s,
-                                   scan_cache=scan_cache)
+                                   scan_cache=scan_cache, device_ids=target_ids)
         use_omniroute = opts.get("use_omniroute", True)
         if use_omniroute:
             plan, omni_meta = plan_rrm_via_omniroute(
-                base_plan, scans, critical, issues, dev_filter=dev_filter
+                base_plan, scans, critical, issues, dev_filter=dev_filter,
+                model_override=opts.get("omniroute_model"),
             )
+            # Double-lock guard: pastikan OmniRoute tidak pernah menyentuh AP di luar target_set
+            if target_set is not None:
+                if isinstance(plan.get("dca"), dict):
+                    plan["dca"]["changes"] = [
+                        c for c in (plan["dca"].get("changes") or [])
+                        if c.get("device_id") in target_set
+                    ]
+                plan["tpc"] = [t for t in (plan.get("tpc") or []) if t.get("device_id") in target_set]
+                plan["steering"] = [s for s in (plan.get("steering") or []) if s.get("device_id") in target_set]
+                plan["roam"] = [r for r in (plan.get("roam") or []) if r.get("device_id") in target_set]
         else:
             plan = base_plan
             base_dca = base_plan.get("dca") or {}
@@ -7785,7 +7821,7 @@ def _opt_worker(job_id: str, opts: dict):
                               apply_txpower=cfg.get("apply_txpower"),
                               apply_steering=cfg.get("apply_steering"),
                               min_gain_pct=cfg.get("min_gain_pct"),
-                              device=dev_filter, plan=plan)
+                              device=dev_filter, device_ids=target_ids, plan=plan)
             res = api_rrm_apply(req)
             if opts.get("ai_auto_push", False):
                 targets = [dev_filter] if dev_filter else [d["id"] for d in devs]
@@ -7856,20 +7892,36 @@ def _opt_worker(job_id: str, opts: dict):
 
 class OptStartReq(BaseModel):
     device: str | None = None
-    fleet: bool = False        # true = optimalkan semua AP sekaligus (channel joint)
+    fleet: bool = False                  # true = optimalkan armada (semua AP atau subset device_ids)
+    device_ids: list[str] | None = None  # opsional: daftar AP terpilih agar AP lain dikunci & tidak tertimpa
     history_window_min: int | None = None
     scan_duration: int | None = None
     dry_run: bool = False
     ai_auto_push: bool = False
     use_omniroute: bool = True
+    omniroute_model: str | None = None   # opsional: pilih model spesifik dari daftar /api/ai/models OmniRoute
 
 
 @app.post("/api/optimize/start")
 def api_optimize_start(req: OptStartReq):
+    target_ids: list[str] | None = None
     if req.fleet:
         dev = {"id": "fleet"}
         dev_filter = None
         lock_key = "fleet"
+        if req.device_ids is not None:
+            valid_ids = {d["id"] for d in load_devices()}
+            cleaned = []
+            seen_ids = set()
+            for x in req.device_ids:
+                if x in valid_ids and x not in seen_ids:
+                    seen_ids.add(x)
+                    cleaned.append(x)
+            if not cleaned:
+                return {"ok": False, "message": "Pilih minimal 1 AP yang valid untuk dioptimalkan."}
+            # Jika semua AP dipilih, perlakukan sebagai full fleet (None); selain itu kunci AP lain
+            if len(cleaned) < len(valid_ids):
+                target_ids = cleaned
     else:
         dev = get_device(req.device)
         dev_filter = dev["id"]
@@ -7887,7 +7939,8 @@ def api_optimize_start(req: OptStartReq):
             "stage": "identify", "stage_index": 0,
             "stages": _opt_stages(int(req.history_window_min or 1440),
                                   int(req.scan_duration or cfg.get("scan_duration", 8))),
-            "details": {}, "started": time.time(), "updated": time.time(), "run_id": None,
+            "details": {"target_devices": target_ids} if target_ids else {},
+            "started": time.time(), "updated": time.time(), "run_id": None,
         }
         OPT_JOBS[job["id"]] = job
         for old_id, old in list(OPT_JOBS.items()):
@@ -7897,13 +7950,20 @@ def api_optimize_start(req: OptStartReq):
     threading.Thread(target=_opt_worker, daemon=True,
                      args=(job["id"], {"device": dev_filter,
                                        "fleet": bool(req.fleet),
+                                       "device_ids": target_ids,
                                        "history_window_min": req.history_window_min,
                                        "scan_duration": req.scan_duration,
                                        "dry_run": req.dry_run,
                                        "ai_auto_push": req.ai_auto_push,
-                                       "use_omniroute": bool(req.use_omniroute)})).start()
+                                       "use_omniroute": bool(req.use_omniroute),
+                                       "omniroute_model": (req.omniroute_model or "").strip() or None})).start()
+    scope_note = (
+        f"({len(target_ids)} AP terpilih; AP lain dikunci & tidak diubah)"
+        if target_ids else "(seluruh armada)"
+    )
     return {"ok": True, "job_id": job["id"], "status": "running",
-            "message": "Optimasi berjalan di background — aman keluar dari halaman ini"}
+            "target_devices": target_ids,
+            "message": f"Optimasi berjalan di background {scope_note} — aman keluar dari halaman ini"}
 
 
 _LIVE_CH_CACHE: dict[str, tuple[float, dict]] = {}
@@ -8326,6 +8386,332 @@ def api_fleet_wifi_sync(req: FleetWifiSyncReq):
             "skipped": skip_cnt,
             "failed": err_cnt,
         },
+        "results": results,
+    }
+
+
+# ==============================================================================
+# FLEET RF NEIGHBOR & DISTANCE ESTIMATION (LOG-DISTANCE PATH LOSS)
+# ==============================================================================
+_RF_ENV_PROFILES = {
+    "corridor": {"label": "Koridor Terbuka", "n": 2.4},
+    "hospital": {"label": "Gedung RS Bertembok", "n": 3.0},
+    "heavy_wall": {"label": "Tembok Beton / Sekat Tebal", "n": 3.5},
+}
+
+
+def _rf_estimate_distance_m(rssi_dbm: float, freq_mhz: int, env: str = "hospital") -> float:
+    """Estimasi jarak indoor antar-AP (meter) dengan model Log-Distance Path Loss."""
+    import math
+    prof = _RF_ENV_PROFILES.get(env) or _RF_ENV_PROFILES["hospital"]
+    n = float(prof["n"])
+    f = float(freq_mhz or 2437)
+    # Effective EIRP rata-rata MikroTik cAP ac indoor (TX + antenna gain)
+    tx_eirp = 18.0 if f < 3000 else 22.0
+    # Free-space path loss pada jarak referensi d0 = 1 meter
+    fspl_1m = 20.0 * math.log10(max(f, 2400.0)) - 27.55
+    exp_val = (tx_eirp - float(rssi_dbm) - fspl_1m) / (10.0 * n)
+    dist = 10.0 ** exp_val
+    return round(max(0.5, min(120.0, dist)), 1)
+
+
+def _freq_to_ch_label(freq: int | None) -> str:
+    if not freq:
+        return "-"
+    f = int(freq)
+    if 2412 <= f <= 2484:
+        ch = 14 if f == 2484 else round((f - 2407) / 5)
+        return f"Ch {ch} ({f})"
+    if 5000 <= f <= 5900:
+        return f"Ch {(f - 5000) // 5} ({f})"
+    return f"{f} MHz"
+
+
+class FleetRfDistanceScanReq(BaseModel):
+    device_ids: list[str] = Field(default_factory=list)
+    band: str = "all"     # "all" | "2g" | "5g"
+    duration: int = Field(5, ge=4, le=12)
+
+
+@app.get("/api/fleet/rf-distances")
+def api_fleet_rf_distances(
+    band: str = Query("all"),
+    env: str = Query("hospital"),
+    window_h: int = Query(168, ge=1, le=720),
+    device: str | None = Query(None),
+):
+    """Hitung estimasi jarak RF antar-AP armada dari riwayat scan RF SQLite + pemetaan BSSID armada."""
+    env_key = env if env in _RF_ENV_PROFILES else "hospital"
+    band_filter = band if band in ("all", "2g", "5g") else "all"
+    devs = load_devices()
+    dev_by_id = {d["id"]: d for d in devs}
+    known_bssids = get_fleet_known_bssids()
+    cutoff = time.time() - window_h * 3600
+
+    # Ambil scan terbaru per (device_id, band) dari rf_scan_history
+    latest_scans: dict[tuple[str, str], dict] = {}
+    with _DB_LOCK:
+        try:
+            conn = sqlite3.connect(str(NOC_DB_FILE))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT ts, device_id, band, channels_json, bss_json FROM rf_scan_history "
+                "WHERE ts >= ? ORDER BY ts DESC",
+                (cutoff,),
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                did = r["device_id"]
+                b = r["band"]
+                if did not in dev_by_id:
+                    continue
+                if band_filter != "all" and b != band_filter:
+                    continue
+                key = (did, b)
+                if key in latest_scans:
+                    continue
+                latest_scans[key] = {
+                    "ts": float(r["ts"]),
+                    "device_id": did,
+                    "band": b,
+                    "bss_list": json.loads(r["bss_json"] or "[]"),
+                }
+        except Exception as e:
+            raise HTTPException(500, f"Gagal membaca riwayat scan RF: {e}")
+
+    # Kumpulkan link terarah (scanner_id -> heard_owner_id, band), ambil RSSI terkuat dari Virtual AP
+    directed: dict[tuple[str, str, str], dict] = {}
+    scanned_dev_ids: set[str] = set()
+    for (scanner_id, b), sc in latest_scans.items():
+        scanned_dev_ids.add(scanner_id)
+        for item in sc["bss_list"]:
+            bssid = str(item.get("bssid") or "").upper().strip()
+            owner = known_bssids.get(bssid)
+            if not owner:
+                continue
+            target_id = owner["device_id"]
+            if target_id == scanner_id or target_id not in dev_by_id:
+                continue
+            try:
+                sig = float(item.get("signal"))
+            except (TypeError, ValueError):
+                continue
+            freq = int(item.get("freq") or 0)
+            dkey = (scanner_id, target_id, b)
+            prev = directed.get(dkey)
+            if not prev or sig > prev["rssi"]:
+                directed[dkey] = {
+                    "rssi": sig,
+                    "freq": freq,
+                    "width": int(item.get("width") or 20),
+                    "ssid": item.get("ssid") or owner.get("ssid") or "",
+                    "ts": sc["ts"],
+                }
+
+    # Gabungkan pasangan simetris (A <-> B) per band
+    pair_map: dict[tuple[str, str, str], dict] = {}
+    for (src, dst, b), info in directed.items():
+        a, c = (src, dst) if src < dst else (dst, src)
+        pkey = (a, c, b)
+        entry = pair_map.setdefault(
+            pkey,
+            {
+                "ap_a_id": a,
+                "ap_b_id": c,
+                "band": b,
+                "rssi_ab": None,
+                "rssi_ba": None,
+                "freq_heard_b": None,
+                "freq_heard_a": None,
+                "ts": 0.0,
+            },
+        )
+        if src == a:
+            entry["rssi_ab"] = round(info["rssi"], 1)
+            entry["freq_heard_b"] = info["freq"]
+        else:
+            entry["rssi_ba"] = round(info["rssi"], 1)
+            entry["freq_heard_a"] = info["freq"]
+        entry["ts"] = max(entry["ts"], info["ts"])
+
+    pairs: list[dict] = []
+    per_ap_links: dict[str, list[dict]] = {d["id"]: [] for d in devs}
+
+    for p in pair_map.values():
+        a_id = p["ap_a_id"]
+        b_id = p["ap_b_id"]
+        if device and device not in (a_id, b_id):
+            continue
+        r_ab = p["rssi_ab"]
+        r_ba = p["rssi_ba"]
+        bidir = (r_ab is not None) and (r_ba is not None)
+        rssi_avg = round((r_ab + r_ba) / 2.0, 1) if bidir else float(r_ab if r_ab is not None else r_ba)
+        ref_freq = p["freq_heard_b"] or p["freq_heard_a"] or (2437 if p["band"] == "2g" else 5745)
+        dist_m = _rf_estimate_distance_m(rssi_avg, ref_freq, env_key)
+
+        fa = p["freq_heard_a"]
+        fb = p["freq_heard_b"]
+        co_channel = bool(fa and fb and abs(int(fa) - int(fb)) < 20)
+
+        if dist_m < 7.0 or rssi_avg >= -52.0:
+            proximity = "too_close"
+        elif dist_m <= 18.0:
+            proximity = "ideal"
+        else:
+            proximity = "far"
+
+        da = dev_by_id[a_id]
+        db = dev_by_id[b_id]
+        row = {
+            "ap_a_id": a_id,
+            "ap_a_name": da.get("name") or a_id,
+            "ap_a_host": da.get("host") or "",
+            "ap_a_group": da.get("group") or "Default",
+            "ap_b_id": b_id,
+            "ap_b_name": db.get("name") or b_id,
+            "ap_b_host": db.get("host") or "",
+            "ap_b_group": db.get("group") or "Default",
+            "band": p["band"],
+            "rssi_dbm": rssi_avg,
+            "rssi_ab": r_ab,
+            "rssi_ba": r_ba,
+            "bidirectional": bidir,
+            "freq_a": fa,
+            "freq_b": fb,
+            "channel_label": _freq_to_ch_label(ref_freq),
+            "co_channel": co_channel,
+            "distance_m": dist_m,
+            "proximity": proximity,
+            "scanned_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(p["ts"])) if p["ts"] else "-",
+        }
+        pairs.append(row)
+        per_ap_links[a_id].append(
+            {
+                "peer_id": b_id,
+                "peer_name": row["ap_b_name"],
+                "peer_host": row["ap_b_host"],
+                "band": p["band"],
+                "rssi_dbm": rssi_avg,
+                "distance_m": dist_m,
+                "proximity": proximity,
+                "co_channel": co_channel,
+                "bidirectional": bidir,
+            }
+        )
+        per_ap_links[b_id].append(
+            {
+                "peer_id": a_id,
+                "peer_name": row["ap_a_name"],
+                "peer_host": row["ap_a_host"],
+                "band": p["band"],
+                "rssi_dbm": rssi_avg,
+                "distance_m": dist_m,
+                "proximity": proximity,
+                "co_channel": co_channel,
+                "bidirectional": bidir,
+            }
+        )
+
+    pairs.sort(key=lambda x: (x["distance_m"], -x["rssi_dbm"]))
+
+    per_ap: list[dict] = []
+    unscanned_aps: list[dict] = []
+    for d in devs:
+        did = d["id"]
+        if device and did != device:
+            continue
+        links = sorted(per_ap_links.get(did) or [], key=lambda x: (x["distance_m"], -x["rssi_dbm"]))
+        has_scan = did in scanned_dev_ids
+        if not has_scan and not links:
+            unscanned_aps.append({"id": did, "name": d.get("name") or did, "host": d.get("host") or "", "group": d.get("group") or "Default"})
+            continue
+        nearest = links[0] if links else None
+        per_ap.append(
+            {
+                "device_id": did,
+                "device_name": d.get("name") or did,
+                "host": d.get("host") or "",
+                "group": d.get("group") or "Default",
+                "scanned": has_scan,
+                "neighbour_count": len(links),
+                "too_close_count": sum(1 for x in links if x["proximity"] == "too_close"),
+                "co_channel_count": sum(1 for x in links if x["co_channel"]),
+                "nearest": nearest,
+                "neighbours": links[:12],
+            }
+        )
+
+    per_ap.sort(key=lambda x: (x["nearest"]["distance_m"] if x["nearest"] else 999.0, x["device_name"]))
+
+    return {
+        "ok": True,
+        "env": env_key,
+        "env_label": _RF_ENV_PROFILES[env_key]["label"],
+        "path_loss_n": _RF_ENV_PROFILES[env_key]["n"],
+        "band": band_filter,
+        "window_h": window_h,
+        "summary": {
+            "total_devices": len(devs),
+            "scanned_devices": len(scanned_dev_ids),
+            "unscanned_devices": len(unscanned_aps),
+            "total_pairs": len(pairs),
+            "too_close_pairs": sum(1 for p in pairs if p["proximity"] == "too_close"),
+            "ideal_pairs": sum(1 for p in pairs if p["proximity"] == "ideal"),
+            "far_pairs": sum(1 for p in pairs if p["proximity"] == "far"),
+            "co_channel_pairs": sum(1 for p in pairs if p["co_channel"]),
+        },
+        "pairs": pairs,
+        "per_ap": per_ap,
+        "unscanned_aps": unscanned_aps,
+    }
+
+
+@app.post("/api/fleet/rf-distances/scan")
+def api_fleet_rf_distances_scan(req: FleetRfDistanceScanReq):
+    """Pindai RF on-demand untuk 1 atau beberapa AP terpilih agar jarak tetangga RF terbarui."""
+    if not req.device_ids:
+        raise HTTPException(400, "Pilih minimal 1 AP untuk dipindai")
+    if len(req.device_ids) > 12:
+        raise HTTPException(400, "Maksimal 12 AP per scan manual agar jaringan tetap ringan")
+    all_devs = {d["id"]: d for d in load_devices()}
+    targets = [all_devs[did] for did in req.device_ids if did in all_devs]
+    if not targets:
+        raise HTTPException(404, "Perangkat target tidak ditemukan")
+
+    bands = ["2g", "5g"] if req.band == "all" else [req.band if req.band in ("2g", "5g") else "5g"]
+    # Refresh fleet BSSID cache so newly scanned BSSIDs map accurately
+    try:
+        get_fleet_known_bssids()
+    except Exception:
+        pass
+
+    results: list[dict] = []
+
+    def _scan_dev(d: dict) -> dict:
+        ok_bands = []
+        errs = []
+        for b in bands:
+            try:
+                api_rf_scan(device=d["id"], band=b, duration=req.duration, non_disruptive=False)
+                ok_bands.append(b)
+            except Exception as e:
+                errs.append(f"{b}: {e}")
+        return {
+            "device_id": d["id"],
+            "device_name": d.get("name") or d["id"],
+            "ok": len(ok_bands) > 0,
+            "bands_ok": ok_bands,
+            "errors": errs,
+        }
+
+    with ThreadPoolExecutor(max_workers=min(6, len(targets))) as ex:
+        for r in ex.map(_scan_dev, targets):
+            results.append(r)
+
+    return {
+        "ok": any(r["ok"] for r in results),
+        "scanned": sum(1 for r in results if r["ok"]),
+        "failed": sum(1 for r in results if not r["ok"]),
         "results": results,
     }
 

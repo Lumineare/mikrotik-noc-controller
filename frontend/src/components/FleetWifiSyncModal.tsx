@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { FleetDevice } from '../types';
 import { api } from '../api/client';
+import { ActionProgressModal, useActionProgress } from './ActionProgressModal';
 
 interface FleetWifiSyncModalProps {
   isOpen: boolean;
@@ -81,6 +82,7 @@ export const FleetWifiSyncModal: React.FC<FleetWifiSyncModalProps> = ({
     summary: { total: number; success: number; skipped: number; failed: number };
     results: SyncResultItem[];
   } | null>(null);
+  const { progress: actionProgress, runAction, closeProgress } = useActionProgress();
 
   useEffect(() => {
     if (!isOpen) return;
@@ -200,29 +202,60 @@ export const FleetWifiSyncModal: React.FC<FleetWifiSyncModalProps> = ({
 
     setRunning(true);
     setSyncResp(null);
+    const loadingLabel =
+      action === 'create_ssid'
+        ? dryRun
+          ? 'Memeriksa Preview Tambah SSID...'
+          : 'Menambahkan SSID ke Armada AP...'
+        : action === 'rotate_password'
+        ? dryRun
+          ? 'Memeriksa Preview Ganti Password...'
+          : 'Menerapkan Password Wi-Fi Baru...'
+        : dryRun
+        ? 'Memeriksa Preview Ganti Nama SSID...'
+        : 'Mengganti Nama SSID Armada AP...';
     try {
-      const res = await api.syncFleetWifi({
-        action,
-        device_ids: Array.from(selectedIds),
-        target_ssid: targetSsid.trim(),
-        new_ssid: action === 'rename_ssid' ? newSsid.trim() : undefined,
-        password: password.trim() || undefined,
-        security_mode: securityMode,
-        bands,
-        vlan_mode: vlanMode,
-        vlan_id: vlanMode === 'use-tag' && vlanId ? Number(vlanId) : undefined,
-        hide_ssid: hideSsid,
-        add_bridge: addBridge,
-        bridge_name: bridgeName.trim() || 'bridge1',
-        dry_run: dryRun,
-      });
-      setSyncResp({
-        dry_run: res.dry_run,
-        summary: res.summary,
-        results: res.results,
-      });
-    } catch (err: any) {
-      setError(err?.message || 'Gagal menjalankan sinkronisasi Wi-Fi');
+      const outcome = await runAction(
+        {
+          loadingTitle: loadingLabel,
+          loadingMessage: `Memproses "${targetSsid.trim()}" pada ${selectedIds.size} AP terpilih...`,
+          successTitle: dryRun ? 'Preview Selesai!' : 'Sinkronisasi Wi-Fi Selesai!',
+          errorTitle: 'Gagal Menjalankan Sinkronisasi Wi-Fi',
+        },
+        async () => {
+          const res = await api.syncFleetWifi({
+            action,
+            device_ids: Array.from(selectedIds),
+            target_ssid: targetSsid.trim(),
+            new_ssid: action === 'rename_ssid' ? newSsid.trim() : undefined,
+            password: password.trim() || undefined,
+            security_mode: securityMode,
+            bands,
+            vlan_mode: vlanMode,
+            vlan_id: vlanMode === 'use-tag' && vlanId ? Number(vlanId) : undefined,
+            hide_ssid: hideSsid,
+            add_bridge: addBridge,
+            bridge_name: bridgeName.trim() || 'bridge1',
+            dry_run: dryRun,
+          });
+          setSyncResp({
+            dry_run: res.dry_run,
+            summary: res.summary,
+            results: res.results,
+          });
+          if (res.summary.success === 0 && res.summary.failed > 0) {
+            const firstErr = res.results.find((r) => r.status === 'error')?.message;
+            throw new Error(
+              `Semua AP gagal diproses (${res.summary.failed}/${res.summary.total}).${
+                firstErr ? ` Detail: ${firstErr}` : ''
+              }`
+            );
+          }
+        }
+      );
+      if (!outcome.ok && outcome.error) {
+        setError(outcome.error);
+      }
     } finally {
       setRunning(false);
     }
@@ -712,6 +745,9 @@ export const FleetWifiSyncModal: React.FC<FleetWifiSyncModalProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Non-closable Blocking Loading / Error Modal */}
+      <ActionProgressModal state={actionProgress} onClose={closeProgress} />
     </div>
   );
 };
